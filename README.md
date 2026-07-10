@@ -23,6 +23,16 @@ The framework gives you durable plumbing and gets out of your way:
 npm install -D simple-agent-orchestrator
 ```
 
+For a local checkout during development, install it by relative path instead:
+
+```bash
+npm install -D "file:../simple-agent-orchestrator"
+```
+
+The local install runs the package's `prepare` script to build `dist/`. Run
+`npm install` in the local checkout first so its build dependencies are
+available.
+
 Then initialize your project:
 
 ```bash
