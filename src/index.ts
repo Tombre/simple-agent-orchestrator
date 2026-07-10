@@ -20,6 +20,7 @@ export type {
   HandlerContext,
   HandleOptions,
 } from "./core/client.js";
+export { HandlerTimeoutError } from "./core/errors.js";
 
 export { createEnvironment } from "./core/environment.js";
 export type {

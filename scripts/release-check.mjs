@@ -182,7 +182,8 @@ import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
 import * as testing from "simple-agent-orchestrator/testing";
 
 assert.equal(typeof api.createClient, "function");
-assert.equal(api.CURRENT_STATE_VERSION, 2);
+assert.equal(api.CURRENT_STATE_VERSION, 3);
+assert.equal(typeof api.HandlerTimeoutError, "function");
 assert.equal(typeof api.validateAndMigrateState, "function");
 assert.equal(typeof testing.createTestRuntime, "function");
 const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });

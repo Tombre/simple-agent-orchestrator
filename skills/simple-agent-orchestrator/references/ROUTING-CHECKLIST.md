@@ -17,6 +17,7 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - The handler does not require state created by another channel unless it can recreate or recover it.
 - External source acknowledgement happens in one designated `onSuccess`, its ownership under fan-out is explicit, and it is safe to repeat.
 - Each external handler or hook operation uses a stable idempotency key that does not include `attempt`, or reconciles external state before acting.
+- Bounded operations receive the handler or sandbox `signal`; timeout is treated as cooperative cancellation, not proof that external work had no effect.
 - Untrusted external text is separated from system/developer instructions using the target agent SDK's supported content or escaping mechanism.
 
 ## Session lifecycle
@@ -40,6 +41,7 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - Failed deliveries remain visible through `events list`.
 - Retry settings are explicit when the default is not enough.
 - Retry delay is explicit when immediate retries could amplify an outage or rate limit.
+- Handler timeout is explicit when an agent, subprocess, or network operation needs a cooperative deadline.
 - One-shot drains are not expected to wait for delayed pending work.
 - `client.concurrency({ perSession: true })` is used when the target agent/tool cannot safely receive same-session messages concurrently.
 

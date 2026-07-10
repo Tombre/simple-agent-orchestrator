@@ -74,21 +74,24 @@ Edit:
 Replace the handler with your own agent integration:
 
 ```ts
-client.handle(manualChannel, async ({ event, session }) => {
+client.timeout("10m");
+client.handle(manualChannel, async ({ event, session, signal }) => {
   const agentSessionId = await session.ensure("agent.sessionId", async () => {
     const created = await createAgentSession({
       idempotencyKey: `agent-session:${session.id}`,
+      signal,
     });
     return created.id;
   });
 
   await sendToAgent(agentSessionId, String(event.input), {
     idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+    signal,
   });
 });
 ```
 
-Both external operations use stable keys because a later failure can retry the handler. Avoid submitting the first prompt during ensured session creation: an attempt-local `createdNow` flag cannot prevent duplicate first-event delivery after a retry.
+Both external operations use stable keys because a later failure or timeout can retry the handler, and both receive the cooperative cancellation signal. A timeout cannot force JavaScript or prove that an external side effect did not occur. Avoid submitting the first prompt during ensured session creation: an attempt-local `createdNow` flag cannot prevent duplicate first-event delivery after a retry.
 
 ## 7. Add real channels
 

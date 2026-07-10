@@ -135,16 +135,18 @@ import { markReviewSeen } from "../../src/lib/github/reviews";
 export const codingClient = createClient("coding", (client) => {
   client.useEnvironment(opencodeHerdrEnvironment);
   client.concurrency({ workers: 2, perSession: true });
+  client.timeout("10m");
 
   client.handle(githubReviewsChannel, {
     retries: { attempts: 3 },
 
-    async handle({ event, session, environment }) {
+    async handle({ event, session, environment, signal }) {
       const serverUrl = environment.get(opencodeServerUrl);
 
       const agentSessionId = await session.ensure(opencodeSessionId, async () => {
         const created = await createAgentSession(serverUrl, {
           idempotencyKey: `agent-session:${session.id}`,
+          signal,
         });
 
         return created.id;
@@ -152,19 +154,21 @@ export const codingClient = createClient("coding", (client) => {
 
       await sendToAgent(serverUrl, agentSessionId, String(event.input), {
         idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+        signal,
       });
     },
 
-    async onSuccess({ event }) {
+    async onSuccess({ event, signal }) {
       await markReviewSeen(event.payload, {
         idempotencyKey: `source-ack:${event.channelId}:${event.dedupeKey}`,
+        signal,
       });
     },
   });
 });
 ```
 
-The project-owned agent and source functions must honor these keys or reconcile by stable identity. A retry can rerun both `handle` and `onSuccess`; event dedupe alone does not dedupe those external operations.
+The project-owned agent and source functions must honor both the stable keys and cooperative cancellation signal. A timeout or other retry can rerun both `handle` and `onSuccess`; event dedupe alone does not dedupe those external operations, and timeout does not prove a provider-side operation had no effect.
 
 ## Config
 

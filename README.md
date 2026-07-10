@@ -172,17 +172,20 @@ export const githubReviewsChannel = createChannel(
 
 export const codingClient = createClient("coding", (client) => {
   client.retries({ attempts: 3, delay: "5s" });
+  client.timeout("10m");
 
-  client.handle(githubReviewsChannel, async ({ event, session }) => {
+  client.handle(githubReviewsChannel, async ({ event, session, signal }) => {
     const id = await session.ensure(agentSessionId, async () => {
       const created = await createAgentSession({
         idempotencyKey: `agent-session:${session.id}`,
+        signal,
       });
       return created.id;
     });
 
     await sendToAgent(id, String(event.input), {
       idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+      signal,
     });
   });
 });
@@ -202,7 +205,7 @@ An event is the durable unit of input. Events have a source `id`, optional `dedu
 
 A delivery is a client/handler-specific attempt to process an event. One event can be delivered to multiple clients.
 
-Delivery processing is retryable, not exactly once. Retries are immediate by default; a fixed `delay` can durably postpone automatic retries. A later failure or restart recovery can repeat handlers, hooks, and external effects even though event dispatch was deduped. On startup or drain, the runtime automatically requeues deliveries left `processing` by an interrupted runtime and logs a warning. Integrations must use stable external idempotency keys or reconciliation; see [Failure semantics and idempotency](docs/guides/failure-semantics.md).
+Delivery processing is retryable, not exactly once. Retries are immediate by default; a fixed `delay` can durably postpone automatic retries. An optional `timeout` cooperatively aborts a delivery attempt and applies the same retry rules. Integrations must pass the context `signal` to their own agents, subprocesses, and network APIs; JavaScript that ignores cancellation is still awaited and cannot be forcefully terminated. A later failure, timeout, or restart recovery can repeat handlers, hooks, and external effects even though event dispatch was deduped. See [Failure semantics and idempotency](docs/guides/failure-semantics.md).
 
 ### Client
 

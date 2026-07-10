@@ -39,19 +39,21 @@ async function handler({
 | `project` | Project root/path helpers. |
 | `logger` | Runtime logger. |
 | `attempt` | Current delivery attempt number. |
-| `signal` | Abort signal for graceful shutdown. |
+| `signal` | Abort signal for an attempt timeout or graceful shutdown. |
 
 ## Handler object form
 
-Use object form when you need retries or success hooks:
+Use object form when you need retries, a timeout, or success hooks:
 
 ```ts
 client.handle(githubReviewsChannel, {
   retries: { attempts: 5, delay: "10s" },
+  timeout: "2m",
 
-  async handle({ event, session }) {
+  async handle({ event, session, signal }) {
     await sendToAgent(session.key, String(event.input), {
       idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+      signal,
     });
   },
 
@@ -69,7 +71,11 @@ client.handle(githubReviewsChannel, {
 
 Retry fields are resolved independently in this order: handler options, `client.retries(...)`, global config `retries`, then three attempts and zero delay. `delay` is fixed and accepts milliseconds or strings such as `"500ms"`, `"10s"`, `"5m"`, and `"1h"`. Positive fractions round up to a whole millisecond. The maximum is `2_147_483_647` ms (about 24.9 days). The first attempt is immediate. After a failed nonterminal attempt, a positive delay leaves the delivery durably `pending` with a `nextAttemptAt` timestamp.
 
-Normal workers process delayed retries after they become eligible, including after restart. One-shot and direct drains process only currently eligible work and return without waiting. Manual retry accepts only a failed delivery, grants one immediately eligible attempt, and bypasses delay. Startup and drain also recover deliveries left `processing` immediately; the interrupted attempt remains counted, with one replacement attempt granted only when the interruption exhausted the configured budget. This is a fixed delay, not backoff, jitter, timeout, or general scheduling.
+Normal workers process delayed retries after they become eligible, including after restart. One-shot and direct drains process only currently eligible work and return without waiting. Manual retry accepts only a failed delivery, grants one immediately eligible attempt, and bypasses delay. Startup and drain also recover deliveries left `processing` immediately; the interrupted attempt remains counted, with one replacement attempt granted only when the interruption exhausted the configured budget. Retry delay is fixed, not backoff, jitter, or general scheduling.
+
+Timeout resolves from handler `timeout`, `client.timeout(...)`, global config `timeout`, then `0` (disabled). It uses the same duration syntax, rounding, and maximum as retry delay; an explicit `0` disables an inherited timeout. The deadline covers sandbox creation, `handle`, `onSuccess`, and sandbox cleanup. At expiry the runtime aborts `signal` with `HandlerTimeoutError`, waits for cooperative code to settle, and applies ordinary retry rules. A handler that catches the abort and returns is still timed out. Runtime shutdown wins if it aborts first.
+
+Cancellation is cooperative. Pass `signal` into agent SDKs, `fetch`, subprocess handling, and other project APIs. Code that ignores it cannot be forcefully terminated and can block past the deadline; external side effects may have completed and can repeat on retry. `onFailure` receives the timeout error and aborted signal when the handler context was created, but the failure hook itself is not deadline-bounded.
 
 The order is `handle`, `onSuccess`, required sandbox cleanup, then final success persistence. An error from any step fails the attempt and can rerun `handle`. `onFailure` receives the original error when a handler context exists; if it throws, its error is logged without replacing the original. Setup failures before the context exists do not call `onFailure`.
 

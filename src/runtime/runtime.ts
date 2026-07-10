@@ -6,6 +6,7 @@ import type { ClientDefinition, HandlerContext, RegisteredHandler } from "../cor
 import type { EnvironmentDefinition, EnvironmentInstance, SandboxContext } from "../core/environment.js";
 import { createEmptyEnvironment, EnvironmentInstanceImpl } from "../core/environment.js";
 import type { OrchestratorConfig } from "../core/config.js";
+import { HandlerTimeoutError } from "../core/errors.js";
 import { createStoredSession, SessionImpl } from "../core/session.js";
 import type {
   DispatchEvent,
@@ -22,7 +23,13 @@ import { memoryStore, type Store } from "../stores/index.js";
 import { StoreMutex } from "../stores/store.js";
 import { newId } from "../utils/id.js";
 import { consoleLogger } from "../utils/logger.js";
-import { isSupportedRetryDelay, MAX_DATE_TIMESTAMP, nowIso, parseDuration } from "../utils/time.js";
+import {
+  isSupportedRetryDelay,
+  MAX_DATE_TIMESTAMP,
+  MAX_TIMER_DURATION_MS,
+  nowIso,
+  parseDuration,
+} from "../utils/time.js";
 import { acquireRuntimeOwnership, type RuntimeOwnership } from "./ownership.js";
 
 export interface RuntimeOptions {
@@ -53,6 +60,14 @@ interface MountedEnvironment {
   pendingUnmountHooks: EnvironmentDefinition["unmountHooks"];
 }
 
+interface AttemptSignal {
+  readonly signal: AbortSignal;
+  readonly timeoutError: HandlerTimeoutError | undefined;
+  cancelTimeout(): void;
+  dispose(): void;
+  throwIfTimedOut(): void;
+}
+
 function parseRetryDelay(value: number | string): number {
   const duration = parseDuration(value);
   const normalized = duration > 0 ? Math.ceil(duration) : 0;
@@ -60,6 +75,59 @@ function parseRetryDelay(value: number | string): number {
     throw new Error(`Invalid retry delay: ${String(value)} exceeds the supported range`);
   }
   return normalized;
+}
+
+function parseHandlerTimeout(value: number | string): number {
+  const duration = parseDuration(value);
+  const normalized = duration > 0 ? Math.ceil(duration) : 0;
+  if (normalized > MAX_TIMER_DURATION_MS) {
+    throw new Error(`Invalid handler timeout: ${String(value)} exceeds the supported range`);
+  }
+  return normalized;
+}
+
+function createAttemptSignal(runtimeSignal: AbortSignal, timeoutMs: number): AttemptSignal {
+  const controller = new AbortController();
+  let timeoutError: HandlerTimeoutError | undefined;
+  let timer: NodeJS.Timeout | undefined;
+
+  const onRuntimeAbort = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    controller.abort(runtimeSignal.reason);
+  };
+
+  if (runtimeSignal.aborted) {
+    onRuntimeAbort();
+  } else {
+    runtimeSignal.addEventListener("abort", onRuntimeAbort, { once: true });
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timer = undefined;
+        timeoutError = new HandlerTimeoutError(timeoutMs);
+        controller.abort(timeoutError);
+      }, timeoutMs);
+      timer.unref();
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    get timeoutError() {
+      return timeoutError;
+    },
+    cancelTimeout() {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    },
+    dispose() {
+      this.cancelTimeout();
+      runtimeSignal.removeEventListener("abort", onRuntimeAbort);
+    },
+    throwIfTimedOut() {
+      if (timeoutError) throw timeoutError;
+    },
+  };
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -659,6 +727,7 @@ export class OrchestratorRuntime {
     const { client, delivery, event, handler } = claimed;
     let sessionImpl: SessionImpl | undefined;
     let handlerContext: HandlerContext | undefined;
+    let attemptSignal: AttemptSignal | undefined;
 
     try {
       const session = await this.resolveSession(event.sessionKey, delivery.id);
@@ -667,7 +736,10 @@ export class OrchestratorRuntime {
       );
 
       const environment = await this.getMountedEnvironment(client);
-      await this.ensureSandbox(client, environment, sessionImpl, event);
+      const timeoutMs = parseHandlerTimeout(handler.timeout ?? this.options.config.timeout ?? 0);
+      attemptSignal = createAttemptSignal(this.abortController.signal, timeoutMs);
+      await this.ensureSandbox(client, environment, sessionImpl, event, attemptSignal);
+      attemptSignal.throwIfTimedOut();
 
       const orchestratorEvent = this.toRuntimeEvent(event);
       handlerContext = {
@@ -678,26 +750,35 @@ export class OrchestratorRuntime {
         project: this.project,
         logger: this.logger,
         attempt: delivery.attempts,
-        signal: this.abortController.signal,
+        signal: attemptSignal.signal,
       };
 
       await handler.handle(handlerContext);
+      attemptSignal.throwIfTimedOut();
       await handler.onSuccess?.(handlerContext);
+      attemptSignal.throwIfTimedOut();
 
       if (sessionImpl.status === "ended") {
-        await this.cleanupSandbox(client, environment, sessionImpl, event);
+        await this.cleanupSandbox(client, environment, sessionImpl, event, attemptSignal);
+        attemptSignal.throwIfTimedOut();
       }
 
+      attemptSignal.dispose();
       await this.persistSuccess(delivery.id, sessionImpl);
     } catch (error) {
+      const failure = attemptSignal?.timeoutError ?? error;
+      attemptSignal?.cancelTimeout();
       if (handlerContext) {
         try {
-          await handler.onFailure?.({ ...handlerContext, error });
+          await handler.onFailure?.({ ...handlerContext, error: failure });
         } catch (onFailureError) {
           this.logger.warn("onFailure hook failed", { error: formatError(onFailureError) });
         }
       }
-      await this.persistFailure(delivery.id, error);
+      attemptSignal?.dispose();
+      await this.persistFailure(delivery.id, failure);
+    } finally {
+      attemptSignal?.dispose();
     }
   }
 
@@ -906,14 +987,17 @@ export class OrchestratorRuntime {
     environment: EnvironmentInstance,
     session: SessionImpl,
     event: StoredEvent,
+    attemptSignal: AttemptSignal,
   ): Promise<void> {
     const definition = client.environment;
     if (!definition?.sandbox) return;
     const flag = `__sao.sandbox.${definition.id}.created`;
     await this.withSandboxLock(`${session.id}:${flag}`, async () => {
       await this.refreshSessionState(session);
+      attemptSignal.throwIfTimedOut();
       if (session.getOptional<boolean>(flag)) return;
-      await definition.sandbox!.create(this.sandboxContext(environment, session, event));
+      await definition.sandbox!.create(this.sandboxContext(environment, session, event, attemptSignal.signal));
+      attemptSignal.throwIfTimedOut();
       session.set(flag, true);
       await this.persistSessionMutations(session);
     });
@@ -924,14 +1008,17 @@ export class OrchestratorRuntime {
     environment: EnvironmentInstance,
     session: SessionImpl,
     event: StoredEvent,
+    attemptSignal: AttemptSignal,
   ): Promise<void> {
     const definition = client.environment;
     if (!definition?.sandbox?.cleanup) return;
     const flag = `__sao.sandbox.${definition.id}.created`;
     await this.withSandboxLock(`${session.id}:${flag}`, async () => {
       await this.refreshSessionState(session);
+      attemptSignal.throwIfTimedOut();
       if (!session.getOptional<boolean>(flag)) return;
-      await definition.sandbox!.cleanup!(this.sandboxContext(environment, session, event));
+      await definition.sandbox!.cleanup!(this.sandboxContext(environment, session, event, attemptSignal.signal));
+      attemptSignal.throwIfTimedOut();
       session.set(flag, false);
       await this.persistSandboxFlag(session, flag, false);
     });
@@ -941,12 +1028,13 @@ export class OrchestratorRuntime {
     environment: EnvironmentInstance,
     session: SessionImpl,
     event: StoredEvent,
+    signal: AbortSignal,
   ): SandboxContext {
     return {
       environment,
       project: this.project,
       logger: this.logger,
-      signal: this.abortController.signal,
+      signal,
       session,
       event: this.toRuntimeEvent(event),
     };
@@ -959,11 +1047,14 @@ export class OrchestratorRuntime {
       for (const poll of channel.polls) parseDuration(poll.every);
     }
     if (this.options.config.retries?.delay !== undefined) parseRetryDelay(this.options.config.retries.delay);
+    if (this.options.config.timeout !== undefined) parseHandlerTimeout(this.options.config.timeout);
     for (const client of this.clients) {
       this.assertUnique(client.handlers.map(({ id }) => id), "handler", ` for client ${client.id}`);
       if (client.retryOptions.delay !== undefined) parseRetryDelay(client.retryOptions.delay);
+      if (client.timeout !== undefined) parseHandlerTimeout(client.timeout);
       for (const handler of client.handlers) {
         if (handler.retries.delay !== undefined) parseRetryDelay(handler.retries.delay);
+        if (handler.timeout !== undefined) parseHandlerTimeout(handler.timeout);
       }
     }
   }

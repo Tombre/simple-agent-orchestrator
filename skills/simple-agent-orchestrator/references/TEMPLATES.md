@@ -135,20 +135,23 @@ const opencodeSessionId = sessionKey<string>("opencode.sessionId");
 export const codingClient = createClient("coding", (client) => {
   client.useEnvironment(opencodeEnvironment);
   client.concurrency({ workers: 2, perSession: true });
+  client.timeout("10m");
 
   client.handle(githubReviewsChannel, {
     id: "coding.githubReviews",
 
-    async handle({ event, session, environment }) {
+    async handle({ event, session, environment, signal }) {
       const serverUrl = environment.get(opencodeServerUrl);
       const agentSessionId = await session.ensure(opencodeSessionId, async () => {
         const agentSession = await createAgentSession(serverUrl, {
           idempotencyKey: `agent-session:${session.id}`,
+          signal,
         });
         return agentSession.id;
       });
       await sendToAgent(serverUrl, agentSessionId, event.input, {
         idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+        signal,
       });
     },
 
@@ -183,7 +186,7 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
   });
 
   environment.useSandbox({
-    async create({ event, session, project }) {
+    async create({ event, session, project, signal }) {
       const branch = event.meta?.branch;
       if (typeof branch !== "string" || branch.trim() === "") {
         throw new Error("Expected event.meta.branch");
@@ -194,13 +197,14 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
         rootDirectory: project.root,
         sourceCheckout: "main",
         branch,
+        signal,
       });
       session.set("worktree.id", worktreeId);
     },
 
-    async cleanup({ session }) {
+    async cleanup({ session, signal }) {
       const worktreeId = session.getOptional<string>("worktree.id");
-      if (worktreeId) await closeWorktreeIdempotently(worktreeId);
+      if (worktreeId) await closeWorktreeIdempotently(worktreeId, { signal });
     },
   });
 });

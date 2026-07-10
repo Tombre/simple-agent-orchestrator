@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createChannel, createClient } from "../src/index.js";
-import { MAX_RETRY_DELAY_MS } from "../src/utils/time.js";
+import { MAX_RETRY_DELAY_MS, MAX_TIMER_DURATION_MS } from "../src/utils/time.js";
 import { findConfigFile, findProjectRoot, loadProjectConfig } from "../src/runtime/project.js";
 import { createRuntime } from "./helpers.js";
 
@@ -48,6 +48,31 @@ describe("configuration validation", () => {
     await expect(createRuntime({ retries: { delay: `${MAX_RETRY_DELAY_MS}.1ms` } }).then((runtime) => runtime.init())).rejects.toThrow(
       "exceeds the supported range",
     );
+  });
+
+  it("rejects invalid handler timeouts before runtime work starts", async () => {
+    const channel = createChannel("timeout");
+    const client = createClient("client", (builder) => {
+      builder.timeout("later");
+      builder.handle(channel, { timeout: -1, handle() {} });
+    });
+
+    await expect(createRuntime({ timeout: "later" }).then((runtime) => runtime.init())).rejects.toThrow(
+      "Invalid duration string: later",
+    );
+    await expect(createRuntime({ timeout: MAX_TIMER_DURATION_MS + 1 }).then((runtime) => runtime.init())).rejects.toThrow(
+      "Invalid handler timeout",
+    );
+    await expect(createRuntime({ channels: [channel], clients: [client] }).then((runtime) => runtime.init())).rejects.toThrow(
+      "Invalid duration string: later",
+    );
+
+    const handlerOnly = createClient("handler-only", (builder) => {
+      builder.handle(channel, { timeout: -1, handle() {} });
+    });
+    await expect(
+      createRuntime({ channels: [channel], clients: [handlerOnly] }).then((runtime) => runtime.init()),
+    ).rejects.toThrow("Invalid duration: -1");
   });
 
   it("keeps the repository root when an explicit config is inside the orchestrator directory", async () => {

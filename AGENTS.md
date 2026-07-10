@@ -91,6 +91,8 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Events fan out across clients and across handlers on one client.
 - Channel and client IDs are globally unique. Handler IDs are unique within a client.
 - Retry fields resolve independently through handler override, client default captured at handler registration, config default, then three attempts and zero delay.
+- Handler timeout resolves through handler override, client default captured at handler registration, config default, then zero (disabled); an explicit zero disables inheritance.
+- Handler timeout cooperatively aborts sandbox creation, `handle`, `onSuccess`, and sandbox cleanup, records `HandlerTimeoutError`, and uses ordinary retry and rollback behavior.
 - Positive fixed retry delays persist on deliveries; delayed work remains `pending` with `nextAttemptAt`, normal workers honor eligibility, and drains do not wait for future work.
 - `handle` runs before `onSuccess`. An error from either fails the attempt.
 - `onFailure` runs when a handler context exists; an error from `onFailure` is logged and does not replace the delivery error.
@@ -126,6 +128,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Environment instances are scoped by client ID and environment ID. Their values are process-local.
 - Mount hooks run in registration order. Environments unmount in reverse mount order and hooks run in reverse registration order; cleanup continues after failures.
 - Shutdown is cooperative. Handlers and hooks must observe their `AbortSignal` when appropriate.
+- Runtime shutdown wins over a later attempt timeout; cancellation-aware work is awaited in both cases.
 - `workers` controls in-process parallelism.
 - `perSession: true` serializes same-session deliveries for that client only within one runtime process; every participating client must opt in for runtime-wide same-session serialization.
 - Session merging, `session.ensure`, sandbox locks, poll locks, and `StoreMutex` provide only in-process coordination.
@@ -142,7 +145,8 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - JSON-store first-run initialization and runtime ownership require a local filesystem with atomic hard-link support.
 - There is no distributed worker coordination or distributed per-session lock.
 - Processing is not exactly once, and retries can repeat external side effects.
-- Retries support only a fixed delay; there is no backoff, jitter, timeout, arbitrary schedule, or dead-letter queue.
+- Retries support only a fixed delay; there is no backoff, jitter, arbitrary schedule, or dead-letter queue.
+- Handler timeouts are cooperative. JavaScript that ignores cancellation cannot be forcefully terminated and external side effects may already have occurred.
 - Only memory and JSON-file stores ship.
 - There is no retention, compaction, or pruning policy.
 - Sandbox creation has a crash window between external creation and marker persistence.

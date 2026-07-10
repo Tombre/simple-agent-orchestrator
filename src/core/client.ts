@@ -37,6 +37,7 @@ export interface HandleOptions<
 > {
   id?: string;
   retries?: RetryOptions;
+  timeout?: number | string;
   handle: EventHandler<TPayload, TInput, TMeta>;
   onSuccess?: (ctx: HandlerContext<TPayload, TInput, TMeta>) => Promise<void> | void;
   onFailure?: (ctx: HandlerContext<TPayload, TInput, TMeta> & { error: unknown }) => Promise<void> | void;
@@ -47,6 +48,7 @@ export interface RegisteredHandler {
   channelId: string;
   channel: ChannelDefinition;
   retries: RetryOptions;
+  timeout?: number | string | undefined;
   handle: EventHandler;
   onSuccess?: ((ctx: HandlerContext) => Promise<void> | void) | undefined;
   onFailure?: ((ctx: HandlerContext & { error: unknown }) => Promise<void> | void) | undefined;
@@ -56,6 +58,7 @@ export interface ClientBuilder {
   useEnvironment(environment: EnvironmentDefinition): void;
   concurrency(options: ConcurrencyOptions): void;
   retries(options: RetryOptions): void;
+  timeout(value: number | string): void;
   handle<
     TPayload = unknown,
     TInput = unknown,
@@ -72,6 +75,7 @@ export interface ClientDefinition {
   readonly environment?: EnvironmentDefinition | undefined;
   readonly concurrencyOptions: Required<ConcurrencyOptions>;
   readonly retryOptions: RetryOptions;
+  readonly timeout?: number | string | undefined;
 }
 
 export function createClient(id: string, setup: (client: ClientBuilder) => void): ClientDefinition {
@@ -79,6 +83,7 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
   let environment: EnvironmentDefinition | undefined;
   let concurrencyOptions: Required<ConcurrencyOptions> = { workers: 1, perSession: false };
   let retryOptions: RetryOptions = {};
+  let timeout: number | string | undefined;
 
   const builder: ClientBuilder = {
     useEnvironment(next) {
@@ -97,6 +102,9 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
         ...(options.delay !== undefined ? { delay: options.delay } : {}),
       };
     },
+    timeout(value) {
+      timeout = value;
+    },
     handle(channel, handlerOrOptions) {
       const options = (typeof handlerOrOptions === "function"
         ? { handle: handlerOrOptions }
@@ -111,6 +119,7 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
           ...(options.retries?.attempts !== undefined ? { attempts: Math.max(1, options.retries.attempts) } : {}),
           ...(options.retries?.delay !== undefined ? { delay: options.retries.delay } : {}),
         },
+        timeout: options.timeout ?? timeout,
         handle: options.handle as EventHandler,
         onSuccess: options.onSuccess as RegisteredHandler["onSuccess"],
         onFailure: options.onFailure as RegisteredHandler["onFailure"],
@@ -126,5 +135,6 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
     environment,
     concurrencyOptions,
     retryOptions,
+    timeout,
   };
 }

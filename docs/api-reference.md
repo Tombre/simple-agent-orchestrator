@@ -24,6 +24,7 @@ type OrchestratorConfig = {
   clients?: ClientDefinition[];
   logger?: Logger;
   retries?: RetryOptions;
+  timeout?: number | string;
 };
 
 type RetryOptions = {
@@ -33,6 +34,8 @@ type RetryOptions = {
 ```
 
 `attempts` counts the first attempt and defaults to `3`. `delay` is a fixed wait between failed automatic attempts; it accepts milliseconds or the same `ms`, `s`, `m`, and `h` strings as poll intervals and defaults to `0`. Positive fractional values round up to one whole millisecond. The maximum is `2_147_483_647` ms (about 24.9 days).
+
+`timeout` is the default cooperative deadline for each delivery attempt. It uses the same duration format, rounding, and maximum; `0` disables it. It does not apply to polls or environment mount/unmount hooks.
 
 ## `createChannel(id, setup?)`
 
@@ -101,6 +104,7 @@ Creates a delivery consumer.
 ```ts
 const client = createClient("coding", (client) => {
   client.retries({ attempts: 3, delay: "5s" });
+  client.timeout("10m");
   client.handle(githubReviewsChannel, handleReview);
 });
 ```
@@ -118,6 +122,7 @@ client.handle(channel, async ({ event, session }) => {
 ```ts
 client.handle(channel, {
   retries: { attempts: 5, delay: "30s" },
+  timeout: "2m",
   async handle(ctx) {},
   async onSuccess(ctx) {},
   async onFailure({ error }) {},
@@ -127,6 +132,14 @@ client.handle(channel, {
 Attempt order is `handle`, `onSuccess`, required sandbox cleanup, then final persistence. An error from any step fails the attempt and can rerun `handle`. `onFailure` receives the original error when a handler context exists. Its own error is logged without replacing the original; setup failures before context creation do not invoke it.
 
 Retry fields resolve independently in handler, client, global-config, then built-in order. The first attempt is immediate. A positive delay is captured on each delivery and stores the next eligibility time after a failed nonterminal attempt. Delayed work remains `pending`; normal workers process it after eligibility, including across restarts. `drain()` and `start({ drain: true })` process only currently eligible work and do not wait. Manual retry and interrupted-attempt recovery are immediately eligible.
+
+Timeout resolves from the handler option, the client default captured when the handler is registered, global config, then `0` (disabled). The deadline covers sandbox creation, `handle`, `onSuccess`, and required sandbox cleanup. It aborts `HandlerContext.signal` and sandbox signals with an exported `HandlerTimeoutError`, waits for the current cooperative operation to settle, records that error, and applies ordinary retry rules. If runtime shutdown aborts first, the later deadline is cancelled and shutdown retains its existing semantics. `onFailure` receives the timeout error and already-aborted signal when a handler context exists; it is not itself deadline-bounded.
+
+Timeout cancellation is cooperative, not forced. Code that ignores `signal` can continue blocking indefinitely, and timed-out external operations may already have produced side effects. Pass `signal` to project-owned APIs and keep their effects retry-safe. A handler that catches cancellation and returns is still recorded as timed out.
+
+### `HandlerTimeoutError`
+
+Exported error with a numeric `timeoutMs` property. Use `error instanceof HandlerTimeoutError` in `onFailure` when timeout-specific reporting is needed. Its name and message are retained in the delivery's `lastError`.
 
 ### `client.useEnvironment(environment)`
 
@@ -156,6 +169,8 @@ type HandlerContext = {
   signal: AbortSignal;
 };
 ```
+
+`signal` is aborted by either runtime shutdown or the configured attempt timeout. Pass it through to cancellation-aware project operations.
 
 ## `Session`
 

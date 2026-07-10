@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { createChannel, createClient, memoryStore, type OrchestratorEvent } from "../src/index.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  createChannel,
+  createClient,
+  HandlerTimeoutError,
+  memoryStore,
+  type OrchestratorEvent,
+} from "../src/index.js";
 import { createTestRuntime } from "../src/testing/index.js";
 import { MAX_RETRY_DELAY_MS } from "../src/utils/time.js";
+import { deferred } from "./helpers.js";
 
 describe("runtime behavior", () => {
   it("preserves event fields, scopes dedupe by channel, and fans out to every client", async () => {
@@ -106,6 +113,133 @@ describe("runtime behavior", () => {
     const deliveries = (await test.events.list())[0]!.deliveries;
     expect(calls).toEqual(["handle:1", "failure:1", "handle:2", "success:2"]);
     expect(deliveries[0]).toMatchObject({ status: "processed", attempts: 2, lastError: undefined });
+  });
+
+  it("cooperatively aborts timed-out attempts, rolls back ordinary changes, and retries", async () => {
+    vi.useFakeTimers();
+    try {
+      const channel = createChannel("timeout");
+      const starts = [deferred(), deferred()];
+      const failures: unknown[] = [];
+      const client = createClient("client", (builder) => {
+        builder.handle(channel, {
+          retries: { attempts: 2 },
+          async handle({ attempt, session, signal }) {
+            session.set("ordinary", attempt);
+            session.note(`attempt ${attempt}`);
+            await session.ensure("eager", () => "kept");
+            starts[attempt - 1]!.resolve();
+            await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          },
+          onFailure({ error, signal }) {
+            failures.push(error);
+            expect(signal.aborted).toBe(true);
+            expect(signal.reason).toBe(error);
+          },
+        });
+      });
+      const test = await createTestRuntime({ config: { channels: [channel], clients: [client], timeout: "10ms" } });
+
+      const dispatch = test.dispatch("timeout", { id: "event", sessionKey: "work" });
+      await starts[0]!.promise;
+      await vi.advanceTimersByTimeAsync(10);
+      await starts[1]!.promise;
+      await vi.advanceTimersByTimeAsync(10);
+      await dispatch;
+
+      expect(failures).toHaveLength(2);
+      expect(failures.every((error) => error instanceof HandlerTimeoutError)).toBe(true);
+      expect(failures[0]).toMatchObject({ timeoutMs: 10 });
+      expect(await test.sessions.get("work")).toMatchObject({ state: { eager: "kept" } });
+      expect(await test.sessions.notes("work")).toEqual([]);
+      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({
+        status: "failed",
+        attempts: 2,
+      });
+      expect((await test.events.list())[0]!.deliveries[0]!.lastError).toContain("HandlerTimeoutError");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves handler timeout from handler, client, global, then disabled defaults", () => {
+    const channel = createChannel("timeout");
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, { id: "built-in", handle() {} });
+      builder.timeout("20ms");
+      builder.handle(channel, { id: "client", handle() {} });
+      builder.handle(channel, { id: "handler", timeout: "5ms", handle() {} });
+      builder.handle(channel, { id: "disabled", timeout: 0, handle() {} });
+    });
+
+    expect(client.handlers.map(({ id, timeout }) => ({ id, timeout }))).toEqual([
+      { id: "built-in", timeout: undefined },
+      { id: "client", timeout: "20ms" },
+      { id: "handler", timeout: "5ms" },
+      { id: "disabled", timeout: 0 },
+    ]);
+  });
+
+  it("clears the deadline after a successful attempt", async () => {
+    vi.useFakeTimers();
+    try {
+      const channel = createChannel("timeout");
+      let signal: AbortSignal | undefined;
+      const client = createClient("client", (builder) => {
+        builder.handle(channel, {
+          timeout: "10ms",
+          handle(context) {
+            signal = context.signal;
+          },
+        });
+      });
+      const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+      await test.dispatch("timeout", { id: "event" });
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(signal?.aborted).toBe(false);
+      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "processed" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out a cooperative success hook and rolls back the attempt", async () => {
+    vi.useFakeTimers();
+    try {
+      const channel = createChannel("timeout");
+      const started = deferred();
+      let failure: unknown;
+      const client = createClient("client", (builder) => {
+        builder.handle(channel, {
+          timeout: "10ms",
+          retries: { attempts: 1 },
+          handle({ session }) {
+            session.set("ordinary", true);
+          },
+          async onSuccess({ signal }) {
+            started.resolve();
+            await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          },
+          onFailure({ error }) {
+            failure = error;
+          },
+        });
+      });
+      const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+      const dispatch = test.dispatch("timeout", { id: "event", sessionKey: "work" });
+      await started.promise;
+      await vi.advanceTimersByTimeAsync(10);
+      await dispatch;
+
+      expect(failure).toBeInstanceOf(HandlerTimeoutError);
+      expect(await test.sessions.get("work")).toMatchObject({ state: {} });
+      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "failed", attempts: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retries after a success hook error and rolls back ordinary attempt changes", async () => {

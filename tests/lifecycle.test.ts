@@ -4,12 +4,13 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createChannel,
   createClient,
   createEnvironment,
   cursorKey,
+  HandlerTimeoutError,
   jsonFileStore,
   type Logger,
   memoryStore,
@@ -97,6 +98,68 @@ async function waitForChildExit(owner: { child: ChildProcess; stderr: string[] }
 }
 
 describe("resource lifecycle", () => {
+  it("lets runtime shutdown win over a later handler deadline", async () => {
+    const channel = createChannel("shutdown");
+    const started = deferred();
+    let abortReason: unknown;
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        timeout: "1h",
+        async handle({ signal }) {
+          started.resolve();
+          await new Promise<void>((resolve) => {
+            signal.addEventListener("abort", () => {
+              abortReason = signal.reason;
+              resolve();
+            }, { once: true });
+          });
+        },
+      });
+    });
+    const runtime = await createRuntime({ channels: [channel], clients: [client] });
+    await runtime.dispatch("shutdown", { id: "event" });
+    await runtime.start({ prettyStartupLog: false });
+    await started.promise;
+
+    await runtime.stop();
+
+    expect(abortReason).not.toBeInstanceOf(HandlerTimeoutError);
+    expect((await runtime.listEvents())[0]!.deliveries[0]).toMatchObject({ status: "processed" });
+  });
+
+  it("keeps shutdown cancellation connected while onFailure runs", async () => {
+    const channel = createChannel("shutdown-failure");
+    const failureStarted = deferred();
+    let abortReason: unknown;
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        timeout: "1h",
+        retries: { attempts: 1 },
+        handle() {
+          throw new Error("handler failed");
+        },
+        async onFailure({ signal }) {
+          failureStarted.resolve();
+          await new Promise<void>((resolve) => {
+            signal.addEventListener("abort", () => {
+              abortReason = signal.reason;
+              resolve();
+            }, { once: true });
+          });
+        },
+      });
+    });
+    const runtime = await createRuntime({ channels: [channel], clients: [client] });
+    await runtime.dispatch("shutdown-failure", { id: "event" });
+    await runtime.start({ prettyStartupLog: false });
+    await failureStarted.promise;
+
+    await runtime.stop();
+
+    expect(abortReason).not.toBeInstanceOf(HandlerTimeoutError);
+    expect((await runtime.listEvents())[0]!.deliveries[0]).toMatchObject({ status: "failed", attempts: 1 });
+  });
+
   it("rejects a second active runtime for the same JSON state and releases ownership on stop", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-ownership-"));
     const statePath = join(root, "state.json");
@@ -1035,6 +1098,110 @@ describe("resource lifecycle", () => {
     expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "processed", attempts: 2 });
   });
 
+  it("does not persist sandbox creation when its hook cooperatively times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const channel = createChannel("sandbox-timeout");
+      const starts = [deferred(), deferred()];
+      let creates = 0;
+      let handles = 0;
+      let failures = 0;
+      const environment = createEnvironment("workspace", (builder) => {
+        builder.useSandbox({
+          async create({ signal }) {
+            creates += 1;
+            starts[creates - 1]!.resolve();
+            await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+            expect(signal.reason).toBeInstanceOf(HandlerTimeoutError);
+          },
+        });
+      });
+      const client = createClient("client", (builder) => {
+        builder.useEnvironment(environment);
+        builder.handle(channel, {
+          timeout: "10ms",
+          retries: { attempts: 2 },
+          handle() {
+            handles += 1;
+          },
+          onFailure() {
+            failures += 1;
+          },
+        });
+      });
+      const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+      const dispatch = test.dispatch("sandbox-timeout", { id: "event", sessionKey: "work" });
+      await starts[0]!.promise;
+      await vi.advanceTimersByTimeAsync(10);
+      await starts[1]!.promise;
+      await vi.advanceTimersByTimeAsync(10);
+      await dispatch;
+
+      expect(creates).toBe(2);
+      expect(handles).toBe(0);
+      expect(failures).toBe(0);
+      expect(await test.sessions.get("work")).toMatchObject({ state: {} });
+      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "failed", attempts: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start sandbox work after timing out while waiting for its lock", async () => {
+    vi.useFakeTimers();
+    try {
+      const channel = createChannel("sandbox-lock-timeout");
+      const firstCreateStarted = deferred();
+      const releaseFirstCreate = deferred();
+      let creates = 0;
+      const environment = createEnvironment("workspace", (builder) => {
+        builder.useSandbox({
+          async create() {
+            creates += 1;
+            firstCreateStarted.resolve();
+            await releaseFirstCreate.promise;
+          },
+        });
+      });
+      const client = createClient("client", (builder) => {
+        builder.useEnvironment(environment);
+        builder.concurrency({ workers: 2 });
+        builder.handle(channel, { timeout: "10ms", retries: { attempts: 1 }, handle() {} });
+      });
+      const runtime = await createRuntime({ channels: [channel], clients: [client] });
+      await runtime.dispatch("sandbox-lock-timeout", { id: "first", sessionKey: "work" });
+      await runtime.dispatch("sandbox-lock-timeout", { id: "second", sessionKey: "work" });
+      await runtime.start({ prettyStartupLog: false });
+      await firstCreateStarted.promise;
+
+      for (let index = 0; index < 100; index += 1) {
+        const processing = (await runtime.listEvents())
+          .flatMap(({ deliveries }) => deliveries)
+          .filter(({ status }) => status === "processing");
+        if (processing.length === 2) break;
+        await Promise.resolve();
+      }
+      expect((await runtime.listEvents()).flatMap(({ deliveries }) => deliveries).filter(({ status }) => status === "processing")).toHaveLength(2);
+
+      await vi.advanceTimersByTimeAsync(10);
+      releaseFirstCreate.resolve();
+      for (let index = 0; index < 100; index += 1) {
+        const failed = (await runtime.listEvents())
+          .flatMap(({ deliveries }) => deliveries)
+          .filter(({ status }) => status === "failed");
+        if (failed.length === 2) break;
+        await Promise.resolve();
+      }
+      await runtime.stop();
+
+      expect(creates).toBe(1);
+      expect((await runtime.listEvents()).flatMap(({ deliveries }) => deliveries).every(({ status }) => status === "failed")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("retries the whole attempt when sandbox cleanup fails", async () => {
     const channel = createChannel("sandbox");
     let creates = 0;
@@ -1081,6 +1248,53 @@ describe("resource lifecycle", () => {
       "success:2",
     ]);
     expect(await test.sessions.get("work")).toMatchObject({ status: "ended" });
+  });
+
+  it("keeps the eager sandbox marker when cleanup cooperatively times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const channel = createChannel("sandbox-cleanup-timeout");
+      const cleanupStarted = deferred();
+      let failures = 0;
+      const environment = createEnvironment("workspace", (builder) => {
+        builder.useSandbox({
+          create() {},
+          async cleanup({ signal }) {
+            cleanupStarted.resolve();
+            await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          },
+        });
+      });
+      const client = createClient("client", (builder) => {
+        builder.useEnvironment(environment);
+        builder.handle(channel, {
+          timeout: "10ms",
+          retries: { attempts: 1 },
+          handle({ session }) {
+            session.end({ reason: "done" });
+          },
+          onFailure({ error }) {
+            expect(error).toBeInstanceOf(HandlerTimeoutError);
+            failures += 1;
+          },
+        });
+      });
+      const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+      const dispatch = test.dispatch("sandbox-cleanup-timeout", { id: "event", sessionKey: "work" });
+      await cleanupStarted.promise;
+      await vi.advanceTimersByTimeAsync(10);
+      await dispatch;
+
+      expect(failures).toBe(1);
+      expect(await test.sessions.get("work")).toMatchObject({
+        status: "active",
+        state: { "__sao.sandbox.workspace.created": true },
+      });
+      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "failed", attempts: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("unmounts environments before one-shot drain startup resolves", async () => {

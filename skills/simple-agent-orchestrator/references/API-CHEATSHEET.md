@@ -11,6 +11,7 @@ export default defineConfig(({ project }) => ({
   name: String(project.packageJson.name ?? "agent-orchestrator"),
   channels: [manualChannel],
   clients: [codingClient],
+  timeout: "10m",
 }));
 ```
 
@@ -84,15 +85,17 @@ type DispatchEvent = {
 ## Clients
 
 ```ts
-import { createClient } from "simple-agent-orchestrator";
+import { createClient, HandlerTimeoutError } from "simple-agent-orchestrator";
 
 export const codingClient = createClient("coding", (client) => {
   client.useEnvironment(opencodeEnvironment);
   client.concurrency({ workers: 2, perSession: true });
   client.retries({ attempts: 3, delay: "5s" });
+  client.timeout("10m");
 
   client.handle(githubReviewsChannel, {
     id: "coding.githubReviews",
+    timeout: "2m",
 
     async handle({ event, session, environment, project, logger, signal }) {
       // Route event to persistent resource.
@@ -106,6 +109,8 @@ export const codingClient = createClient("coding", (client) => {
 ```
 
 Retry `attempts` and fixed `delay` resolve independently from handler options, client defaults, global config, then built-ins (`3` and `0`). Numbers are milliseconds; strings accept `ms`, `s`, `m`, and `h`. Positive fractions round up to one millisecond; the maximum is `2_147_483_647` ms (about 24.9 days). Delayed retries stay durably pending with `nextAttemptAt`. Normal workers wait for eligibility, while drains return without waiting; manual retry and interrupted-attempt recovery are immediate.
+
+Timeout resolves from handler `timeout`, the `client.timeout(...)` value captured at registration, global config `timeout`, then `0` (disabled). An explicit zero disables inheritance. It cooperatively aborts sandbox creation, `handle`, `onSuccess`, and sandbox cleanup with `HandlerTimeoutError`, then applies ordinary retries. Pass `signal` through to project APIs. Work that ignores cancellation is still awaited, and external side effects may repeat. Runtime shutdown wins if it aborts first.
 
 Handler context:
 
@@ -121,6 +126,8 @@ type HandlerContext = {
   signal: AbortSignal;
 };
 ```
+
+Use `error instanceof HandlerTimeoutError` in `onFailure` to distinguish a deadline. The timeout error exposes `timeoutMs`; a timeout failure hook receives the already-aborted attempt signal.
 
 ## Sessions
 

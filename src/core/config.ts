@@ -14,6 +14,7 @@ export interface OrchestratorConfig {
   clients?: ClientDefinition[];
   logger?: Logger;
   retries?: RetryOptions;
+  timeout?: number | string;
 }
 
 export type ConfigFactory =

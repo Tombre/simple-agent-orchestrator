@@ -1,5 +1,6 @@
 export const MAX_DATE_TIMESTAMP = 8_640_000_000_000_000;
-export const MAX_RETRY_DELAY_MS = 2_147_483_647;
+export const MAX_TIMER_DURATION_MS = 2_147_483_647;
+export const MAX_RETRY_DELAY_MS = MAX_TIMER_DURATION_MS;
 
 export function nowIso(): string {
   return new Date().toISOString();

@@ -46,6 +46,8 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
 
 7. **Assume at-least-once external effects.** Event dedupe is not exactly-once processing. `handle`, `onSuccess`, `onFailure`, sandbox hooks, and external agent operations can repeat after uncertain failures. Startup and drain automatically retry deliveries interrupted in `processing`, without knowing whether their external effects completed. Use operation-specific idempotency keys derived from stable event/session identity, never from `attempt`; reconcile current external state when providers do not support keys. Done when every external effect is safe to retry or its residual risk is explicit.
 
+   When a handler timeout is appropriate, configure it globally, with `client.timeout(...)`, or on the handler, and pass the context `signal` into agents, subprocesses, network requests, and sandbox operations. Timeout cancellation is cooperative: code that ignores the signal is still awaited, and provider-side effects may already have happened. Done when bounded operations honor cancellation without being treated as exactly once.
+
 8. **Validate with the CLI.** Prefer these checks after edits:
 
    ```bash
