@@ -588,6 +588,50 @@ describe("resource lifecycle", () => {
     await runtime.stop();
   });
 
+  it("preserves falsy cleanup errors during startup shutdown", async () => {
+    const environment = createEnvironment("failure", (builder) => {
+      builder.onMount(() => {
+        throw new Error("mount failed");
+      });
+      builder.onUnmount(() => {
+        throw undefined;
+      });
+    });
+    const client = createClient("client", (builder) => builder.useEnvironment(environment));
+    const runtime = await createRuntime({ clients: [client] });
+
+    const error = await runtime.start({ prettyStartupLog: false }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toEqual([new Error("mount failed"), undefined]);
+  });
+
+  it("rejects overlapping offline drains and permits sequential drains", async () => {
+    const mountStarted = deferred();
+    const releaseMount = deferred();
+    let mounts = 0;
+    const environment = createEnvironment("service", (builder) => {
+      builder.onMount(async () => {
+        mounts += 1;
+        mountStarted.resolve();
+        await releaseMount.promise;
+      });
+    });
+    const client = createClient("client", (builder) => builder.useEnvironment(environment));
+    const runtime = await createRuntime({ clients: [client] });
+
+    await runtime.runOffline(async ({ drain }) => {
+      const firstDrain = drain();
+      await mountStarted.promise;
+      await expect(drain()).rejects.toThrow("another drain is in progress");
+      releaseMount.resolve();
+      await firstDrain;
+      await drain();
+    });
+
+    expect(mounts).toBe(1);
+  });
+
   it("releases JSON state ownership when environment unmounting fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-ownership-"));
     const statePath = join(root, "state.json");
@@ -796,6 +840,127 @@ describe("resource lifecycle", () => {
     const replacement = await createRuntime({ store: jsonFileStore(statePath) });
     await replacement.start({ prettyStartupLog: false });
     await replacement.stop();
+  });
+
+  it("rejects duplicate and conflicting lifecycle operations", async () => {
+    const mountStarted = deferred();
+    const releaseMount = deferred();
+    const environment = createEnvironment("service", (builder) => {
+      builder.onMount(async () => {
+        mountStarted.resolve();
+        await releaseMount.promise;
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+    });
+    const runtime = await createRuntime({ clients: [client] });
+
+    const startup = runtime.start({ prettyStartupLog: false });
+    await mountStarted.promise;
+    await expect(runtime.start({ prettyStartupLog: false })).rejects.toThrow("runtime is starting");
+    await expect(runtime.drain()).rejects.toThrow("start() has already claimed");
+    await expect(runtime.stop()).rejects.toThrow("runtime is starting");
+
+    releaseMount.resolve();
+    await startup;
+    await expect(runtime.start({ prettyStartupLog: false })).rejects.toThrow("start() has already been called");
+    await expect(runtime.drain()).rejects.toThrow("start() has already claimed");
+    await runtime.stop();
+    await expect(runtime.start({ prettyStartupLog: false })).rejects.toThrow("runtime has been stopped");
+    await expect(runtime.drain()).rejects.toThrow("runtime has been stopped");
+  });
+
+  it("unwinds mounted environments in reverse order when startup fails", async () => {
+    const lifecycle: string[] = [];
+    const createLifecycleClient = (id: string, fail = false) => {
+      const environment = createEnvironment(`environment-${id}`, (builder) => {
+        builder.onMount(() => {
+          lifecycle.push(`mount:${id}`);
+          if (fail) throw new Error("mount failed");
+        });
+        builder.onUnmount(({ signal }) => {
+          lifecycle.push(`unmount:${id}:${String(signal.aborted)}`);
+        });
+      });
+      return createClient(`client-${id}`, (builder) => {
+        builder.useEnvironment(environment);
+      });
+    };
+    const runtime = await createRuntime({
+      clients: [createLifecycleClient("first"), createLifecycleClient("second"), createLifecycleClient("failure", true)],
+    });
+
+    await expect(runtime.start({ prettyStartupLog: false })).rejects.toThrow("mount failed");
+
+    expect(lifecycle).toEqual([
+      "mount:first",
+      "mount:second",
+      "mount:failure",
+      "unmount:failure:false",
+      "unmount:second:true",
+      "unmount:first:true",
+    ]);
+    await expect(runtime.start({ prettyStartupLog: false })).rejects.toThrow("runtime has been stopped");
+    await runtime.stop();
+    expect(lifecycle).toHaveLength(6);
+  });
+
+  it("rejects invalid poll intervals before mounting startup resources", async () => {
+    let mounts = 0;
+    const channel = createChannel("poll", (builder) => {
+      builder.poll({ every: "invalid", fetch: () => [] });
+    });
+    const environment = createEnvironment("service", (builder) => {
+      builder.onMount(() => {
+        mounts += 1;
+      });
+    });
+    const client = createClient("client", (builder) => builder.useEnvironment(environment));
+    const runtime = await createRuntime({ channels: [channel], clients: [client] });
+
+    await expect(runtime.start({ prettyStartupLog: false })).rejects.toThrow("Invalid duration string");
+
+    expect(mounts).toBe(0);
+    await runtime.stop();
+  });
+
+  it("coordinates concurrent stops and continues reverse-order cleanup after failures", async () => {
+    const unmountStarted = deferred();
+    const releaseUnmount = deferred();
+    const lifecycle: string[] = [];
+    const firstEnvironment = createEnvironment("first", (builder) => {
+      builder.onUnmount(() => {
+        lifecycle.push("first");
+      });
+    });
+    const secondEnvironment = createEnvironment("second", (builder) => {
+      builder.onUnmount(async () => {
+        lifecycle.push("second:early");
+        unmountStarted.resolve();
+        await releaseUnmount.promise;
+      });
+      builder.onUnmount(() => {
+        lifecycle.push("second:late");
+        throw new Error("unmount failed");
+      });
+    });
+    const firstClient = createClient("first", (builder) => builder.useEnvironment(firstEnvironment));
+    const secondClient = createClient("second", (builder) => builder.useEnvironment(secondEnvironment));
+    const runtime = await createRuntime({ clients: [firstClient, secondClient] });
+    await runtime.start({ prettyStartupLog: false });
+
+    const firstStop = runtime.stop();
+    await unmountStarted.promise;
+    const secondStop = runtime.stop();
+    releaseUnmount.resolve();
+
+    const errors = await Promise.all([firstStop.catch((error: unknown) => error), secondStop.catch((error: unknown) => error)]);
+    expect(errors[0]).toBe(errors[1]);
+    expect(errors[0]).toEqual(new Error("unmount failed"));
+    expect(lifecycle).toEqual(["second:late", "second:early", "first"]);
+    await expect(runtime.stop()).rejects.toThrow("unmount failed");
+    expect(lifecycle).toEqual(["second:late", "second:early", "first", "second:late"]);
   });
 
   it("persists a created sandbox across handler retries and cleans it after session end", async () => {
@@ -1136,7 +1301,7 @@ describe("resource lifecycle", () => {
     await runtime.stop();
   });
 
-  it("mounts one environment instance across concurrent drains", async () => {
+  it("rejects overlapping direct drains without mounting twice", async () => {
     const mountStarted = deferred();
     const releaseMount = deferred();
     let mounts = 0;
@@ -1161,9 +1326,9 @@ describe("resource lifecycle", () => {
 
     const firstDrain = runtime.drain();
     await mountStarted.promise;
-    const secondDrain = runtime.drain();
+    await expect(runtime.drain()).rejects.toThrow("another drain is in progress");
     releaseMount.resolve();
-    await Promise.all([firstDrain, secondDrain]);
+    await firstDrain;
     await runtime.stop();
 
     expect(mounts).toBe(1);

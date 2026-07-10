@@ -38,6 +38,8 @@ export const codingClient = createClient("coding", (client) => {
 });
 ```
 
+Mount hooks run in registration order. Shutdown and failed-startup rollback unmount environments in reverse mount order and run each environment's unmount hooks in reverse registration order. Cleanup continues if a hook fails; repeated `stop()` calls retry only hooks that failed. Keep unmount hooks safe to retry because cleanup can fail after partially completing external work.
+
 ## Sandbox
 
 A sandbox is a session-scoped resource managed by an environment.

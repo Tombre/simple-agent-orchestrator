@@ -46,6 +46,13 @@ interface ClaimedDelivery {
   client: ClientDefinition;
 }
 
+type RuntimeLifecycleState = "unused" | "starting" | "started" | "drain" | "stopping" | "stopped";
+
+interface MountedEnvironment {
+  instance: EnvironmentInstanceImpl;
+  pendingUnmountHooks: EnvironmentDefinition["unmountHooks"];
+}
+
 function parseRetryDelay(value: number | string): number {
   const duration = parseDuration(value);
   const normalized = duration > 0 ? Math.ceil(duration) : 0;
@@ -87,7 +94,7 @@ export class OrchestratorRuntime {
   private readonly logger: Logger;
   private readonly mutex = new StoreMutex();
   private readonly abortController = new AbortController();
-  private readonly environmentInstances = new Map<string, EnvironmentInstanceImpl>();
+  private readonly environmentInstances = new Map<string, MountedEnvironment>();
   private readonly environmentMounts = new Map<string, Promise<EnvironmentInstanceImpl>>();
   private readonly intervalHandles: NodeJS.Timeout[] = [];
   private readonly workerPromises: Promise<void>[] = [];
@@ -97,9 +104,9 @@ export class OrchestratorRuntime {
   private readonly sandboxLocks = new Map<string, Promise<void>>();
   private ownership: RuntimeOwnership | undefined;
   private ownershipPromise: Promise<RuntimeOwnership> | undefined;
-  private runtimeLifecycleClaimed = false;
-  private runtimeLifecycleKind: "start" | "drain" | undefined;
-  private lifecycleTransitions = 0;
+  private lifecycleState: RuntimeLifecycleState = "unused";
+  private drainInProgress = false;
+  private stopPromise: Promise<void> | undefined;
   private offlineOperationActive = false;
   private initialized = false;
 
@@ -126,44 +133,62 @@ export class OrchestratorRuntime {
   }
 
   async start(options: StartOptions = {}): Promise<void> {
-    this.claimRuntimeLifecycle("start");
+    this.claimStart();
+    let startupError: unknown;
+    let startupFailed = false;
     try {
       await this.ensureRuntimeOwnership();
-      try {
-        await this.init();
+      await this.init();
+      if (options.prettyStartupLog ?? true) this.printStartupSummary();
+
+      if (options.drain) {
+        await this.runAllPollsOnce();
+        await this.drainOwned();
+      } else {
         await this.recoverInterruptedDeliveries();
-        if (options.prettyStartupLog ?? true) this.printStartupSummary();
-
-        if (options.drain) {
-          try {
-            await this.runAllPollsOnce();
-            await this.drainOwned();
-          } finally {
-            await this.stopInternal();
-          }
-          return;
-        }
-
         await this.mountAllEnvironments();
         this.startPollers();
         this.startWorkers();
-      } catch (error) {
-        try {
-          await this.releaseRuntimeOwnership();
-        } catch (releaseError) {
-          throw new AggregateError([error, releaseError], "Runtime startup and ownership release failed");
-        }
-        throw error;
       }
-    } finally {
-      this.lifecycleTransitions -= 1;
+    } catch (error) {
+      startupFailed = true;
+      startupError = error;
     }
+
+    if (startupFailed) {
+      try {
+        await this.shutdown();
+      } catch (shutdownError) {
+        throw new AggregateError([startupError, shutdownError], "Runtime startup and shutdown failed");
+      }
+      throw startupError;
+    }
+
+    if (options.drain) {
+      await this.shutdown();
+      return;
+    }
+    this.lifecycleState = "started";
   }
 
   async stop(): Promise<void> {
     if (this.offlineOperationActive) throw new Error("Cannot stop a runtime during an active offline operation");
-    if (this.lifecycleTransitions > 0) throw new Error("Cannot stop a runtime while its lifecycle is starting");
-    await this.stopInternal();
+    if (this.lifecycleState === "starting") throw new Error("Cannot stop a runtime while the runtime is starting");
+    if (this.drainInProgress) throw new Error("Cannot stop a runtime while a drain is in progress");
+    await this.shutdown();
+  }
+
+  private async shutdown(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.lifecycleState = "stopping";
+    const stopping = this.stopInternal();
+    this.stopPromise = stopping;
+    try {
+      await stopping;
+    } finally {
+      this.lifecycleState = "stopped";
+      if (this.stopPromise === stopping) this.stopPromise = undefined;
+    }
   }
 
   private async stopInternal(): Promise<void> {
@@ -173,35 +198,40 @@ export class OrchestratorRuntime {
     await Promise.allSettled(this.pollPromises.values());
     await Promise.allSettled(this.workerPromises);
     let unmountError: unknown;
+    let unmountFailed = false;
     try {
       await this.unmountAllEnvironments();
     } catch (error) {
+      unmountFailed = true;
       unmountError = error;
     }
     let releaseError: unknown;
+    let releaseFailed = false;
     try {
       await this.releaseRuntimeOwnership();
     } catch (error) {
+      releaseFailed = true;
       releaseError = error;
     }
-    if (unmountError && releaseError) {
+    if (unmountFailed && releaseFailed) {
       throw new AggregateError([unmountError, releaseError], "Runtime shutdown and ownership release failed");
     }
-    if (unmountError) throw unmountError;
-    if (releaseError) throw releaseError;
+    if (unmountFailed) throw unmountError;
+    if (releaseFailed) throw releaseError;
   }
 
   async drain(): Promise<void> {
-    this.claimRuntimeLifecycle("drain");
+    this.claimDrain();
     try {
       await this.ensureRuntimeOwnership();
       await this.drainOwned();
     } finally {
-      this.lifecycleTransitions -= 1;
+      this.drainInProgress = false;
     }
   }
 
   private async drainOwned(): Promise<void> {
+    await this.init();
     await this.recoverInterruptedDeliveries();
     await this.mountAllEnvironments();
     while (true) {
@@ -214,9 +244,19 @@ export class OrchestratorRuntime {
     }
   }
 
+  private async drainOwnedGuarded(): Promise<void> {
+    if (this.drainInProgress) throw new Error("Cannot drain a runtime while another drain is in progress");
+    this.drainInProgress = true;
+    try {
+      await this.drainOwned();
+    } finally {
+      this.drainInProgress = false;
+    }
+  }
+
   async runOffline<T>(operation: (context: OfflineOperationContext) => Promise<T>): Promise<T> {
     if (this.offlineOperationActive) throw new Error("An offline operation is already active on this runtime");
-    if (this.runtimeLifecycleClaimed || this.abortController.signal.aborted) {
+    if (this.lifecycleState !== "unused") {
       throw new Error("runOffline requires an unused one-shot runtime");
     }
     this.offlineOperationActive = true;
@@ -230,7 +270,7 @@ export class OrchestratorRuntime {
     let operationError: unknown;
     let operationFailed = false;
     try {
-      result = await operation({ drain: () => this.drainOwned() });
+      result = await operation({ drain: () => this.drainOwnedGuarded() });
     } catch (error) {
       operationFailed = true;
       operationError = error;
@@ -239,7 +279,7 @@ export class OrchestratorRuntime {
     let stopError: unknown;
     let stopFailed = false;
     try {
-      await this.stopInternal();
+      await this.shutdown();
     } catch (error) {
       stopFailed = true;
       stopError = error;
@@ -254,21 +294,30 @@ export class OrchestratorRuntime {
     return result as T;
   }
 
-  private claimRuntimeLifecycle(kind: "start" | "drain"): void {
-    if (this.offlineOperationActive) throw new Error("Cannot start or drain during an active offline operation");
-    if (this.abortController.signal.aborted) {
-      throw new Error("This one-shot runtime lifecycle has already been used");
+  private claimStart(): void {
+    if (this.offlineOperationActive) throw new Error("Cannot start a runtime during an active offline operation");
+    if (this.lifecycleState === "unused") {
+      this.lifecycleState = "starting";
+      return;
     }
-    if (this.runtimeLifecycleClaimed) {
-      if (kind === "drain" && this.runtimeLifecycleKind === "drain") {
-        this.lifecycleTransitions += 1;
-        return;
-      }
-      throw new Error("This one-shot runtime lifecycle has already been used");
+    if (this.lifecycleState === "starting") throw new Error("Cannot start a runtime while the runtime is starting");
+    if (this.lifecycleState === "started") throw new Error("Cannot start a runtime because start() has already been called");
+    if (this.lifecycleState === "drain") {
+      throw new Error("Cannot start a runtime after drain() has already claimed its one-shot lifecycle");
     }
-    this.runtimeLifecycleClaimed = true;
-    this.runtimeLifecycleKind = kind;
-    this.lifecycleTransitions = 1;
+    throw new Error("Cannot start a runtime after the runtime has been stopped");
+  }
+
+  private claimDrain(): void {
+    if (this.offlineOperationActive) throw new Error("Cannot drain a runtime during an active offline operation");
+    if (this.lifecycleState === "unused") this.lifecycleState = "drain";
+    else if (this.lifecycleState === "starting" || this.lifecycleState === "started") {
+      throw new Error("Cannot drain a runtime because start() has already claimed its one-shot lifecycle");
+    } else if (this.lifecycleState === "stopping" || this.lifecycleState === "stopped") {
+      throw new Error("Cannot drain a runtime after the runtime has been stopped");
+    }
+    if (this.drainInProgress) throw new Error("Cannot drain a runtime while another drain is in progress");
+    this.drainInProgress = true;
   }
 
   async dispatch(
@@ -782,7 +831,7 @@ export class OrchestratorRuntime {
     const definition = client.environment ?? createEmptyEnvironment();
     const key = `${client.id}:${definition.id}`;
     const existing = this.environmentInstances.get(key);
-    if (existing) return existing;
+    if (existing) return existing.instance;
     const existingMount = this.environmentMounts.get(key);
     if (existingMount) return existingMount;
 
@@ -807,34 +856,49 @@ export class OrchestratorRuntime {
         });
       }
     } catch (error) {
+      const failedHooks: EnvironmentDefinition["unmountHooks"] = [];
       for (const hook of [...definition.unmountHooks].reverse()) {
         try {
           await hook({ environment: instance, project: this.project, logger: this.logger, signal: this.abortController.signal });
         } catch (rollbackError) {
           this.logger.warn("Environment rollback failed", { error: formatError(rollbackError) });
+          failedHooks.push(hook);
         }
+      }
+      if (failedHooks.length > 0) {
+        this.environmentInstances.set(key, { instance, pendingUnmountHooks: failedHooks });
       }
       throw error;
     }
-    this.environmentInstances.set(key, instance);
+    this.environmentInstances.set(key, {
+      instance,
+      pendingUnmountHooks: [...definition.unmountHooks].reverse(),
+    });
     return instance;
   }
 
   private async unmountAllEnvironments(): Promise<void> {
-    for (const client of this.clients) {
-      const definition = client.environment ?? createEmptyEnvironment();
-      const instance = this.environmentInstances.get(`${client.id}:${definition.id}`);
-      if (!instance) continue;
-      for (const hook of [...definition.unmountHooks].reverse()) {
-        await hook({
-          environment: instance,
-          project: this.project,
-          logger: this.logger,
-          signal: this.abortController.signal,
-        });
+    const errors: unknown[] = [];
+    for (const [key, mounted] of [...this.environmentInstances.entries()].reverse()) {
+      const failedHooks: EnvironmentDefinition["unmountHooks"] = [];
+      for (const hook of mounted.pendingUnmountHooks) {
+        try {
+          await hook({
+            environment: mounted.instance,
+            project: this.project,
+            logger: this.logger,
+            signal: this.abortController.signal,
+          });
+        } catch (error) {
+          errors.push(error);
+          failedHooks.push(hook);
+        }
       }
-      this.environmentInstances.delete(`${client.id}:${definition.id}`);
+      mounted.pendingUnmountHooks = failedHooks;
+      if (failedHooks.length === 0) this.environmentInstances.delete(key);
     }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "Multiple environment unmount hooks failed");
   }
 
   private async ensureSandbox(
@@ -891,6 +955,9 @@ export class OrchestratorRuntime {
   private validateConfiguration(): void {
     this.assertUnique(this.channels.map(({ id }) => id), "channel");
     this.assertUnique(this.clients.map(({ id }) => id), "client");
+    for (const channel of this.channels) {
+      for (const poll of channel.polls) parseDuration(poll.every);
+    }
     if (this.options.config.retries?.delay !== undefined) parseRetryDelay(this.options.config.retries.delay);
     for (const client of this.clients) {
       this.assertUnique(client.handlers.map(({ id }) => id), "handler", ` for client ${client.id}`);

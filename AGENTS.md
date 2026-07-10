@@ -120,9 +120,11 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Treat an `OrchestratorRuntime` as one-shot. Its abort controller remains aborted after `stop()`.
 - Normal `start()` mounts environments, starts pollers, and starts client workers.
 - `start({ drain: true })` polls once, drains currently eligible deliveries without waiting for delayed work, and always stops and unmounts before resolving.
-- Direct `drain()` mounts environments but does not unmount them; its caller must eventually call `stop()`.
+- Direct `drain()` mounts environments, may repeat sequentially, rejects overlap, and does not unmount; its caller must eventually call `stop()`.
+- Startup failure performs full shutdown before rejecting. Duplicate starts, conflicting start/drain calls, and restart after stop are rejected.
+- `stop()` shares concurrent cleanup, is otherwise idempotent, and retries only unmount hooks that previously failed.
 - Environment instances are scoped by client ID and environment ID. Their values are process-local.
-- Mount hooks run in registration order. Unmount hooks run in reverse order.
+- Mount hooks run in registration order. Environments unmount in reverse mount order and hooks run in reverse registration order; cleanup continues after failures.
 - Shutdown is cooperative. Handlers and hooks must observe their `AbortSignal` when appropriate.
 - `workers` controls in-process parallelism.
 - `perSession: true` serializes same-session deliveries for that client only within one runtime process; every participating client must opt in for runtime-wide same-session serialization.
@@ -139,7 +141,6 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - The JSON store rejects multiple active runtimes and scopes explicit `runOffline()` operations, but it is not safe for unscoped or arbitrary concurrent writers.
 - JSON-store first-run initialization and runtime ownership require a local filesystem with atomic hard-link support.
 - There is no distributed worker coordination or distributed per-session lock.
-- Runtime lifecycle calls do not yet have complete duplicate-start or restart guards.
 - Processing is not exactly once, and retries can repeat external side effects.
 - Retries support only a fixed delay; there is no backoff, jitter, timeout, arbitrary schedule, or dead-letter queue.
 - Only memory and JSON-file stores ship.
