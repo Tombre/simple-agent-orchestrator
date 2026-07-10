@@ -112,4 +112,4 @@ The store interface is intentionally small so you can add a database-backed adap
 
 Ownership records use atomic hard links and require a local hard-link-capable filesystem. Unsupported filesystems fail startup explicitly instead of silently disabling enforcement.
 
-This enforces the supported one-active-runtime model, but it does not make the JSON store safe for arbitrary concurrent writers. CLI `dispatch`, `sessions end`, and `events retry` acquire ownership for their complete offline operation and fail before writing while a runtime is active. Direct library mutations remain unsafe unless the caller scopes them with `runtime.runOffline(...)`.
+This enforces the supported one-active-runtime model, but it does not make the JSON store safe for arbitrary concurrent writers. Once ownership is acquired, startup and drain requeue deliveries left `processing` by an interrupted owner before workers claim work. CLI `dispatch`, `sessions end`, and `events retry` acquire ownership for their complete offline operation and fail before writing while a runtime is active. Direct library mutations remain unsafe unless the caller scopes them with `runtime.runOffline(...)`.

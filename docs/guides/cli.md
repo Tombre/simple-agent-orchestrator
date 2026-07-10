@@ -84,7 +84,7 @@ npx simple-agent-orchestrator events list
 npx simple-agent-orchestrator events retry <delivery-id>
 ```
 
-`list` is an inspection command available while `start` is active. `retry` is an offline mutation that grants one additional attempt to a failed delivery and drains the runtime once. Pending, processing, and processed deliveries are not requeued. The complete handler attempt can run again, so external effects and source acknowledgement must use stable idempotency keys or reconciliation.
+`list` is an inspection command available while `start` is active. `retry` is an offline mutation that grants one additional attempt to a failed delivery and drains the runtime once. The retry action itself does not requeue pending, processing, or processed deliveries; however, its drain automatically recovers any delivery left `processing` by an interrupted runtime. The complete handler attempt can run again, so external effects and source acknowledgement must use stable idempotency keys or reconciliation.
 
 ## print-config
 

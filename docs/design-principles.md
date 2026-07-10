@@ -50,7 +50,7 @@ A delivery is only marked processed after the handler, success hook, required sa
 
 Local delivery state cannot be committed atomically with source acknowledgement, agent calls, or other external effects. A failed attempt may therefore repeat work that completed externally. Integrations own stable external idempotency keys or reconciliation, and acknowledgement belongs after successful handling.
 
-Event dedupe is not an exactly-once processing guarantee. Abrupt crashes can currently strand `processing` deliveries because stale-claim recovery is not implemented.
+Event dedupe is not an exactly-once processing guarantee. After an abrupt exit, the next startup or drain requeues deliveries left `processing`; because the interrupted attempt may already have completed external work, recovery can repeat effects.
 
 ## Prefer small composable primitives
 

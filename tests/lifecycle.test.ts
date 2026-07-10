@@ -11,11 +11,12 @@ import {
   createEnvironment,
   cursorKey,
   jsonFileStore,
+  type Logger,
   memoryStore,
   type Store,
 } from "../src/index.js";
 import { createTestRuntime } from "../src/testing/index.js";
-import { createRuntime, deferred } from "./helpers.js";
+import { createRuntime, deferred, waitFor } from "./helpers.js";
 
 type OwnerMessage = { type: "ready"; pid: number } | { type: "error"; message: string };
 
@@ -183,6 +184,231 @@ describe("resource lifecycle", () => {
 
     await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(orphanCandidate, "utf8")).toBe("orphan");
+  });
+
+  it("recovers a delivery interrupted after its durable claim on JSON-store restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-crash-recovery-"));
+    const statePath = join(root, "state.json");
+    const backing = jsonFileStore(statePath);
+    let interruptClaim = true;
+    const interruptedStore: Store = {
+      name: "interrupted-json-claim",
+      runtimeLockPath: backing.runtimeLockPath!,
+      init: () => backing.init(),
+      read: () => backing.read(),
+      async write(state) {
+        await backing.write(state);
+        if (interruptClaim && state.deliveries.some(({ status }) => status === "processing")) {
+          interruptClaim = false;
+          throw new Error("process exited after claim persistence");
+        }
+      },
+    };
+    const channel = createChannel("recovery");
+    const attempts: number[] = [];
+    const client = createClient("client", (builder) => {
+      builder.retries({ attempts: 1 });
+      builder.handle(channel, ({ attempt }) => {
+        attempts.push(attempt);
+      });
+    });
+    const interruptedRuntime = await createRuntime({ channels: [channel], clients: [client], store: interruptedStore });
+    await interruptedRuntime.dispatch("recovery", { id: "event" });
+
+    await expect(interruptedRuntime.drain()).rejects.toThrow("process exited after claim persistence");
+    expect((await backing.read()).deliveries[0]).toMatchObject({
+      status: "processing",
+      attempts: 1,
+      maxAttempts: 1,
+    });
+    await interruptedRuntime.stop();
+
+    const warnings: { message: string; data?: Record<string, unknown> | undefined }[] = [];
+    const logger: Logger = {
+      debug() {},
+      info() {},
+      warn(message, data) {
+        warnings.push({ message, data });
+      },
+      error() {},
+    };
+    const replacement = await createRuntime({ channels: [channel], clients: [client], store: backing, logger });
+    await replacement.start({ prettyStartupLog: false });
+    await waitFor(async () => {
+      expect((await replacement.listEvents())[0]!.deliveries[0]?.status).toBe("processed");
+    });
+    await replacement.stop();
+
+    expect(attempts).toEqual([2]);
+    const recoveredDelivery = (await replacement.listEvents())[0]!.deliveries[0]!;
+    expect(recoveredDelivery).toMatchObject({
+      status: "processed",
+      attempts: 2,
+      maxAttempts: 2,
+    });
+    expect(recoveredDelivery.lastError).toBeUndefined();
+    expect(warnings).toEqual([
+      {
+        message: "Recovered interrupted deliveries",
+        data: {
+          count: 1,
+          deliveries: [{ id: expect.any(String), interruptedAttempt: 1 }],
+        },
+      },
+    ]);
+  });
+
+  it("repeats uncertain handler work and continues ordinary retries after recovery", async () => {
+    const backing = memoryStore();
+    let failAttemptCompletion = true;
+    const interruptedStore: Store = {
+      name: "interrupted-attempt",
+      init: () => backing.init(),
+      read: () => backing.read(),
+      async write(state) {
+        const delivery = state.deliveries[0];
+        if (
+          failAttemptCompletion &&
+          delivery?.attempts === 1 &&
+          (delivery.status === "processed" || delivery.status === "pending" || delivery.status === "failed")
+        ) {
+          throw new Error("process exited before attempt completion persistence");
+        }
+        await backing.write(state);
+      },
+    };
+    const channel = createChannel("recovery");
+    const effects: { attempt: number; key: string }[] = [];
+    const client = createClient("client", (builder) => {
+      builder.retries({ attempts: 3 });
+      builder.handle(channel, ({ attempt, event, session }) => {
+        effects.push({ attempt, key: `effect:${event.channelId}:${event.dedupeKey}` });
+        session.set("committedAttempt", attempt);
+        if (attempt === 2) throw new Error("ordinary retry after recovery");
+      });
+    });
+    const interruptedRuntime = await createRuntime({ channels: [channel], clients: [client], store: interruptedStore });
+    await interruptedRuntime.dispatch("recovery", { id: "event", sessionKey: "work" });
+
+    await expect(interruptedRuntime.drain()).rejects.toThrow("process exited before attempt completion persistence");
+    expect((await backing.read()).deliveries[0]).toMatchObject({ status: "processing", attempts: 1, maxAttempts: 3 });
+    failAttemptCompletion = false;
+
+    await interruptedRuntime.drain();
+    await interruptedRuntime.stop();
+
+    expect(effects).toEqual([
+      { attempt: 1, key: "effect:recovery:event" },
+      { attempt: 2, key: "effect:recovery:event" },
+      { attempt: 3, key: "effect:recovery:event" },
+    ]);
+    expect(await interruptedRuntime.getSession("work")).toMatchObject({ state: { committedAttempt: 3 } });
+    expect((await interruptedRuntime.listEvents())[0]!.deliveries[0]).toMatchObject({
+      status: "processed",
+      attempts: 3,
+      maxAttempts: 3,
+    });
+  });
+
+  it("recovers through an offline drain and exposes the interrupted attempt while processing", async () => {
+    const store = memoryStore();
+    const channel = createChannel("recovery");
+    let observedLastError: string | undefined;
+    let runtime: Awaited<ReturnType<typeof createRuntime>>;
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, async () => {
+        observedLastError = (await runtime.listEvents())[0]!.deliveries[0]!.lastError;
+      });
+    });
+    runtime = await createRuntime({ channels: [channel], clients: [client], store });
+    await runtime.dispatch("recovery", { id: "event" });
+    const interruptedState = await store.read();
+    interruptedState.deliveries[0]!.status = "processing";
+    interruptedState.deliveries[0]!.attempts = 1;
+    await store.write(interruptedState);
+
+    await runtime.runOffline(async ({ drain }) => drain());
+
+    expect(observedLastError).toBe(
+      "Interrupted during attempt 1; recovered before processing resumed. Handler and external effects may run again.",
+    );
+    expect((await runtime.listEvents())[0]!.deliveries[0]).toMatchObject({ status: "processed", attempts: 2 });
+  });
+
+  it("retries recovery persistence on a later drain", async () => {
+    const backing = memoryStore();
+    let failRecoveryWrite = true;
+    const store: Store = {
+      name: "recovery-write-failure",
+      init: () => backing.init(),
+      read: () => backing.read(),
+      async write(state) {
+        const delivery = state.deliveries[0];
+        if (failRecoveryWrite && delivery?.status === "pending" && delivery.lastError?.startsWith("Interrupted during")) {
+          failRecoveryWrite = false;
+          throw new Error("recovery write failed");
+        }
+        await backing.write(state);
+      },
+    };
+    const channel = createChannel("recovery");
+    const attempts: number[] = [];
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, ({ attempt }) => {
+        attempts.push(attempt);
+      });
+    });
+    const runtime = await createRuntime({ channels: [channel], clients: [client], store });
+    await runtime.dispatch("recovery", { id: "event" });
+    const interruptedState = await backing.read();
+    interruptedState.deliveries[0]!.status = "processing";
+    interruptedState.deliveries[0]!.attempts = 1;
+    await backing.write(interruptedState);
+
+    await expect(runtime.drain()).rejects.toThrow("recovery write failed");
+    expect((await backing.read()).deliveries[0]).toMatchObject({ status: "processing", attempts: 1 });
+
+    await runtime.drain();
+    await runtime.stop();
+
+    expect(attempts).toEqual([2]);
+    expect((await runtime.listEvents())[0]!.deliveries[0]).toMatchObject({ status: "processed", attempts: 2 });
+  });
+
+  it("releases per-session serialization when a durable claim write rejects", async () => {
+    const backing = memoryStore();
+    let interruptClaim = true;
+    const store: Store = {
+      name: "interrupted-per-session-claim",
+      init: () => backing.init(),
+      read: () => backing.read(),
+      async write(state) {
+        await backing.write(state);
+        if (interruptClaim && state.deliveries.some(({ status }) => status === "processing")) {
+          interruptClaim = false;
+          throw new Error("process exited after claim persistence");
+        }
+      },
+    };
+    const channel = createChannel("recovery");
+    const attempts: number[] = [];
+    const client = createClient("client", (builder) => {
+      builder.concurrency({ perSession: true });
+      builder.handle(channel, ({ attempt }) => {
+        attempts.push(attempt);
+      });
+    });
+    const runtime = await createRuntime({ channels: [channel], clients: [client], store });
+    await runtime.dispatch("recovery", { id: "event", sessionKey: "work" });
+
+    await expect(runtime.drain()).rejects.toThrow("process exited after claim persistence");
+    expect((await backing.read()).deliveries[0]).toMatchObject({ status: "processing", attempts: 1 });
+
+    await runtime.drain();
+    await runtime.stop();
+
+    expect(attempts).toEqual([2]);
+    expect((await runtime.listEvents())[0]!.deliveries[0]).toMatchObject({ status: "processed", attempts: 2 });
   });
 
   it("ignores orphan ownership sidecars when no active lock exists", async () => {

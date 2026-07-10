@@ -187,6 +187,8 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 });
 ```
 
+Startup and each drain automatically requeue deliveries left `processing` by an interrupted attempt, preserving the consumed attempt and warning that external effects may repeat.
+
 ## Key helpers
 
 ```ts

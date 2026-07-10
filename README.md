@@ -199,7 +199,7 @@ An event is the durable unit of input. Events have a source `id`, optional `dedu
 
 A delivery is a client/handler-specific attempt to process an event. One event can be delivered to multiple clients.
 
-Delivery processing is retryable, not exactly once. A later failure can repeat handlers, hooks, and external effects even though event dispatch was deduped. Integrations must use stable external idempotency keys or reconciliation; see [Failure semantics and idempotency](docs/guides/failure-semantics.md).
+Delivery processing is retryable, not exactly once. A later failure or restart recovery can repeat handlers, hooks, and external effects even though event dispatch was deduped. On startup or drain, the runtime automatically requeues deliveries left `processing` by an interrupted runtime and logs a warning. Integrations must use stable external idempotency keys or reconciliation; see [Failure semantics and idempotency](docs/guides/failure-semantics.md).
 
 ### Client
 
@@ -255,7 +255,7 @@ See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
 
 This generated project is intentionally small and dependency-light. It ships with an in-memory store and a JSON-file store. The public store interface is small so that you can add a SQLite or Postgres adapter later without changing user code.
 
-The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Ownership requires a local hard-link-capable filesystem and fails explicitly when the filesystem cannot provide atomic hard links. The CLI rejects offline mutations while `start` is active, but direct unscoped library writes remain unsafe. Stale `processing` delivery recovery and multi-process worker coordination are not implemented.
+The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Ownership requires a local hard-link-capable filesystem and fails explicitly when the filesystem cannot provide atomic hard links. After acquiring ownership, startup and drain recover stale `processing` deliveries automatically. The CLI rejects offline mutations while `start` is active, but direct unscoped library writes remain unsafe. Multi-process worker coordination is not implemented.
 
 The package is ESM-only and requires Node.js 20 or newer.
 

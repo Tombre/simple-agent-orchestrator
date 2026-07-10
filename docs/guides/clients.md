@@ -67,7 +67,7 @@ client.handle(githubReviewsChannel, {
 });
 ```
 
-Retry defaults are resolved in this order: handler options, `client.retries(...)`, global config `retries`, then three attempts. Automatic retries run immediately without backoff. Manual retry accepts only a failed delivery and grants one additional attempt.
+Retry defaults are resolved in this order: handler options, `client.retries(...)`, global config `retries`, then three attempts. Automatic retries run immediately without backoff. Manual retry accepts only a failed delivery and grants one additional attempt. Startup and drain automatically requeue deliveries left `processing`; the interrupted attempt remains counted, with one replacement attempt granted only when the interruption exhausted the configured budget.
 
 The order is `handle`, `onSuccess`, required sandbox cleanup, then final success persistence. An error from any step fails the attempt and can rerun `handle`. `onFailure` receives the original error when a handler context exists; if it throws, its error is logged without replacing the original. Setup failures before the context exists do not call `onFailure`.
 

@@ -13,7 +13,7 @@ For a claimed delivery, the runtime:
 5. cleans up the sandbox if the handler ended the session;
 6. persists ordinary session changes, notes, and the `processed` delivery status together.
 
-An error from `handle`, `onSuccess`, sandbox cleanup, or final persistence fails the attempt. If the runtime can persist the failure state, the next automatic or manual attempt runs `handle` again, including when the previous `handle` completed its external work. A continuing store failure can instead leave the delivery `processing`.
+An error from `handle`, `onSuccess`, sandbox cleanup, or final persistence fails the attempt. If the runtime can persist the failure state, the next automatic or manual attempt runs `handle` again, including when the previous `handle` completed its external work. A continuing store failure can instead leave the delivery `processing` until a later runtime startup or drain recovers it.
 
 `onFailure` runs after a failed attempt when a handler context was created. It receives the original error. If `onFailure` throws, that secondary error is logged and does not replace the delivery error or change retry behavior. Failures before the context exists, including sandbox creation failures, do not invoke `onFailure`.
 
@@ -74,6 +74,8 @@ Poll `commit` is an ingestion checkpoint, not a successful-processing acknowledg
 
 ## Process failures
 
-External effects may be uncertain whenever a process stops between an external operation and local persistence. The current runtime does not recover stale `processing` claims automatically, so an abrupt crash can strand a delivery rather than retry it. Any future or operator-managed recovery must assume the external operation may already have happened.
+External effects may be uncertain whenever a process stops between an external operation and local persistence. On the next startup or drain, after acquiring store ownership, the runtime changes every persisted `processing` delivery to `pending` and logs the affected delivery IDs and interrupted attempt numbers. The consumed attempt number and `startedAt` remain intact. If that interruption used the final configured attempt, recovery grants one replacement attempt; otherwise the original remaining retry budget applies.
+
+Recovery does not call `onFailure` for the interrupted attempt because the runtime has no reliable error or handler context from the exited process. It records an interruption explanation in `lastError` while the delivery is pending. The next claim increments `attempt`, reruns the complete handler attempt, and clears that explanation only after success or replaces it with a new failure. No operator command is required. Recovery cannot determine whether external work completed, so handlers, hooks, acknowledgements, ensured factories, and sandbox operations must all remain safe to repeat.
 
 Stored delivery errors, JSON state, and default logs are plaintext and are not redacted automatically. Sanitize provider errors before throwing or logging them when they may contain credentials, request bodies, source content, or other sensitive values.

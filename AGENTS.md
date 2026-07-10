@@ -94,6 +94,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - `handle` runs before `onSuccess`. An error from either fails the attempt.
 - `onFailure` runs when a handler context exists; an error from `onFailure` is logged and does not replace the delivery error.
 - Manual retry applies only to `failed` deliveries and grants one additional attempt.
+- Startup and drain recover persisted `processing` deliveries to `pending`, preserve the interrupted attempt, and grant a replacement attempt if the interruption exhausted the retry budget.
 - Ordinary session mutations and notes persist only after a successful attempt.
 - `session.ensure` values persist eagerly and survive a failed attempt.
 - Sandbox creation state persists eagerly so handler retries reuse the same sandbox.
@@ -138,7 +139,6 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Persisted state has no schema-validation or migration system. The JSON store currently coerces the read version to `1` instead of rejecting unsupported versions.
 - There is no distributed worker coordination or distributed per-session lock.
 - Runtime lifecycle calls do not yet have complete duplicate-start or restart guards.
-- A crash can leave a delivery permanently `processing`; stale-claim recovery is not implemented.
 - Processing is not exactly once, and retries can repeat external side effects.
 - Retries have no delay, backoff, timeout, schedule, or dead-letter queue.
 - Only memory and JSON-file stores ship.

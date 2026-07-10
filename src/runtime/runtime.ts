@@ -121,6 +121,7 @@ export class OrchestratorRuntime {
       await this.ensureRuntimeOwnership();
       try {
         await this.init();
+        await this.recoverInterruptedDeliveries();
         if (options.prettyStartupLog ?? true) this.printStartupSummary();
 
         if (options.drain) {
@@ -191,6 +192,7 @@ export class OrchestratorRuntime {
   }
 
   private async drainOwned(): Promise<void> {
+    await this.recoverInterruptedDeliveries();
     await this.mountAllEnvironments();
     while (true) {
       let processed = false;
@@ -424,6 +426,31 @@ export class OrchestratorRuntime {
     if (this.ownership === ownership) this.ownership = undefined;
   }
 
+  private async recoverInterruptedDeliveries(): Promise<void> {
+    const recovered = await this.mutex.run(async () => {
+      const state = await this.store.read();
+      const interrupted = state.deliveries.filter(({ status }) => status === "processing");
+      if (interrupted.length === 0) return [];
+
+      const recoveredAt = nowIso();
+      for (const delivery of interrupted) {
+        delivery.status = "pending";
+        delivery.maxAttempts = Math.max(delivery.maxAttempts, delivery.attempts + 1);
+        delivery.lastError = `Interrupted during attempt ${delivery.attempts}; recovered before processing resumed. Handler and external effects may run again.`;
+        delivery.updatedAt = recoveredAt;
+      }
+      await this.store.write(state);
+      return interrupted.map(({ id, attempts }) => ({ id, interruptedAttempt: attempts }));
+    });
+
+    if (recovered.length > 0) {
+      this.logger.warn("Recovered interrupted deliveries", {
+        count: recovered.length,
+        deliveries: recovered,
+      });
+    }
+  }
+
   private startPollers(): void {
     for (const channel of this.channels) {
       channel.polls.forEach((poll, index) => {
@@ -555,8 +582,8 @@ export class OrchestratorRuntime {
         delivery.attempts += 1;
         delivery.startedAt = nowIso();
         delivery.updatedAt = nowIso();
-        if (client.concurrencyOptions.perSession) this.processingSessionKeys.add(event.sessionKey);
         await this.store.write(state);
+        if (client.concurrencyOptions.perSession) this.processingSessionKeys.add(event.sessionKey);
         return { delivery: { ...delivery }, event: { ...event }, handler, client };
       }
       return undefined;
