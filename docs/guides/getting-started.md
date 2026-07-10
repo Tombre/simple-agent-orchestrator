@@ -1,0 +1,107 @@
+# Getting started
+
+Simple Agent Orchestrator is meant to live inside an existing TypeScript project.
+
+## 1. Install
+
+```bash
+npm install -D simple-agent-orchestrator
+```
+
+## 2. Initialize
+
+```bash
+npx simple-agent-orchestrator init
+```
+
+This creates `.simple-agent-orchestrator` at your project root.
+
+## 3. Check the project
+
+```bash
+npx simple-agent-orchestrator doctor
+```
+
+`doctor` loads your config, checks that the runtime can start, and prints the discovered channels and clients.
+
+## 4. Start the runtime
+
+```bash
+npx simple-agent-orchestrator start
+```
+
+The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root.
+
+## 5. Dispatch a manual event
+
+The default template includes a manual channel and an echo client.
+
+```bash
+npx simple-agent-orchestrator dispatch manual \
+  --id first-event \
+  --session demo \
+  --input "Hello agent runtime"
+```
+
+Then inspect the session:
+
+```bash
+npx simple-agent-orchestrator sessions show demo
+```
+
+You should see session state like:
+
+```json
+{
+  "key": "demo",
+  "status": "active",
+  "state": {
+    "example.messageCount": 1
+  }
+}
+```
+
+## 6. Replace the echo client
+
+Edit:
+
+```text
+.simple-agent-orchestrator/clients/echo.ts
+```
+
+Replace the handler with your own agent integration:
+
+```ts
+client.handle(manualChannel, async ({ event, session }) => {
+  const agentSessionId = await session.ensure("agent.sessionId", async () => {
+    const created = await createAgentSession({ initialPrompt: String(event.input) });
+    return created.id;
+  });
+
+  await sendToAgent(agentSessionId, String(event.input));
+});
+```
+
+## 7. Add real channels
+
+Channels can poll existing project code:
+
+```ts
+import { createChannel } from "simple-agent-orchestrator";
+import { fetchReviewCandidates } from "../../src/lib/github/reviews";
+
+export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
+  channel.poll({
+    every: "60s",
+    fetch: () => fetchReviewCandidates(),
+    map: (review) => ({
+      id: review.id,
+      sessionKey: `github:${review.repo}:pr:${review.prNumber}`,
+      input: review.toMarkdown(),
+      payload: review,
+    }),
+  });
+});
+```
+
+Then add the channel and client to `orchestrator.ts`.

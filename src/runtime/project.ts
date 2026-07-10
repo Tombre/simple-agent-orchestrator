@@ -1,0 +1,163 @@
+import { access, mkdir, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { ConfigFactory, OrchestratorConfig } from "../core/config.js";
+import type { ProjectContext } from "../core/types.js";
+import { jsonFileStore } from "../stores/json-file.js";
+import { OrchestratorRuntime } from "./runtime.js";
+
+const CONFIG_NAMES = [
+  "orchestrator.ts",
+  "orchestrator.mts",
+  "orchestrator.cts",
+  "orchestrator.js",
+  "orchestrator.mjs",
+  "orchestrator.cjs",
+];
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readJson(path: string): Promise<Record<string, unknown>> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+async function findUp(start: string, predicate: (dir: string) => Promise<boolean>): Promise<string | undefined> {
+  let current = resolve(start);
+  while (true) {
+    if (await predicate(current)) return current;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+export async function findProjectRoot(options: { cwd?: string; root?: string; config?: string } = {}): Promise<string> {
+  if (options.root) return resolve(options.root);
+  if (options.config) return dirname(resolve(options.config));
+  const cwd = resolve(options.cwd ?? process.cwd());
+
+  const orchestratorRoot = await findUp(cwd, async (dir) => exists(join(dir, ".simple-agent-orchestrator")));
+  if (orchestratorRoot) return orchestratorRoot;
+
+  const packageRoot = await findUp(cwd, async (dir) => exists(join(dir, "package.json")));
+  if (packageRoot) return packageRoot;
+
+  return cwd;
+}
+
+export async function createProjectContext(root: string): Promise<ProjectContext> {
+  const projectRoot = resolve(root);
+  const packageJson = await readJson(join(projectRoot, "package.json"));
+  const orchestratorDir = join(projectRoot, ".simple-agent-orchestrator");
+
+  const ctx: ProjectContext = {
+    root: projectRoot,
+    orchestratorDir,
+    packageJson,
+    resolve(...parts: string[]) {
+      return resolve(projectRoot, ...parts);
+    },
+    fromRoot(...parts: string[]) {
+      return resolve(projectRoot, ...parts);
+    },
+    fromOrchestrator(...parts: string[]) {
+      return resolve(orchestratorDir, ...parts);
+    },
+    statePath(...parts: string[]) {
+      return resolve(orchestratorDir, "state", ...parts);
+    },
+    cachePath(...parts: string[]) {
+      return resolve(orchestratorDir, "tmp", ...parts);
+    },
+  };
+
+  return ctx;
+}
+
+export async function findConfigFile(project: ProjectContext, explicitConfig?: string): Promise<string> {
+  if (explicitConfig) return isAbsolute(explicitConfig) ? explicitConfig : resolve(project.root, explicitConfig);
+
+  const pointer = project.packageJson.simpleAgentOrchestrator;
+  if (typeof pointer === "string") return resolve(project.root, pointer);
+  if (pointer && typeof pointer === "object" && "config" in pointer) {
+    const config = (pointer as { config?: unknown }).config;
+    if (typeof config === "string") return resolve(project.root, config);
+  }
+
+  for (const name of CONFIG_NAMES) {
+    const candidate = join(project.orchestratorDir, name);
+    if (await exists(candidate)) return candidate;
+  }
+
+  throw new Error(
+    `Could not find .simple-agent-orchestrator/orchestrator.ts under ${project.root}. Run: npx simple-agent-orchestrator init`,
+  );
+}
+
+export async function loadConfigFile(configFile: string, project: ProjectContext): Promise<OrchestratorConfig> {
+  const previousCwd = process.cwd();
+  process.chdir(project.root);
+  try {
+    const extension = configFile.split(".").pop();
+    let mod: unknown;
+    if (extension === "ts" || extension === "mts" || extension === "cts") {
+      const tsx = (await import("tsx/esm/api")) as {
+        tsImport: (path: string, parentUrl: string) => Promise<unknown>;
+      };
+      mod = await tsx.tsImport(configFile, import.meta.url);
+    } else {
+      mod = await import(pathToFileURL(configFile).href);
+    }
+
+    const maybeDefault = (mod as { default?: unknown }).default ?? mod;
+    const factory = maybeDefault as ConfigFactory;
+    const config = typeof factory === "function" ? await factory({ project }) : factory;
+    return {
+      ...config,
+      store: config.store ?? jsonFileStore(project.statePath("state.json")),
+    };
+  } finally {
+    process.chdir(previousCwd);
+  }
+}
+
+export interface LoadProjectOptions {
+  cwd?: string;
+  root?: string;
+  config?: string;
+}
+
+export async function loadProjectConfig(options: LoadProjectOptions = {}): Promise<{
+  project: ProjectContext;
+  configFile: string;
+  config: OrchestratorConfig;
+}> {
+  const root = await findProjectRoot(options);
+  const project = await createProjectContext(root);
+  await mkdir(project.orchestratorDir, { recursive: true });
+  const configFile = await findConfigFile(project, options.config);
+  const config = await loadConfigFile(configFile, project);
+  return { project, configFile, config };
+}
+
+export async function loadProjectOrchestrator(options: LoadProjectOptions = {}): Promise<{
+  project: ProjectContext;
+  configFile: string;
+  runtime: OrchestratorRuntime;
+}> {
+  const { project, configFile, config } = await loadProjectConfig(options);
+  const runtime = new OrchestratorRuntime({ project, config });
+  return { project, configFile, runtime };
+}
