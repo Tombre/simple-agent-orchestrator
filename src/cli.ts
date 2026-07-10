@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { access, cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -84,6 +84,13 @@ async function initProject(flags: Record<string, string | boolean>): Promise<voi
   const templateRoot = fileURLToPath(new URL("../templates/default/.simple-agent-orchestrator", import.meta.url));
   await mkdir(dirname(target), { recursive: true });
   await cp(templateRoot, target, { recursive: true, force: true });
+  await Promise.all(
+    ["logs", "state", "tmp"].map(async (directory) => {
+      const packagedPath = join(target, directory, "gitignore");
+      await copyFile(packagedPath, join(target, directory, ".gitignore"));
+      await rm(packagedPath);
+    }),
+  );
 
   const packageJsonPath = join(root, "package.json");
   if (await exists(packageJsonPath)) {

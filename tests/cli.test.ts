@@ -38,6 +38,11 @@ describe("CLI", () => {
     expect(await readFile(join(root, ".simple-agent-orchestrator", "orchestrator.ts"), "utf8")).toContain(
       "defineConfig",
     );
+    for (const directory of ["logs", "state", "tmp"]) {
+      expect(await readFile(join(root, ".simple-agent-orchestrator", directory, ".gitignore"), "utf8")).toBe(
+        "*\n!.gitignore\n",
+      );
+    }
   });
 
   it("persists a dispatch across CLI processes and supports inspection and ending", async () => {

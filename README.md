@@ -254,6 +254,16 @@ The runtime is suitable as a starting point for local/project-embedded orchestra
 
 The package is ESM-only and requires Node.js 20 or newer.
 
+## Release verification
+
+Before proposing a release, run the same package-level check used by CI:
+
+```bash
+npm run release:check
+```
+
+This builds the npm tarball, validates its release-facing files, installs it in a clean temporary consumer, checks all public package subpaths and declarations, initializes the packaged template, and exercises the installed CLI against persisted state. CI runs the test, typecheck, and build contract on Node.js 20, 22, 24, and 26, then runs the package-artifact check on Node.js 20 and 26 on Linux and Windows.
+
 ## License
 
 MIT
