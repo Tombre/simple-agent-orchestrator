@@ -93,7 +93,7 @@ The `dispatch` command processes currently eligible work in a one-shot runtime a
 npx simple-agent-orchestrator start
 ```
 
-The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, and `events retry` are offline operations: they acquire the same ownership lock and fail before writing if `start` is active. Inspection commands, including `state validate`, remain available while the runtime is running.
+The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline operations: they acquire the same ownership lock and fail before writing if `start` is active. Inspection commands, including `state validate` and a `state prune` preview without `--apply`, remain available while the runtime is running.
 
 ## Project-local config
 
@@ -236,11 +236,16 @@ simple-agent-orchestrator sessions list
 simple-agent-orchestrator sessions show <id-or-key>
 simple-agent-orchestrator events list
 
+# Explicit state retention (preview first; add --apply while start is stopped)
+simple-agent-orchestrator state prune --before 2026-01-01T00:00:00Z
+
 # Offline mutation (requires start to be stopped)
 simple-agent-orchestrator dispatch <channel> --id <id> --session <sessionKey> --input <text>
 simple-agent-orchestrator sessions end <id-or-key>
 simple-agent-orchestrator events retry <delivery-id>
 ```
+
+State pruning removes old processed deliveries and safely unreferenced ended sessions with their notes. Events remain as dedupe records by default. `--drop-dedupe` also removes old unreferenced events and can cause the same source identities to run again; preview the exact IDs, back up persistent state, and use that flag only when this behavior is intended. Cursors and operational work are never pruned.
 
 See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
 
@@ -265,7 +270,7 @@ This generated project is intentionally small and dependency-light. It ships wit
 
 The JSON-file store strictly validates state before runtime work and writes. State version 3 is current; valid version 1 and 2 snapshots are upgraded deterministically in memory with immediate retry defaults and persisted as version 3 by the next successful write. Validation and inspection do not rewrite historical files. Malformed, structurally invalid, obsolete, and future versions fail with actionable errors and are not replaced. Run `state validate` for a read-only compatibility check.
 
-The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Atomic first-run state initialization and runtime ownership require a local hard-link-capable filesystem and fail explicitly when the filesystem cannot provide atomic hard links. After acquiring ownership, startup and drain recover stale `processing` deliveries automatically. The CLI rejects offline mutations while `start` is active, but direct unscoped library writes remain unsafe. Multi-process worker coordination is not implemented.
+The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Atomic first-run state initialization and runtime ownership require a local hard-link-capable filesystem and fail explicitly when the filesystem cannot provide atomic hard links. After acquiring ownership, startup and drain recover stale `processing` deliveries automatically. The CLI rejects offline mutations, including applying state retention, while `start` is active, but direct unscoped library writes remain unsafe. Multi-process worker coordination is not implemented.
 
 The package is ESM-only and requires Node.js 20 or newer.
 

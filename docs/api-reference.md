@@ -317,7 +317,12 @@ await runtime.getSession(idOrKey);
 await runtime.listSessionNotes(idOrKey);
 await runtime.listEvents();
 await runtime.printConfig();
+await runtime.previewStatePrune({ before: "2026-01-01T00:00:00Z" });
 ```
+
+`previewStatePrune(options)` returns a `StatePrunePlan` without writing. `before` is a `Date` or an ISO 8601 timestamp with a timezone. Only processed deliveries whose `processedAt` is strictly before the cutoff are selected. Ended sessions whose `endedAt` is before the cutoff are selected only when no retained delivery references them and no durable `__sao.sandbox.*.created` marker is true; their notes are selected with them. Pending, processing, and failed deliveries, active/paused/failed sessions, cursors, missing or invalid historical timestamps, and sessions with active sandbox markers are preserved.
+
+Events are the dedupe ledger and are retained by default. Set `dropDedupe: true` to select events whose `receivedAt` is before the cutoff and which have no retained delivery. Removing them allows the same `channelId + dedupeKey` to dispatch again. The plan reports exact `deliveryIds`, `sessionIds`, `noteIds`, and `eventIds`, otherwise-eligible events preserved by default in `dedupeProtectedEventIds`, and ended sessions blocked by a retained delivery or sandbox marker.
 
 Use a fresh runtime for an offline mutation:
 
@@ -325,10 +330,12 @@ Use a fresh runtime for an offline mutation:
 const { runtime: offlineRuntime } = await loadProjectOrchestrator();
 await offlineRuntime.runOffline(async ({ drain }) => {
   await offlineRuntime.dispatch(channelId, event);
-  // endSession() and retryDelivery() belong in this scope too.
+  // endSession(), retryDelivery(), and pruneState() belong in this scope too.
   await drain();
 });
 ```
+
+`pruneState(options)` recomputes and applies the same plan under the runtime mutex. Use it inside `runOffline()` so persistent stores also hold runtime ownership; a prior preview is advisory and may become stale. No write occurs when the plan selects nothing. Back up persistent state before applying retention, especially with `dropDedupe`.
 
 For a direct drain lifecycle, use another fresh runtime and pair `drain()` with `stop()`:
 
@@ -343,7 +350,7 @@ try {
 
 `start()` and `drain()` acquire the configured store's runtime lock and hold it until `stop()`; `start({ drain: true })` releases it automatically even when polling, mounting, or processing fails. After ownership is acquired, every processing lifecycle automatically requeues persisted `processing` deliveries and warns with their IDs and interrupted attempt numbers. Recovery preserves the consumed attempt and grants one replacement attempt only when needed to make an interruption at the retry limit eligible again. The complete handler attempt may repeat, including uncertain external effects.
 
-`runOffline(operation)` requires an unused runtime, acquires the same ownership before invoking the callback, then always stops the one-shot runtime and releases ownership. Its callback receives an owned `drain()` function for processing deliveries without opening another lifecycle scope; that drain also performs interrupted-delivery recovery. Use the scope for direct offline calls to `dispatch`, `endSession`, or `retryDelivery`; an active owner causes it to fail before invoking the callback. A lock whose PID is no longer alive is reclaimed automatically. Mutation-only offline operations do not recover deliveries unless they invoke `drain()`.
+`runOffline(operation)` requires an unused runtime, acquires the same ownership before invoking the callback, then always stops the one-shot runtime and releases ownership. Its callback receives an owned `drain()` function for processing deliveries without opening another lifecycle scope; that drain also performs interrupted-delivery recovery. Use the scope for direct offline calls to `dispatch`, `endSession`, `retryDelivery`, or `pruneState`; an active owner causes it to fail before invoking the callback. A lock whose PID is no longer alive is reclaimed automatically. Mutation-only offline operations do not recover deliveries unless they invoke `drain()`.
 
 This is local process-ownership enforcement, not general multi-process store coordination. Mutation methods called outside `start()`, `drain()`, or `runOffline()` do not independently acquire ownership.
 

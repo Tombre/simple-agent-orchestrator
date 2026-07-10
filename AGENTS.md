@@ -116,6 +116,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - State version 3 is current. Structurally valid version 1 and 2 snapshots migrate deterministically in memory with immediate retry defaults and persist as version 3 on the next successful write; inspection does not rewrite them.
 - Persisted event, session, note, and cursor values must be JSON-safe when using `jsonFileStore`.
 - Dispatch may return `queued` with no matching handlers. Sessions are created only when a delivery is processed.
+- State pruning is explicit and preview-first. It removes only old processed deliveries and safely unreferenced ended sessions/notes, preserves cursors and operational records, preserves sessions with active sandbox markers, and retains event dedupe unless the operator explicitly drops it.
 
 ## Lifecycle And Concurrency
 
@@ -135,7 +136,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Sandbox creation and cleanup are serialized per session/environment in one process.
 - Sandbox cleanup runs only after `handle` and `onSuccess` succeed and the handler called `session.end()`.
 - Keep external side effects idempotent because delivery state and external systems are not one transaction.
-- CLI `dispatch`, `sessions end`, and `events retry` are offline operations that fail before writing while a `jsonFileStore` runtime owns the state. Inspection commands remain available; direct library mutations need an explicit `runtime.runOffline(...)` scope.
+- CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline operations that fail before writing while a `jsonFileStore` runtime owns the state. Inspection and retention preview remain available; direct library mutations need an explicit `runtime.runOffline(...)` scope.
 
 ## Accepted Limitations
 
@@ -148,7 +149,7 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Retries support only a fixed delay; there is no backoff, jitter, arbitrary schedule, or dead-letter queue.
 - Handler timeouts are cooperative. JavaScript that ignores cancellation cannot be forcefully terminated and external side effects may already have occurred.
 - Only memory and JSON-file stores ship.
-- There is no retention, compaction, or pruning policy.
+- There is no automatic retention, archival, or background compaction policy.
 - Sandbox creation has a crash window between external creation and marker persistence.
 - `session.ensure` has the same crash window between external factory work and value persistence; factories must be retry-safe.
 - Sandbox markers are keyed by environment ID, not client ID, and can collide when clients with the same environment ID share a session.

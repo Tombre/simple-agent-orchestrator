@@ -56,7 +56,7 @@ npx simple-agent-orchestrator sessions list
 npx simple-agent-orchestrator events list
 ```
 
-`dispatch`, `sessions end`, and `events retry` are offline mutations and require the long-running runtime to be stopped. The inspection commands, including `state validate`, remain available while `start` is active.
+`dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. The inspection commands, including `state validate` and a retention preview without `--apply`, remain available while `start` is active. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
 
 ## Common failures
 

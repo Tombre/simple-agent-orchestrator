@@ -17,6 +17,7 @@ The framework owns boring but important stateful plumbing:
 - environment lifecycle
 - sandbox cleanup
 - CLI inspection
+- explicit operator-controlled state retention
 
 User code owns:
 
@@ -67,6 +68,8 @@ Important primitives:
 - runtime/CLI inspection
 
 Avoid large abstractions until repeated real-world integrations prove they are necessary.
+
+State retention is an explicit preview-and-apply operation, not a background compaction service. It preserves operational work and dedupe by default; surrendering old dedupe history requires a separate operator choice.
 
 A fixed durable retry eligibility timestamp is delivery plumbing, not a general scheduling API. Backoff strategies, arbitrary timers, and workflow schedules remain outside the runtime until demonstrated integration needs justify them.
 

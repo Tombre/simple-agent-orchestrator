@@ -72,3 +72,5 @@ session.end({ reason: "github.pr.merged" });
 ```
 
 An ended session is kept for history. A future event with the same `sessionKey` creates a new active session.
+
+Explicit state pruning can remove an old ended session and its notes only when no retained delivery references it and no active sandbox marker remains. Active, paused, and failed sessions are preserved. Preview `state prune --before <timestamp>` before applying it; a pruned historical session is no longer available through session inspection.

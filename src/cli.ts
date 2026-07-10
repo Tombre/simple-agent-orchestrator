@@ -46,6 +46,13 @@ function hasFlag(flags: Record<string, string | boolean>, name: string): boolean
   return flags[name] === true || typeof flags[name] === "string";
 }
 
+function booleanFlag(flags: Record<string, string | boolean>, name: string): boolean {
+  const value = flags[name];
+  if (value === undefined || value === "false") return false;
+  if (value === true || value === "true") return true;
+  throw new Error(`--${name} must be a bare flag, true, or false`);
+}
+
 function usage(): void {
   console.log(`Simple Agent Orchestrator
 
@@ -64,6 +71,9 @@ Usage:
   simple-agent-orchestrator sessions list
   simple-agent-orchestrator sessions show <id-or-key>
   simple-agent-orchestrator events list
+
+  State retention (preview is safe while start is active; --apply requires it to be stopped):
+  simple-agent-orchestrator state prune --before <timestamp> [--apply] [--drop-dedupe]
 
   Offline mutation commands (require start to be stopped):
   simple-agent-orchestrator dispatch <channel> --id <id> --session <sessionKey> --input <text>
@@ -170,12 +180,28 @@ async function printConfig(flags: Record<string, string | boolean>): Promise<voi
 }
 
 async function stateCommand(args: ParsedArgs): Promise<void> {
-  if (args.positional[1] !== "validate") {
-    throw new Error("Usage: simple-agent-orchestrator state validate [--root <path>] [--config <path>]");
+  const action = args.positional[1];
+  if (action === "validate") {
+    const { runtime } = await loadRuntime(args.flags);
+    await runtime.init();
+    console.log("State is valid and compatible.");
+    return;
   }
-  const { runtime } = await loadRuntime(args.flags);
-  await runtime.init();
-  console.log("State is valid and compatible.");
+  if (action === "prune") {
+    const before = flagString(args.flags, "before");
+    if (!before) {
+      throw new Error("Usage: simple-agent-orchestrator state prune --before <timestamp> [--apply] [--drop-dedupe]");
+    }
+    const { runtime } = await loadRuntime(args.flags);
+    const options = { before, dropDedupe: booleanFlag(args.flags, "drop-dedupe") };
+    const apply = booleanFlag(args.flags, "apply");
+    const plan = apply
+      ? await runtime.runOffline(() => runtime.pruneState(options))
+      : await runtime.previewStatePrune(options);
+    console.log(JSON.stringify({ applied: apply, ...plan }, null, 2));
+    return;
+  }
+  throw new Error("Usage: simple-agent-orchestrator state <validate|prune>");
 }
 
 async function dispatchCommand(args: ParsedArgs): Promise<void> {

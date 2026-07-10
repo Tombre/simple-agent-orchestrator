@@ -91,6 +91,8 @@ Fields:
 
 Events are deduped by `channelId + dedupeKey`. A duplicate dispatch is not enqueued again, but the original event remains available in the store.
 
+Event records are also the durable dedupe ledger. State pruning retains them by default even after processed delivery history is removed. Explicitly applying `state prune --drop-dedupe` removes eligible old events with no retained deliveries; the same source identity can then dispatch and run again.
+
 A delivery is only marked `processed` after the handler, `onSuccess`, required sandbox cleanup, and final persistence succeed. Dedupe does not prevent a failed delivery attempt or its external effects from repeating.
 
 Executions of the same poll do not overlap within one runtime process. Mapping is sequential. Mapped events are durably dispatched before `commit` runs, and cursor changes are persisted only after `fetch`, mapping, dispatch, and `commit` complete. Previously dispatched events remain if a later poll step fails, so stable dedupe keys must make refetching safe.

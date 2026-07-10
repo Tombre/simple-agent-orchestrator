@@ -61,7 +61,7 @@ After the manual smoke test, start the long-running runtime for polls and projec
 npx simple-agent-orchestrator start
 ```
 
-The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root and validates persisted state before polling, mounting environments, recovering deliveries, or invoking handlers. The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, and `events retry` fail before writing while `start` is active; inspection commands such as `state validate`, `sessions show`, and `events list` remain available.
+The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root and validates persisted state before polling, mounting environments, recovering deliveries, or invoking handlers. The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` fail before writing while `start` is active; inspection commands such as `state validate`, a retention preview, `sessions show`, and `events list` remain available.
 
 ## 6. Replace the echo client
 

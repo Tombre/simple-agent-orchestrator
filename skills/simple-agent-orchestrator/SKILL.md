@@ -59,7 +59,7 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
    npx simple-agent-orchestrator events list
    ```
 
-   Run the `dispatch` smoke test only after stopping a long-running JSON-store runtime; it is an offline command and will fail before writing while `start` is active. Inspection commands such as `doctor`, `state validate`, `print-config`, `sessions list`, and `events list` remain safe while `start` is active. `state validate` reports malformed, incompatible, or unsupported persisted state without replacing it. Also run the project’s TypeScript/test commands when available. Done when config and state validate and the changed route can be smoke-tested or the remaining blocker is named.
+   Run the `dispatch` smoke test only after stopping a long-running JSON-store runtime; it is an offline command and will fail before writing while `start` is active. Inspection commands such as `doctor`, `state validate`, `print-config`, `sessions list`, `events list`, and `state prune --before <timestamp>` without `--apply` remain safe while `start` is active. `state validate` reports malformed, incompatible, or unsupported persisted state without replacing it. If state growth requires retention, preview exact IDs, back up the state file, and stop the runtime before adding `--apply`; do not add `--drop-dedupe` unless redispatching old source identities is acceptable. Also run the project’s TypeScript/test commands when available. Done when config and state validate and the changed route can be smoke-tested or the remaining blocker is named.
 
 ## References
 

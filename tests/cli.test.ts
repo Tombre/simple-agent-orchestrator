@@ -185,6 +185,69 @@ describe("CLI", () => {
     expect(await runCli("events", "retry", failedDelivery!.id, "--root", root)).toContain("retried");
   });
 
+  it("previews state pruning without writing and requires offline ownership to apply it", async () => {
+    const { root, stateFile } = await createFixture();
+    await runCli("dispatch", "manual", "--root", root, "--id", "old", "--session", "old", "--input", "hello");
+    await runCli("sessions", "end", "old", "--root", root);
+    const seeded = JSON.parse(await readFile(stateFile, "utf8")) as {
+      sessions: { endedAt?: string; updatedAt: string }[];
+      deliveries: { processedAt?: string; updatedAt: string }[];
+    };
+    const old = "2020-01-01T00:00:00.000Z";
+    Object.assign(seeded.sessions[0]!, { endedAt: old, updatedAt: old });
+    Object.assign(seeded.deliveries[0]!, { processedAt: old, updatedAt: old });
+    await writeFile(stateFile, `${JSON.stringify(seeded, null, 2)}\n`, "utf8");
+    const beforePreview = await readFile(stateFile, "utf8");
+
+    const falseFlags = JSON.parse(await runCli(
+      "state", "prune", "--root", root, "--before", "2021-01-01T00:00:00.000Z", "--apply=false", "--drop-dedupe=false",
+    )) as { applied: boolean; dropDedupe: boolean };
+    expect(falseFlags).toMatchObject({ applied: false, dropDedupe: false });
+    expect(await readFile(stateFile, "utf8")).toBe(beforePreview);
+    const ambiguousFlag = await runCliResult(
+      "state", "prune", "--root", root, "--before", "2021-01-01T00:00:00.000Z", "--apply=no",
+    );
+    expect(ambiguousFlag.failed).toBe(true);
+    expect(ambiguousFlag.stderr).toContain("--apply must be a bare flag, true, or false");
+    expect(await readFile(stateFile, "utf8")).toBe(beforePreview);
+
+    const { runtime } = await loadProjectOrchestrator({ root });
+    await runtime.start({ prettyStartupLog: false });
+    try {
+      const preview = JSON.parse(await runCli("state", "prune", "--root", root, "--before", "2021-01-01T00:00:00.000Z")) as {
+        applied: boolean;
+        deliveryIds: string[];
+        sessionIds: string[];
+      };
+      expect(preview).toMatchObject({ applied: false });
+      expect(preview.deliveryIds).toHaveLength(1);
+      expect(preview.sessionIds).toHaveLength(1);
+      expect(await readFile(stateFile, "utf8")).toBe(beforePreview);
+
+      const failure = await runCliResult(
+        "state", "prune", "--root", root, "--before", "2021-01-01T00:00:00.000Z", "--apply",
+      );
+      expect(failure.failed).toBe(true);
+      expect(failure.stderr).toMatch(new RegExp(`active orchestrator runtime.*PID ${process.pid}`, "i"));
+      expect(await readFile(stateFile, "utf8")).toBe(beforePreview);
+    } finally {
+      await runtime.stop();
+    }
+
+    const applied = JSON.parse(await runCli(
+      "state", "prune", "--root", root, "--before", "2021-01-01T00:00:00.000Z", "--apply", "--drop-dedupe=false",
+    )) as { applied: boolean };
+    expect(applied.applied).toBe(true);
+    const pruned = JSON.parse(await readFile(stateFile, "utf8")) as {
+      sessions: unknown[];
+      events: unknown[];
+      deliveries: unknown[];
+      notes: unknown[];
+    };
+    expect(pruned).toMatchObject({ sessions: [], deliveries: [], notes: [] });
+    expect(pruned.events).toHaveLength(1);
+  });
+
   it("classifies inspection and offline mutation commands in help", async () => {
     const output = await runCli("help");
     const inspectionHeading = output.indexOf("Inspection commands (safe while start is active)");
@@ -198,5 +261,6 @@ describe("CLI", () => {
     for (const command of ["dispatch", "sessions end", "events retry"]) {
       expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeGreaterThan(mutationHeading);
     }
+    expect(output).toContain("simple-agent-orchestrator state prune --before <timestamp> [--apply] [--drop-dedupe]");
   });
 });

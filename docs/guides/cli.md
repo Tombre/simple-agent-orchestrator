@@ -26,6 +26,20 @@ npx simple-agent-orchestrator state validate
 
 Loads the project and validates that the complete persisted snapshot is compatible. It is an inspection command and does not rewrite a valid historical file, so it remains available while `start` is active. A missing JSON state file is initialized as an empty current snapshot, consistent with `doctor` and other first-run commands. Invalid JSON, invalid shapes or references, obsolete versions, and future versions exit unsuccessfully with recovery guidance; the invalid file is not replaced.
 
+## state prune
+
+```bash
+# Preview only
+npx simple-agent-orchestrator state prune --before 2026-01-01T00:00:00Z
+
+# Apply after backing up state and stopping start
+npx simple-agent-orchestrator state prune --before 2026-01-01T00:00:00Z --apply
+```
+
+The default preview and apply select old processed deliveries plus ended sessions that have no retained deliveries or active sandbox marker; notes are removed only with their session. Pending, processing, and failed deliveries, operational sessions, cursors, and records without valid retention timestamps remain. Preview reports exact removal IDs, blocked ended sessions, and otherwise-eligible events protected as dedupe records, and does not write, so it is available while `start` is active. Apply acquires offline ownership and recomputes the plan before writing.
+
+Events are retained by default because they suppress duplicate dispatch. Add `--drop-dedupe` to preview or apply removal of old events with no retained delivery. After those events are removed, dispatching the same source dedupe identities can create new work. Back up persistent state and inspect the preview before applying this irreversible history loss.
+
 ## start
 
 ```bash
@@ -36,7 +50,7 @@ Starts pollers and client workers.
 
 When using `jsonFileStore`, a local ownership lock rejects a second runtime or offline mutation for the same state and reports the active PID and start time. Ownership is released on normal shutdown, and a lock left by a process that exited is reclaimed on the next operation.
 
-`doctor`, `print-config`, `state validate`, `sessions list`, `sessions show`, and `events list` only inspect runtime state and are safe while `start` is active. `dispatch`, `sessions end`, and `events retry` are offline mutations: they fail before writing unless the long-running runtime is stopped. This does not make direct library writes or arbitrary JSON-store writers safe.
+`doctor`, `print-config`, `state validate`, `sessions list`, `sessions show`, `events list`, and a `state prune` preview only inspect runtime state and are safe while `start` is active. `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline mutations: they fail before writing unless the long-running runtime is stopped. This does not make direct library writes or arbitrary JSON-store writers safe.
 
 Options:
 

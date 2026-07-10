@@ -31,6 +31,12 @@ import {
   parseDuration,
 } from "../utils/time.js";
 import { acquireRuntimeOwnership, type RuntimeOwnership } from "./ownership.js";
+import {
+  applyStatePrune,
+  planStatePrune,
+  type StatePruneOptions,
+  type StatePrunePlan,
+} from "./state-retention.js";
 
 export interface RuntimeOptions {
   project: ProjectContext;
@@ -494,6 +500,24 @@ export class OrchestratorRuntime {
         deliveries: state.deliveries.filter((delivery) => delivery.eventId === event.id),
       }))
       .sort((a, b) => b.event.receivedAt.localeCompare(a.event.receivedAt));
+  }
+
+  async previewStatePrune(options: StatePruneOptions): Promise<StatePrunePlan> {
+    await this.init();
+    return planStatePrune(await this.store.read(), options);
+  }
+
+  async pruneState(options: StatePruneOptions): Promise<StatePrunePlan> {
+    await this.init();
+    return this.mutex.run(async () => {
+      const state = await this.store.read();
+      const plan = planStatePrune(state, options);
+      if (plan.deliveryIds.length || plan.sessionIds.length || plan.noteIds.length || plan.eventIds.length) {
+        applyStatePrune(state, plan);
+        await this.store.write(state);
+      }
+      return plan;
+    });
   }
 
   async retryDelivery(id: string): Promise<boolean> {
