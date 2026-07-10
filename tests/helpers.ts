@@ -42,6 +42,7 @@ export async function createRuntime(config: OrchestratorConfig): Promise<Orchest
     config: {
       logger: silentLogger,
       store: memoryStore(),
+      http: { enabled: false },
       ...config,
     },
   });

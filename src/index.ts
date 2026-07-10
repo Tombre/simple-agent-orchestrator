@@ -1,5 +1,12 @@
 export { defineConfig } from "./core/config.js";
-export type { DefineConfigContext, OrchestratorConfig } from "./core/config.js";
+export type {
+  DefineConfigContext,
+  HttpConfig,
+  HttpDispatch,
+  HttpRegistrationContext,
+  HttpRegistrationHook,
+  OrchestratorConfig,
+} from "./core/config.js";
 
 export { createChannel, createManualChannel } from "./core/channel.js";
 export type {

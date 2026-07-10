@@ -1,5 +1,10 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { dirname, resolve } from "node:path";
 import { mkdir } from "node:fs/promises";
+import { getRequestListener } from "@hono/node-server";
+import { Hono } from "hono";
 import type { ChannelDefinition, PollDefinition } from "../core/channel.js";
 import { CursorImpl, pollCursorId } from "../core/channel.js";
 import type { ClientDefinition, HandlerContext, RegisteredHandler } from "../core/client.js";
@@ -46,6 +51,7 @@ export interface RuntimeOptions {
 export interface StartOptions {
   drain?: boolean;
   prettyStartupLog?: boolean;
+  http?: boolean;
 }
 
 export interface OfflineOperationContext {
@@ -64,6 +70,46 @@ type RuntimeLifecycleState = "unused" | "starting" | "started" | "drain" | "stop
 interface MountedEnvironment {
   instance: EnvironmentInstanceImpl;
   pendingUnmountHooks: EnvironmentDefinition["unmountHooks"];
+}
+
+interface HttpRequestToken {
+  active: boolean;
+}
+
+const DEFAULT_HTTP_HOSTNAME = "127.0.0.1";
+const DEFAULT_HTTP_PORT = 3_000;
+const MAX_HTTP_PORT_ATTEMPTS = 10;
+
+function parseHttpPort(value: number | string, source: string): number {
+  const valid = typeof value === "number"
+    ? Number.isInteger(value)
+    : /^[0-9]+$/.test(value);
+  const port = valid ? Number(value) : Number.NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`Invalid HTTP port${source ? ` in ${source}` : ""}: ${String(value)}`);
+  }
+  return port;
+}
+
+function isAddressInUse(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "EADDRINUSE";
+}
+
+function isServerNotRunning(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ERR_SERVER_NOT_RUNNING";
+}
+
+function isLoopbackAddress(address: string): boolean {
+  const normalized = address.toLowerCase();
+  if (normalized === "::1") return true;
+  const ipv4 = normalized.startsWith("::ffff:") ? normalized.slice(7) : normalized;
+  const parts = ipv4.split(".");
+  return parts.length === 4 && parts[0] === "127";
+}
+
+function formatHttpUrl(hostname: string, port: number): string {
+  const urlHostname = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;
+  return `http://${urlHostname}:${port}`;
 }
 
 interface AttemptSignal {
@@ -168,6 +214,9 @@ export class OrchestratorRuntime {
   private readonly logger: Logger;
   private readonly mutex = new StoreMutex();
   private readonly abortController = new AbortController();
+  private readonly httpRequestContext = new AsyncLocalStorage<HttpRequestToken>();
+  private readonly httpRequests = new Set<Promise<void>>();
+  private readonly httpDispatches = new Set<Promise<unknown>>();
   private readonly environmentInstances = new Map<string, MountedEnvironment>();
   private readonly environmentMounts = new Map<string, Promise<EnvironmentInstanceImpl>>();
   private readonly intervalHandles: NodeJS.Timeout[] = [];
@@ -183,6 +232,9 @@ export class OrchestratorRuntime {
   private stopPromise: Promise<void> | undefined;
   private offlineOperationActive = false;
   private initialized = false;
+  private httpServer: Server | undefined;
+  private httpAccepting = false;
+  private httpReady = false;
 
   constructor(private readonly options: RuntimeOptions) {
     this.store = options.config.store ?? memoryStore();
@@ -221,6 +273,7 @@ export class OrchestratorRuntime {
       } else {
         await this.recoverInterruptedDeliveries();
         await this.mountAllEnvironments();
+        if (options.http !== false && this.options.config.http?.enabled !== false) await this.startHttpServer();
         this.startPollers();
         this.startWorkers();
       }
@@ -243,6 +296,7 @@ export class OrchestratorRuntime {
       return;
     }
     this.lifecycleState = "started";
+    this.httpReady = this.httpServer !== undefined;
   }
 
   async stop(): Promise<void> {
@@ -266,11 +320,20 @@ export class OrchestratorRuntime {
   }
 
   private async stopInternal(): Promise<void> {
+    const httpClose = this.closeHttpServer();
     this.abortController.abort();
     for (const handle of this.intervalHandles) clearInterval(handle);
     this.intervalHandles.length = 0;
     await Promise.allSettled(this.pollPromises.values());
     await Promise.allSettled(this.workerPromises);
+    let httpError: unknown;
+    let httpFailed = false;
+    try {
+      await httpClose;
+    } catch (error) {
+      httpFailed = true;
+      httpError = error;
+    }
     let unmountError: unknown;
     let unmountFailed = false;
     try {
@@ -287,11 +350,162 @@ export class OrchestratorRuntime {
       releaseFailed = true;
       releaseError = error;
     }
-    if (unmountFailed && releaseFailed) {
-      throw new AggregateError([unmountError, releaseError], "Runtime shutdown and ownership release failed");
+    const errors: unknown[] = [];
+    if (httpFailed) errors.push(httpError);
+    if (unmountFailed) errors.push(unmountError);
+    if (releaseFailed) errors.push(releaseError);
+    if (errors.length > 1) throw new AggregateError(errors, "Runtime shutdown failed");
+    if (errors.length === 1) throw errors[0];
+  }
+
+  private async startHttpServer(): Promise<void> {
+    const http = this.options.config.http;
+    const hostname = http?.hostname ?? DEFAULT_HTTP_HOSTNAME;
+    const environmentPort = process.env.SAO_HTTP_PORT;
+    const requestedPort = environmentPort === undefined
+      ? (http?.port ?? DEFAULT_HTTP_PORT)
+      : parseHttpPort(environmentPort, "SAO_HTTP_PORT");
+    const app = new Hono();
+    const dispatch = (channelId: string, event: DispatchEvent) => {
+      if (!this.httpAccepting && this.httpRequestContext.getStore()?.active !== true) {
+        return Promise.reject(new Error("HTTP server is not accepting requests"));
+      }
+      const pending = this.dispatch(channelId, event);
+      this.httpDispatches.add(pending);
+      void pending.then(
+        () => this.httpDispatches.delete(pending),
+        () => this.httpDispatches.delete(pending),
+      );
+      return pending;
+    };
+    const context = { app, project: this.project, logger: this.logger, signal: this.abortController.signal, dispatch };
+
+    app.use("*", async (honoContext, next) => {
+      if (!this.httpAccepting) return honoContext.json({ status: "stopping" }, 503);
+      const token: HttpRequestToken = { active: true };
+      const request = this.httpRequestContext.run(token, async () => {
+        try {
+          await next();
+        } finally {
+          token.active = false;
+        }
+      });
+      this.httpRequests.add(request);
+      try {
+        await request;
+      } finally {
+        this.httpRequests.delete(request);
+      }
+    });
+    await http?.middleware?.(context);
+    app.get("/health", (honoContext) => this.httpReady
+      ? honoContext.json({ status: "ok" })
+      : honoContext.json({ status: "starting" }, 503));
+    app.all("/health", (honoContext) => honoContext.notFound());
+    app.all("/webhooks", (honoContext) => honoContext.notFound());
+    app.all("/webhooks/*", (honoContext) => honoContext.notFound());
+    app.all("/api/v1", (honoContext) => honoContext.notFound());
+    app.all("/api/v1/*", (honoContext) => honoContext.notFound());
+    await http?.routes?.(context);
+
+    let lastAddressInUseError: unknown;
+    const finalPort = Math.min(65_535, requestedPort + MAX_HTTP_PORT_ATTEMPTS - 1);
+    for (let port = requestedPort; port <= finalPort; port += 1) {
+      const server = createServer(getRequestListener(app.fetch, {
+        hostname,
+        overrideGlobalObjects: false,
+      }));
+      try {
+        await this.listen(server, hostname, port);
+        this.httpServer = server;
+        this.httpAccepting = true;
+        const url = formatHttpUrl(hostname, port);
+        const address = server.address() as AddressInfo;
+        if (!isLoopbackAddress(address.address)) {
+          this.logger.warn("HTTP server has no built-in authentication and is bound to a non-loopback hostname", {
+            hostname,
+            port,
+            address: address.address,
+          });
+        }
+        this.logger.info(
+          port === requestedPort ? "HTTP server listening" : "HTTP server listening on fallback port",
+          { hostname, requestedPort, port, url },
+        );
+        return;
+      } catch (error) {
+        if (!isAddressInUse(error)) throw error;
+        lastAddressInUseError = error;
+      }
     }
-    if (unmountFailed) throw unmountError;
-    if (releaseFailed) throw releaseError;
+    throw new Error(
+      `Unable to bind HTTP server after ${finalPort - requestedPort + 1} attempts from port ${requestedPort}`,
+      { cause: lastAddressInUseError },
+    );
+  }
+
+  private listen(server: Server, hostname: string, port: number): Promise<void> {
+    return new Promise((resolveListen, reject) => {
+      const onError = (error: Error) => {
+        server.off("listening", onListening);
+        reject(error);
+      };
+      const onListening = () => {
+        server.off("error", onError);
+        resolveListen();
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.on("request", (_request, response) => {
+        response.once("finish", () => {
+          if (!this.httpAccepting) server.closeIdleConnections();
+        });
+      });
+      server.listen(port, hostname);
+    });
+  }
+
+  private async closeHttpServer(): Promise<void> {
+    const server = this.httpServer;
+    if (!server) return;
+    this.httpAccepting = false;
+    this.httpReady = false;
+    const idleErrors: unknown[] = [];
+    const closeIdleConnections = () => {
+      try {
+        server.closeIdleConnections();
+      } catch (error) {
+        idleErrors.push(error);
+      }
+    };
+    const closed = new Promise<void>((resolveClose, reject) => {
+      server.close((error) => {
+        if (error && !isServerNotRunning(error)) {
+          reject(error);
+          return;
+        }
+        if (this.httpServer === server) this.httpServer = undefined;
+        resolveClose();
+      });
+      closeIdleConnections();
+    });
+    const settledWork = this.settleHttpWork().then(closeIdleConnections);
+    const results = await Promise.allSettled([
+      closed,
+      settledWork,
+    ]);
+    const errors = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason)
+      .concat(idleErrors);
+    if (errors.length > 1) throw new AggregateError(errors, "HTTP server shutdown failed");
+    if (errors.length === 1) throw errors[0];
+  }
+
+  private async settleHttpWork(): Promise<void> {
+    while (this.httpRequests.size > 0 || this.httpDispatches.size > 0) {
+      await Promise.allSettled([...this.httpRequests, ...this.httpDispatches]);
+    }
   }
 
   async drain(): Promise<void> {
@@ -545,6 +759,11 @@ export class OrchestratorRuntime {
       store: this.store.name,
       channels: this.channels.map((channel) => channel.id),
       clients: this.clients.map((client) => client.id),
+      http: {
+        enabled: this.options.config.http?.enabled ?? true,
+        hostname: this.options.config.http?.hostname ?? DEFAULT_HTTP_HOSTNAME,
+        port: this.options.config.http?.port ?? DEFAULT_HTTP_PORT,
+      },
       sessions: state.sessions.length,
       events: state.events.length,
       deliveries: state.deliveries.length,
@@ -1079,6 +1298,7 @@ export class OrchestratorRuntime {
     this.assertUnique(pollCursorIds, "poll cursor");
     if (this.options.config.retries?.delay !== undefined) parseRetryDelay(this.options.config.retries.delay);
     if (this.options.config.timeout !== undefined) parseHandlerTimeout(this.options.config.timeout);
+    if (this.options.config.http?.port !== undefined) parseHttpPort(this.options.config.http.port, "config.http.port");
     for (const client of this.clients) {
       this.assertUnique(client.handlers.map(({ id }) => id), "handler", ` for client ${client.id}`);
       if (client.retryOptions.delay !== undefined) parseRetryDelay(client.retryOptions.delay);

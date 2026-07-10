@@ -22,7 +22,7 @@ This creates `.simple-agent-orchestrator` at your project root.
 npx simple-agent-orchestrator doctor
 ```
 
-`doctor` loads your config, initializes and validates the store, validates identifiers, and prints the discovered channels and clients. It does not run environment hooks, pollers, or handlers. Use `npx simple-agent-orchestrator state validate` when you only need a persisted-state compatibility check.
+`doctor` loads your config, initializes and validates the store, validates identifiers, and prints the discovered channels and clients. It does not run environment hooks, HTTP hooks/listeners, pollers, or handlers. Use `npx simple-agent-orchestrator state validate` when you only need a persisted-state compatibility check.
 
 ## 4. Dispatch a manual event
 
@@ -55,13 +55,13 @@ You should see session state like:
 
 ## 5. Start the runtime
 
-After the manual smoke test, start the long-running runtime for polls and project-owned dispatch integrations:
+After the manual smoke test, start the long-running runtime for HTTP ingress, polls, and workers:
 
 ```bash
 npx simple-agent-orchestrator start
 ```
 
-The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root and validates persisted state before polling, mounting environments, recovering deliveries, or invoking handlers. The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` fail before writing while `start` is active; inspection commands such as `state validate`, a retention preview, `sessions show`, and `events list` remain available.
+The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root and validates persisted state before polling, mounting environments, opening HTTP, recovering deliveries, or invoking handlers. The listener defaults to `http://127.0.0.1:3000`; check `GET /health`, or pass `--no-http` when it is not needed. The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` fail before writing while `start` is active; inspection commands such as `state validate`, a retention preview, `sessions show`, and `events list` remain available.
 
 ## 6. Replace the echo client
 

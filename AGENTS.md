@@ -35,6 +35,7 @@ Read [the design principles](docs/design-principles.md) before changing project 
 - **Sandbox**: an optional session-scoped resource created and cleaned up by an environment. The package tracks lifecycle state; integrations own the actual resource.
 - **Store**: a full runtime-state snapshot adapter. The package ships isolated memory storage and a local JSON-file store.
 - **Runtime**: the one-shot, in-process coordinator for dispatch, polling, workers, lifecycle, locking, and persistence.
+- **HTTP server**: the optional project/runtime-scoped Hono listener started by ordinary `start()` for health and trusted project routes; it is not a client environment.
 
 Canonical API details live in [the API reference](docs/api-reference.md), not in this summary.
 
@@ -87,6 +88,9 @@ The installable coding-agent skill is [skills/simple-agent-orchestrator/SKILL.md
 Preserve these contracts unless implementation, tests, and documentation are deliberately changed together.
 
 - Dispatch persists the event and matching deliveries before returning `queued`.
+- Ordinary startup binds HTTP after recovery and environment mounting but before pollers and workers. Drain, offline, inspection, config loading, and test-harness initialization never bind it.
+- HTTP middleware registers before built-ins, custom routes register afterward, and `/health`, `/webhooks/*`, and `/api/v1/*` are reserved.
+- HTTP shutdown stops acceptance and closes idle connections before waiting for workers or releasing store ownership, and accepted dispatch work settles before ownership release.
 - Duplicate dispatch returns the original internal event ID and creates no new deliveries.
 - Events fan out across clients and across handlers on one client.
 - Channel and client IDs are globally unique. Handler IDs are unique within a client.
@@ -122,10 +126,11 @@ Preserve these contracts unless implementation, tests, and documentation are del
 
 - Treat an `OrchestratorRuntime` as one-shot. Its abort controller remains aborted after `stop()`.
 - Normal `start()` mounts environments, starts pollers, and starts client workers.
+- Normal `start()` also binds HTTP by default; `start({ http: false })`, config `http.enabled: false`, and CLI `--no-http` disable it.
 - `start({ drain: true })` polls once, drains currently eligible deliveries without waiting for delayed work, and always stops and unmounts before resolving.
 - Direct `drain()` mounts environments, may repeat sequentially, rejects overlap, and does not unmount; its caller must eventually call `stop()`.
 - Startup failure performs full shutdown before rejecting. Duplicate starts, conflicting start/drain calls, and restart after stop are rejected.
-- `stop()` shares concurrent cleanup, is otherwise idempotent, and retries only unmount hooks that previously failed.
+- `stop()` shares concurrent cleanup, is otherwise idempotent, and retries only unresolved cleanup work.
 - Environment instances are scoped by client ID and environment ID. Their values are process-local.
 - Mount hooks run in registration order. Environments unmount in reverse mount order and hooks run in reverse registration order; cleanup continues after failures.
 - Shutdown is cooperative. Handlers and hooks must observe their `AbortSignal` when appropriate.
@@ -157,7 +162,7 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Runtime shutdown unmounts environments but does not clean every active session sandbox.
 - Poll dispatch, source acknowledgement, cursor commit, and external effects are not transactionally coupled.
 - `dev` has no watch or reload behavior.
-- No webhook server, provider integration, prompt renderer, approval system, or agent queue is bundled.
+- No built-in or provider-specific webhook route, provider integration, prompt renderer, approval system, or agent queue is bundled.
 - TypeScript config files are transpiled by `tsx` at runtime, not type-checked while loading.
 - `doctor` validates config loading, identifiers, and persisted state; it does not execute environment hooks, polls, handlers, or sandboxes. `state validate` performs the state compatibility check directly.
 - `paused` and `failed` are session status types, but pause/resume and session-failure workflows are not implemented.

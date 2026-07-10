@@ -15,6 +15,7 @@ The framework gives you durable plumbing and gets out of your way:
 - Clients subscribe to channels and handle deliveries.
 - Sessions preserve state across related events.
 - Environments mount project resources and optional sandboxes.
+- A project-level Hono server provides health checks and trusted route extension hooks.
 - CLI commands let you inspect sessions, events, and failed deliveries.
 
 ## Install
@@ -87,7 +88,7 @@ Show a session:
 npx simple-agent-orchestrator sessions show test-session
 ```
 
-The `dispatch` command processes currently eligible work in a one-shot runtime and exits. A configured delayed retry remains durably pending for a later drain or long-running runtime. After this smoke test, start the long-running runtime for polls and project-owned dispatch integrations:
+The `dispatch` command processes currently eligible work in a one-shot runtime and exits. A configured delayed retry remains durably pending for a later drain or long-running runtime. After this smoke test, start the long-running runtime for HTTP ingress, polls, and workers:
 
 ```bash
 npx simple-agent-orchestrator start
@@ -115,6 +116,17 @@ export default defineConfig(({ project }) => ({
 
   store: jsonFileStore(project.statePath("state.json")),
 
+  http: {
+    hostname: "127.0.0.1",
+    port: 3000,
+    routes({ app, dispatch }) {
+      app.post("/project-hook", async (context) => {
+        const result = await dispatch("github.reviews", { id: crypto.randomUUID() });
+        return context.json(result, 202);
+      });
+    },
+  },
+
   channels: [githubReviewsChannel],
 
   clients: [codingClient],
@@ -122,6 +134,8 @@ export default defineConfig(({ project }) => ({
 ```
 
 The config receives a project context so you can resolve paths relative to the repository root or the `.simple-agent-orchestrator` directory.
+
+Normal `start` and `dev` runs bind HTTP to `127.0.0.1:3000` by default. `SAO_HTTP_PORT` overrides the configured port. `GET /health` is built in; `/health`, `/webhooks/*`, and `/api/v1/*` are reserved. Project middleware runs before built-ins and project routes are registered afterward. The server provides no authentication, signature verification, CORS, rate limiting, or TLS, so treat custom routes as trusted config and add the required controls before exposing it. Use `--no-http` to disable the listener.
 
 ## Core example
 
@@ -196,7 +210,7 @@ export const codingClient = createClient("coding", (client) => {
 
 ### Channel
 
-A channel is an event source. It can poll, expose a manual dispatch target, or be wired to an external webhook/server in your project code.
+A channel is an event source. It can poll, expose a manual dispatch target, or receive events from project routes on the runtime-owned HTTP server.
 
 ### Event
 
@@ -227,6 +241,7 @@ An environment mounts shared resources for a client, such as local servers, API 
 simple-agent-orchestrator init
 simple-agent-orchestrator start
 simple-agent-orchestrator dev
+# Add --no-http to start or dev when no listener is wanted.
 
 # Inspection (safe while start is active)
 simple-agent-orchestrator doctor

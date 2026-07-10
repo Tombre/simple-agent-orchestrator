@@ -82,6 +82,30 @@ project.cachePath("scratch")
 
 Use these helpers instead of long relative path chains.
 
+## HTTP integration
+
+Ordinary `start` and `dev` runs own one project-level Hono server alongside polling and workers:
+
+```ts
+export default defineConfig({
+  http: {
+    hostname: "127.0.0.1",
+    port: 3000,
+    middleware({ app }) {
+      app.use("*", projectAuthenticationMiddleware);
+    },
+    routes({ app, dispatch }) {
+      app.post("/source", async (context) => {
+        const event = await parseAndVerifySourceRequest(context.req.raw);
+        return context.json(await dispatch("source", event), 202);
+      });
+    },
+  },
+});
+```
+
+Middleware is registered before built-ins; custom routes are registered afterward. Hooks also receive `project`, `logger`, and the runtime `signal`. `/health`, `/webhooks/*`, and `/api/v1/*` are reserved. The runtime deliberately does not own authentication, signatures, CORS, rate limiting, TLS, or public exposure policy. HTTP belongs at project/runtime scope rather than in a client environment, which may be mounted once per client.
+
 ## TypeScript loading
 
 The runtime loads `.ts`, `.mts`, and `.cts` config files through `tsx`. It does not type-check config at runtime; use your editor or `tsc` for type checking.

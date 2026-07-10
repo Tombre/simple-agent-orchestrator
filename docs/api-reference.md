@@ -25,6 +25,7 @@ type OrchestratorConfig = {
   logger?: Logger;
   retries?: RetryOptions;
   timeout?: number | string;
+  http?: HttpConfig;
 };
 
 type RetryOptions = {
@@ -36,6 +37,33 @@ type RetryOptions = {
 `attempts` counts the first attempt and defaults to `3`. `delay` is a fixed wait between failed automatic attempts; it accepts milliseconds or the same `ms`, `s`, `m`, and `h` strings as poll intervals and defaults to `0`. Positive fractional values round up to one whole millisecond. The maximum is `2_147_483_647` ms (about 24.9 days).
 
 `timeout` is the default cooperative deadline for each delivery attempt. It uses the same duration format, rounding, and maximum; `0` disables it. It does not apply to polls or environment mount/unmount hooks.
+
+### HTTP config
+
+```ts
+type HttpConfig = {
+  enabled?: boolean;
+  hostname?: string;
+  port?: number;
+  middleware?: (context: HttpRegistrationContext) => void | Promise<void>;
+  routes?: (context: HttpRegistrationContext) => void | Promise<void>;
+};
+
+type HttpRegistrationContext = {
+  app: Hono;
+  project: ProjectContext;
+  logger: Logger;
+  signal: AbortSignal;
+  dispatch(channelId: string, event: DispatchEvent): Promise<{
+    status: "queued" | "duplicate";
+    eventId: string;
+  }>;
+};
+```
+
+Ordinary `start()` binds a Hono listener by default. The default is `127.0.0.1:3000`; the port resolves from `SAO_HTTP_PORT`, then `http.port`, then `3000`. Ports must be base-10 integers from `1` through `65535`. On `EADDRINUSE`, startup tries at most nine subsequent ports without probing and never wraps; all other listen errors fail immediately. The final URL and requested/actual ports are logged.
+
+The awaited `middleware` hook runs before built-ins and the awaited `routes` hook runs afterward. Both are trusted project config. `GET /health` returns `{ "status": "ok" }` after ordinary runtime startup completes. `/health`, `/webhooks/*`, and `/api/v1/*` are reserved; the latter namespaces currently return `404`. The server does not provide authentication, authorization, signature verification, CORS, rate limiting, TLS, or exposure policy. A non-loopback bind logs a warning, but loopback is not an authentication boundary.
 
 ## `createChannel(id, setup?)`
 
@@ -301,13 +329,17 @@ import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
 
 const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });
 await runtime.start();
+// Or disable only this start's listener:
+// await runtime.start({ http: false });
 ```
 
 Each runtime instance has one lifecycle. `start()` may be called once; duplicate starts, a start after direct draining, and restart after `stop()` or failed startup are rejected. A direct `drain()` claims the runtime for draining and may be repeated sequentially until `stop()`, but overlapping drains are rejected. `stop()` rejects while startup or a drain is in progress, shares cleanup across concurrent calls, and is otherwise idempotent. Create a fresh runtime rather than attempting to restart a stopped instance.
 
 A drain stops when no delivery is currently eligible. It never sleeps for a future `nextAttemptAt`; delayed work remains durable for a later drain or for workers started by normal `start()`.
 
-Runtime initialization reads state before attaching channels or starting work. Invalid state therefore rejects startup before polls, environment hooks, recovery, or handlers run. If startup otherwise fails after mounting resources or creating pollers, the runtime aborts in-flight work, clears intervals, unmounts environments, and releases store ownership before rejecting. Environments are unmounted in reverse mount order, their hooks run in reverse registration order, and cleanup continues after a hook fails. A later `stop()` retries only failed unmount hooks. When startup and shutdown both fail, the runtime throws an `AggregateError` containing both failures.
+Runtime initialization reads state before attaching channels or starting work. Invalid state therefore rejects startup before polls, environment hooks, recovery, HTTP setup, or handlers run. Ordinary startup acquires ownership, validates state, recovers interrupted deliveries, mounts environments, sets up and binds HTTP, then starts pollers and workers. Route setup or listener failure therefore rolls back without starting orchestration side effects. Failed startup closes HTTP, aborts in-flight work, clears intervals, unmounts environments, and releases store ownership before rejecting. Environments are unmounted in reverse mount order, their hooks run in reverse registration order, and cleanup continues after a hook fails. A later `stop()` retries only unresolved cleanup. When startup and shutdown both fail, the runtime throws an `AggregateError` containing both failures.
+
+Shutdown first stops HTTP acceptance and closes idle connections, then waits for accepted request/dispatch work and workers before unmounting environments and releasing ownership. HTTP-close, environment, and ownership failures are aggregated, and repeated or concurrent `stop()` calls retain the existing deterministic retry behavior.
 
 Inspection methods can use the loaded runtime while it is active:
 
@@ -349,6 +381,8 @@ try {
 ```
 
 `start()` and `drain()` acquire the configured store's runtime lock and hold it until `stop()`; `start({ drain: true })` releases it automatically even when polling, mounting, or processing fails. After ownership is acquired, every processing lifecycle automatically requeues persisted `processing` deliveries and warns with their IDs and interrupted attempt numbers. Recovery preserves the consumed attempt and grants one replacement attempt only when needed to make an interruption at the retry limit eligible again. The complete handler attempt may repeat, including uncertain external effects.
+
+HTTP starts only for ordinary `start()`. It does not start for `start({ drain: true })`, direct `drain()`, `runOffline()`, project/config loading, inspection commands, or `createTestRuntime()` initialization.
 
 `runOffline(operation)` requires an unused runtime, acquires the same ownership before invoking the callback, then always stops the one-shot runtime and releases ownership. Its callback receives an owned `drain()` function for processing deliveries without opening another lifecycle scope; that drain also performs interrupted-delivery recovery. Use the scope for direct offline calls to `dispatch`, `endSession`, `retryDelivery`, or `pruneState`; an active owner causes it to fail before invoking the callback. A lock whose PID is no longer alive is reclaimed automatically. Mutation-only offline operations do not recover deliveries unless they invoke `drain()`.
 

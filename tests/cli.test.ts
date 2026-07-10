@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -28,6 +28,44 @@ async function runCliResult(...args: string[]): Promise<{ failed: boolean; stdou
   }
 }
 
+async function runUntilStarted(args: string[], marker: string): Promise<string> {
+  const child = spawn(process.execPath, ["--import", "tsx", cliFile, ...args], {
+    cwd: repositoryRoot,
+    env: { ...process.env, SAO_HTTP_PORT: "invalid" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  try {
+    await new Promise<void>((resolveStarted, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`Timed out waiting for CLI startup: ${stderr}`)), 5_000);
+      let settling = false;
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+        if (!settling && stdout.includes(marker)) {
+          settling = true;
+          clearTimeout(timeout);
+          resolveStarted();
+        }
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.once("exit", (code) => {
+        clearTimeout(timeout);
+        reject(new Error(`CLI exited before shutdown with code ${String(code)}: ${stderr}`));
+      });
+      child.once("error", reject);
+    });
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+      await new Promise<void>((resolveExit) => child.once("exit", () => resolveExit()));
+    }
+  }
+  return stdout;
+}
+
 async function createFixture(): Promise<{ root: string; stateFile: string }> {
   const root = await mkdtemp(join(tmpdir(), "sao-cli-"));
   const configFile = join(root, ".simple-agent-orchestrator", "orchestrator.ts");
@@ -52,7 +90,7 @@ export default defineConfig({ channels: [manual], clients: [client] });
   return { root, stateFile: join(root, ".simple-agent-orchestrator", "state", "state.json") };
 }
 
-describe("CLI", () => {
+describe("CLI", { timeout: 15_000 }, () => {
   it("initializes a project without replacing existing npm scripts", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-cli-"));
     await writeFile(join(root, "package.json"), JSON.stringify({ scripts: { test: "existing" } }), "utf8");
@@ -69,9 +107,9 @@ describe("CLI", () => {
       "agents:dev": "simple-agent-orchestrator dev",
       "agents:doctor": "simple-agent-orchestrator doctor",
     });
-    expect(await readFile(join(root, ".simple-agent-orchestrator", "orchestrator.ts"), "utf8")).toContain(
-      "defineConfig",
-    );
+    const orchestrator = await readFile(join(root, ".simple-agent-orchestrator", "orchestrator.ts"), "utf8");
+    expect(orchestrator).toContain("defineConfig");
+    expect(orchestrator).toContain("hostname: \"127.0.0.1\"");
     for (const directory of ["logs", "state", "tmp"]) {
       expect(await readFile(join(root, ".simple-agent-orchestrator", directory, ".gitignore"), "utf8")).toBe(
         "*\n!.gitignore\n",
@@ -158,7 +196,7 @@ describe("CLI", () => {
     expect(failedDelivery).toBeDefined();
 
     const { runtime } = await loadProjectOrchestrator({ root });
-    await runtime.start({ prettyStartupLog: false });
+    await runtime.start({ http: false, prettyStartupLog: false });
     try {
       expect(await runCli("doctor", "--root", root)).toContain("Doctor completed.");
       expect(await runCli("print-config", "--root", root)).toContain('"events": 2');
@@ -212,7 +250,7 @@ describe("CLI", () => {
     expect(await readFile(stateFile, "utf8")).toBe(beforePreview);
 
     const { runtime } = await loadProjectOrchestrator({ root });
-    await runtime.start({ prettyStartupLog: false });
+    await runtime.start({ http: false, prettyStartupLog: false });
     try {
       const preview = JSON.parse(await runCli("state", "prune", "--root", root, "--before", "2021-01-01T00:00:00.000Z")) as {
         applied: boolean;
@@ -262,5 +300,16 @@ describe("CLI", () => {
       expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeGreaterThan(mutationHeading);
     }
     expect(output).toContain("simple-agent-orchestrator state prune --before <timestamp> [--apply] [--drop-dedupe]");
+    expect(output).toContain("simple-agent-orchestrator start [--root <path>] [--config <path>] [--drain] [--no-http]");
+    expect(output).toContain("simple-agent-orchestrator dev [--root <path>] [--config <path>] [--no-http]");
+  });
+
+  it("disables HTTP for start and dev even when the environment port is invalid", async () => {
+    const { root } = await createFixture();
+
+    expect(await runUntilStarted(["start", "--root", root, "--no-http"], "Simple Agent Orchestrator is running"))
+      .toContain("Simple Agent Orchestrator is running");
+    expect(await runUntilStarted(["dev", "--root", root, "--no-http"], "Development mode is running"))
+      .toContain("Development mode is running");
   });
 });

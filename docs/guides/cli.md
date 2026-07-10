@@ -16,7 +16,7 @@ Use `--force` to overwrite template files.
 npx simple-agent-orchestrator doctor
 ```
 
-Loads the project config, validates persisted state, and prints discovered runtime resources. It does not run polls, handlers, or environment hooks.
+Loads the project config, validates persisted state, and prints discovered runtime resources. It does not run polls, handlers, environment hooks, HTTP hooks, or a listener.
 
 ## state validate
 
@@ -46,7 +46,7 @@ Events are retained by default because they suppress duplicate dispatch. Add `--
 npx simple-agent-orchestrator start
 ```
 
-Starts pollers and client workers.
+Starts the project-level HTTP listener, pollers, and client workers. HTTP defaults to `127.0.0.1:3000`; `SAO_HTTP_PORT` overrides `http.port`, and occupied ports trigger up to nine sequential fallback attempts. Startup logs the actual URL.
 
 When using `jsonFileStore`, a local ownership lock rejects a second runtime or offline mutation for the same state and reports the active PID and start time. Ownership is released on normal shutdown, and a lock left by a process that exited is reclaimed on the next operation.
 
@@ -58,9 +58,12 @@ Options:
 --root <path>
 --config <path>
 --drain
+--no-http
 ```
 
-`--drain` runs polls once, processes currently eligible pending deliveries, and exits. It does not wait for future delayed retries.
+`--drain` runs polls once, processes currently eligible pending deliveries, and exits. It does not wait for future delayed retries or start HTTP. `--no-http` disables HTTP for an otherwise normal `start`.
+
+The HTTP server has no built-in authentication, signature verification, CORS, rate limiting, or TLS. A non-loopback bind warns because custom routes may be remotely reachable; loopback binding is still not an authentication boundary.
 
 ## dev
 
@@ -68,7 +71,7 @@ Options:
 npx simple-agent-orchestrator dev
 ```
 
-Currently equivalent to `start` with more development-oriented messaging. This is the right place to add watch/reload behavior later.
+Currently equivalent to `start` with more development-oriented messaging and supports `--no-http`. This is the right place to add watch/reload behavior later.
 
 ## dispatch
 

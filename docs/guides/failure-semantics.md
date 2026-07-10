@@ -21,6 +21,8 @@ The timeout signal is cooperative. The runtime aborts it, waits for the active s
 
 Environment mounting occurs during runtime startup or drain setup, before deliveries are claimed. A mount failure rejects that lifecycle operation without consuming a delivery attempt or invoking its failure hook. Failed startup aborts in-flight work, clears poll intervals, unmounts every environment that mounted successfully, and releases store ownership before rejecting. Cleanup proceeds in reverse mount and hook-registration order and continues after individual unmount failures.
 
+For ordinary startup, HTTP route setup and binding happen after recovery and environment mounting but before pollers and workers start. A hook or listener failure performs complete startup rollback without allowing polling or worker side effects. Shutdown stops accepting requests first, waits for accepted request and dispatch work, then unmounts environments and releases store ownership. HTTP-close failures are aggregated with other cleanup failures; unresolved listener cleanup remains retryable by a later `stop()`.
+
 Persisted-state validation occurs before polling, environment mounting, interrupted-delivery recovery, or handler work. A validation or unsupported-version failure leaves the JSON file unchanged, releases ownership acquired for startup, and requires repair, a compatible package, or a restored backup before processing can continue. `state validate` performs the same read-only compatibility check without running work.
 
 ## What persists

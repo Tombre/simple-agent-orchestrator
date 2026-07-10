@@ -18,7 +18,10 @@ function send(message: unknown): Promise<void> {
 
 try {
   const project = await createProjectContext(root);
-  const runtime = new OrchestratorRuntime({ project, config: { store: jsonFileStore(statePath) } });
+  const runtime = new OrchestratorRuntime({
+    project,
+    config: { store: jsonFileStore(statePath), http: { enabled: false } },
+  });
   await runtime.start({ prettyStartupLog: false });
   await send({ type: "ready", pid: process.pid });
   await new Promise<void>((resolve) => {

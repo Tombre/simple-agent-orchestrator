@@ -46,6 +46,8 @@
     "release:check": "node scripts/release-check.mjs"
   },
   "dependencies": {
+    "@hono/node-server": "^2.0.8",
+    "hono": "^4.12.29",
     "tsx": "^4.23.0"
   },
   "devDependencies": {

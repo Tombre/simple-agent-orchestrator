@@ -34,6 +34,14 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - Sandbox cleanup checks whether the resource exists before closing it.
 - Sandbox lifecycle logic can reconcile create, cleanup, and recreate if final delivery persistence fails after cleanup.
 
+## HTTP ingress
+
+- Project HTTP middleware is registered through `config.http.middleware`, before built-in routes.
+- Custom routes use `config.http.routes` and its runtime-backed `dispatch`; the HTTP listener is not modeled as a client environment.
+- `/health`, `/webhooks/*`, and `/api/v1/*` remain reserved.
+- Authentication, source signature verification, request limits, CORS, rate limiting, TLS, and public exposure are explicit project responsibilities.
+- A loopback bind is not treated as authentication, and non-loopback exposure receives an explicit security review.
+
 ## Queue and retries
 
 - Dedupe is not treated as successful processing.
@@ -54,9 +62,10 @@ npx simple-agent-orchestrator print-config
 npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
 npx simple-agent-orchestrator sessions list
 npx simple-agent-orchestrator events list
+curl http://127.0.0.1:3000/health
 ```
 
-`dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. The inspection commands, including `state validate` and a retention preview without `--apply`, remain available while `start` is active. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
+`dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. Normal `start` and `dev` open HTTP unless `--no-http` is passed; drain and inspection commands do not. The inspection commands, including `state validate` and a retention preview without `--apply`, remain available while `start` is active. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
 
 ## Common failures
 

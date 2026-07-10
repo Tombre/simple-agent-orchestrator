@@ -7,6 +7,11 @@ export default defineConfig(({ project }) => ({
 
   store: jsonFileStore(project.statePath("state.json")),
 
+  http: {
+    hostname: "127.0.0.1",
+    port: 3000,
+  },
+
   channels: [manualChannel],
 
   clients: [echoClient],

@@ -36,6 +36,10 @@ import { codingClient } from "./clients/coding";
 
 export default defineConfig(({ project }) => ({
   name: String(project.packageJson.name ?? "agent-orchestrator"),
+  http: {
+    hostname: "127.0.0.1",
+    port: 3000,
+  },
   channels: [manualChannel],
   clients: [codingClient],
 }));

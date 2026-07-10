@@ -1,6 +1,8 @@
 # Channels
 
-Channels are event sources. They can poll APIs, receive manual CLI events, or be connected to your own webhook/server code.
+Channels are event sources. They can poll APIs, receive manual CLI events, or receive dispatches from project routes registered on the runtime-owned Hono server.
+
+The HTTP config's `routes({ app, dispatch })` hook can durably dispatch from trusted custom routes in the same process that owns workers and the JSON store. Add project middleware for authentication and source signature verification before exposing ingress. Built-in normalized webhook routes are not included yet, and `/webhooks/*` is reserved.
 
 ## Manual channel
 

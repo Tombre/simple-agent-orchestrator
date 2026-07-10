@@ -12,10 +12,25 @@ export default defineConfig(({ project }) => ({
   channels: [manualChannel],
   clients: [codingClient],
   timeout: "10m",
+  http: {
+    hostname: "127.0.0.1",
+    port: 3000,
+    middleware({ app }) {
+      app.use("*", projectAuthenticationMiddleware);
+    },
+    routes({ app, dispatch }) {
+      app.post("/source", async (context) => context.json(
+        await dispatch("source", await verifiedEvent(context.req.raw)),
+        202,
+      ));
+    },
+  },
 }));
 ```
 
 The config lives at `.simple-agent-orchestrator/orchestrator.ts`.
+
+Normal `start()` binds HTTP by default; `SAO_HTTP_PORT` overrides config, and `start({ http: false })` or CLI `--no-http` disables it. Middleware runs before built-ins and routes afterward. `GET /health` is built in; `/health`, `/webhooks/*`, and `/api/v1/*` are reserved. Hooks receive the Hono `app`, `project`, `logger`, runtime `signal`, and durable `dispatch`. The server has no built-in authentication, signature checks, CORS, rate limiting, or TLS.
 
 The `project` helper exposes stable paths:
 
@@ -199,7 +214,7 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 });
 ```
 
-Runtime instances are one-shot. Call `start()` once, or use sequential direct `drain()` calls followed by `stop()`; do not overlap drains or try to restart a stopped runtime. Startup and each drain automatically requeue deliveries left `processing` by an interrupted attempt, preserving the consumed attempt and warning that external effects may repeat. `start({ drain: true })` and failed startup clean up automatically. Environments unmount in reverse mount order, hooks unmount in reverse registration order, and cleanup continues after failures. Make unmount hooks retry-safe because a later `stop()` retries hooks that failed.
+Runtime instances are one-shot. Call `start()` once, or use sequential direct `drain()` calls followed by `stop()`; do not overlap drains or try to restart a stopped runtime. Startup and each drain automatically requeue deliveries left `processing` by an interrupted attempt, preserving the consumed attempt and warning that external effects may repeat. HTTP starts only during ordinary `start()`, after environment mounts and before pollers/workers. `start({ drain: true })`, direct drains, offline work, inspection, and test-harness initialization do not open it. Failed startup and one-shot start clean up automatically. Shutdown closes HTTP and settles accepted dispatches before releasing ownership. Environments unmount in reverse mount order, hooks unmount in reverse registration order, and cleanup continues after failures. Make cleanup hooks retry-safe because a later `stop()` retries unresolved cleanup.
 
 ## Key helpers
 

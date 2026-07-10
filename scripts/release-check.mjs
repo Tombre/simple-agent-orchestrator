@@ -137,13 +137,16 @@ async function verifyConsumer(consumerRoot, archive) {
   await writeFile(
     join(consumerRoot, "verify-types.ts"),
     `import { CURRENT_STATE_VERSION, createClient, createManualChannel, defineConfig, validateAndMigrateState } from "simple-agent-orchestrator";
-import type { OrchestratorState, StateValidationErrorCode } from "simple-agent-orchestrator";
+import type { HttpRegistrationContext, OrchestratorState, StateValidationErrorCode } from "simple-agent-orchestrator";
 import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
 import { createTestRuntime } from "simple-agent-orchestrator/testing";
 
 const channel = createManualChannel("types");
 const client = createClient("types", (builder) => builder.handle(channel, () => {}));
-const config = { channels: [channel], clients: [client] };
+const registerRoutes = ({ app }: HttpRegistrationContext) => {
+  app.get("/typed", (context) => context.text("ok"));
+};
+const config = { channels: [channel], clients: [client], http: { enabled: false, routes: registerRoutes } };
 void defineConfig(config);
 const state: OrchestratorState = validateAndMigrateState({ version: CURRENT_STATE_VERSION, sessions: [], events: [], deliveries: [], notes: [], cursors: {} });
 const validationCode: StateValidationErrorCode = "invalid-state";
@@ -199,6 +202,37 @@ assert.equal(deliveries[0]?.status, "pending");
     "utf8",
   );
   await run(process.execPath, [join(consumerRoot, "dispatch.mjs")], { cwd: consumerRoot });
+
+  await writeFile(
+    join(consumerRoot, "http-smoke.mjs"),
+    `import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
+
+const probe = createServer();
+await new Promise((resolve, reject) => {
+  probe.once("error", reject);
+  probe.listen(0, "127.0.0.1", resolve);
+});
+const address = probe.address();
+assert(address && typeof address === "object");
+const port = address.port;
+await new Promise((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+process.env.SAO_HTTP_PORT = String(port);
+
+const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });
+await runtime.start({ prettyStartupLog: false });
+try {
+  const response = await fetch(\`http://127.0.0.1:\${port}/health\`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { status: "ok" });
+} finally {
+  await runtime.stop();
+}
+`,
+    "utf8",
+  );
+  await run(process.execPath, [join(consumerRoot, "http-smoke.mjs")], { cwd: consumerRoot });
 
   console.log("Running the installed CLI against persisted package state...");
   await runCli(["start", "--drain"]);

@@ -61,8 +61,8 @@ Usage:
   simple-agent-orchestrator init [--force]
 
   Runtime commands:
-  simple-agent-orchestrator start [--root <path>] [--config <path>] [--drain]
-  simple-agent-orchestrator dev [--root <path>] [--config <path>]
+  simple-agent-orchestrator start [--root <path>] [--config <path>] [--drain] [--no-http]
+  simple-agent-orchestrator dev [--root <path>] [--config <path>] [--no-http]
 
   Inspection commands (safe while start is active):
   simple-agent-orchestrator doctor [--root <path>] [--config <path>]
@@ -137,7 +137,8 @@ async function loadRuntime(flags: Record<string, string | boolean>) {
 async function start(flags: Record<string, string | boolean>, dev = false): Promise<void> {
   const { runtime } = await loadRuntime(flags);
   const drain = hasFlag(flags, "drain");
-  await runtime.start({ drain, prettyStartupLog: true });
+  const http = !booleanFlag(flags, "no-http");
+  await runtime.start({ drain, http, prettyStartupLog: true });
   if (drain) return;
 
   const shutdown = async () => {
@@ -150,6 +151,8 @@ async function start(flags: Record<string, string | boolean>, dev = false): Prom
 
   if (dev) {
     console.log("Development mode is running. Press Ctrl+C to stop.");
+  } else {
+    console.log("Simple Agent Orchestrator is running. Press Ctrl+C to stop.");
   }
 }
 
