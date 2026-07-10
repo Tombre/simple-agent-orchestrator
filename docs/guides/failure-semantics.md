@@ -17,7 +17,9 @@ An error from `handle`, `onSuccess`, sandbox cleanup, or final persistence fails
 
 `onFailure` runs after a failed attempt when a handler context was created. It receives the original error. If `onFailure` throws, that secondary error is logged and does not replace the delivery error or change retry behavior. Failures before the context exists, including sandbox creation failures, do not invoke `onFailure`.
 
-Environment mounting occurs during runtime startup or drain setup, before deliveries are claimed. A mount failure rejects that lifecycle operation without consuming a delivery attempt or invoking its failure hook.
+Environment mounting occurs during runtime startup or drain setup, before deliveries are claimed. A mount failure rejects that lifecycle operation without consuming a delivery attempt or invoking its failure hook. Failed startup aborts in-flight work, clears poll intervals, unmounts every environment that mounted successfully, and releases store ownership before rejecting. Cleanup proceeds in reverse mount and hook-registration order and continues after individual unmount failures.
+
+Persisted-state validation occurs before polling, environment mounting, interrupted-delivery recovery, or handler work. A validation or unsupported-version failure leaves the JSON file unchanged, releases ownership acquired for startup, and requires repair, a compatible package, or a restored backup before processing can continue. `state validate` performs the same read-only compatibility check without running work.
 
 ## What persists
 

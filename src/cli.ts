@@ -60,6 +60,7 @@ Usage:
   Inspection commands (safe while start is active):
   simple-agent-orchestrator doctor [--root <path>] [--config <path>]
   simple-agent-orchestrator print-config [--root <path>] [--config <path>]
+  simple-agent-orchestrator state validate [--root <path>] [--config <path>]
   simple-agent-orchestrator sessions list
   simple-agent-orchestrator sessions show <id-or-key>
   simple-agent-orchestrator events list
@@ -166,6 +167,15 @@ async function printConfig(flags: Record<string, string | boolean>): Promise<voi
   const { runtime, configFile } = await loadRuntime(flags);
   const config = await runtime.printConfig();
   console.log(JSON.stringify({ ...config, configFile }, null, 2));
+}
+
+async function stateCommand(args: ParsedArgs): Promise<void> {
+  if (args.positional[1] !== "validate") {
+    throw new Error("Usage: simple-agent-orchestrator state validate [--root <path>] [--config <path>]");
+  }
+  const { runtime } = await loadRuntime(args.flags);
+  await runtime.init();
+  console.log("State is valid and compatible.");
 }
 
 async function dispatchCommand(args: ParsedArgs): Promise<void> {
@@ -279,6 +289,9 @@ async function main(): Promise<void> {
       break;
     case "print-config":
       await printConfig(args.flags);
+      break;
+    case "state":
+      await stateCommand(args);
       break;
     case "dispatch":
       await dispatchCommand(args);

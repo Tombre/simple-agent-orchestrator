@@ -1,4 +1,5 @@
 import type { OrchestratorState } from "../core/types.js";
+import { CURRENT_STATE_VERSION } from "./state-validation.js";
 
 export interface Store {
   readonly name: string;
@@ -10,7 +11,7 @@ export interface Store {
 
 export function emptyState(): OrchestratorState {
   return {
-    version: 1,
+    version: CURRENT_STATE_VERSION,
     sessions: [],
     events: [],
     deliveries: [],

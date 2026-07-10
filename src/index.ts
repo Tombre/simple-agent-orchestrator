@@ -41,6 +41,7 @@ export type {
   KeyLike,
   Logger,
   OrchestratorEvent,
+  OrchestratorState,
   ProjectContext,
   RetryOptions,
   SessionNote,
@@ -52,8 +53,16 @@ export type {
 
 export type { Session, SessionEndOptions } from "./core/session.js";
 
-export { fileStore, jsonFileStore, memoryStore } from "./stores/index.js";
-export type { Store } from "./stores/index.js";
+export {
+  CURRENT_STATE_VERSION,
+  MINIMUM_STATE_VERSION,
+  StateValidationError,
+  fileStore,
+  jsonFileStore,
+  memoryStore,
+  validateAndMigrateState,
+} from "./stores/index.js";
+export type { StateValidationErrorCode, Store } from "./stores/index.js";
 
 export { env } from "./utils/env.js";
 export { parseDuration } from "./utils/time.js";

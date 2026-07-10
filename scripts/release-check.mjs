@@ -131,10 +131,13 @@ async function verifyConsumer(consumerRoot, archive) {
 
   const doctor = await runCli(["doctor"]);
   assert.match(doctor.stdout, /Doctor completed\./);
+  const stateValidation = await runCli(["state", "validate"]);
+  assert.match(stateValidation.stdout, /State is valid and compatible\./);
 
   await writeFile(
     join(consumerRoot, "verify-types.ts"),
-    `import { createClient, createManualChannel, defineConfig } from "simple-agent-orchestrator";
+    `import { CURRENT_STATE_VERSION, createClient, createManualChannel, defineConfig, validateAndMigrateState } from "simple-agent-orchestrator";
+import type { OrchestratorState, StateValidationErrorCode } from "simple-agent-orchestrator";
 import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
 import { createTestRuntime } from "simple-agent-orchestrator/testing";
 
@@ -142,6 +145,10 @@ const channel = createManualChannel("types");
 const client = createClient("types", (builder) => builder.handle(channel, () => {}));
 const config = { channels: [channel], clients: [client] };
 void defineConfig(config);
+const state: OrchestratorState = validateAndMigrateState({ version: CURRENT_STATE_VERSION, sessions: [], events: [], deliveries: [], notes: [], cursors: {} });
+const validationCode: StateValidationErrorCode = "invalid-state";
+void state;
+void validationCode;
 void loadProjectOrchestrator({ root: "." });
 void createTestRuntime({ config });
 `,
@@ -175,6 +182,8 @@ import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
 import * as testing from "simple-agent-orchestrator/testing";
 
 assert.equal(typeof api.createClient, "function");
+assert.equal(api.CURRENT_STATE_VERSION, 2);
+assert.equal(typeof api.validateAndMigrateState, "function");
 assert.equal(typeof testing.createTestRuntime, "function");
 const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });
 const result = await runtime.dispatch("manual", {

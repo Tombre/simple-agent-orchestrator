@@ -13,6 +13,7 @@ The framework owns boring but important stateful plumbing:
 - delivery attempts
 - session resolution
 - session state
+- persisted-state validation and compatible upgrades
 - environment lifecycle
 - sandbox cleanup
 - CLI inspection

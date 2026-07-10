@@ -2,8 +2,14 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { jsonFileStore, memoryStore } from "../src/index.js";
+import {
+  CURRENT_STATE_VERSION,
+  StateValidationError,
+  jsonFileStore,
+  memoryStore,
+} from "../src/index.js";
 import { emptyState } from "../src/stores/store.js";
+import { initializeJsonStateFile } from "../src/stores/json-file.js";
 
 describe("stores", () => {
   it("isolates reads and writes in memory", async () => {
@@ -46,7 +52,288 @@ describe("stores", () => {
     await writeFile(path, "not json", "utf8");
     const store = jsonFileStore(path);
 
-    await expect(store.read()).rejects.toBeInstanceOf(SyntaxError);
+    await expect(store.read()).rejects.toMatchObject({
+      code: "invalid-json",
+    });
     expect(await readFile(path, "utf8")).toBe("not json");
+  });
+
+  it("creates a current empty snapshot only when the state file is missing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "nested", "state.json");
+
+    await jsonFileStore(path).init();
+
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(emptyState());
+    expect(emptyState().version).toBe(CURRENT_STATE_VERSION);
+  });
+
+  it("initializes one complete snapshot when first-run callers race", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "nested", "state.json");
+
+    await Promise.all(Array.from({ length: 20 }, () => jsonFileStore(path).init()));
+
+    expect(await jsonFileStore(path).read()).toEqual(emptyState());
+  });
+
+  it("does not overwrite state when a delayed initializer publishes after another caller", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "state.json");
+    const winner = emptyState();
+    winner.cursors.poll = { page: 4 };
+    const raw = JSON.stringify(winner, null, 2);
+    await writeFile(path, raw, "utf8");
+
+    await initializeJsonStateFile(path);
+
+    expect(await readFile(path, "utf8")).toBe(raw);
+  });
+
+  it("deterministically upgrades a valid version 1 fixture without changing durable data", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "state.json");
+    const fixturePath = join(import.meta.dirname, "fixtures", "state", "version-1.json");
+    const raw = await readFile(fixturePath, "utf8");
+    const versionOne = JSON.parse(raw) as Record<string, unknown>;
+    await writeFile(path, raw, "utf8");
+
+    const migrated = await jsonFileStore(path).read();
+
+    expect(migrated).toEqual({ ...versionOne, version: CURRENT_STATE_VERSION });
+    expect(await jsonFileStore(path).read()).toEqual(migrated);
+    expect(await readFile(path, "utf8")).toBe(raw);
+
+    await jsonFileStore(path).write(migrated);
+    expect((JSON.parse(await readFile(path, "utf8")) as { version: number }).version).toBe(CURRENT_STATE_VERSION);
+  });
+
+  it.each([
+    ["top-level null", "null", "state must be an object"],
+    ["missing version", JSON.stringify({ sessions: [], events: [], deliveries: [], notes: [], cursors: {} }), "state.version is required"],
+    ["future version", JSON.stringify({ ...emptyState(), version: CURRENT_STATE_VERSION + 1 }), "newer than this package supports"],
+    ["obsolete version", JSON.stringify({ ...emptyState(), version: 0 }), "older than the minimum supported version"],
+    ["invalid collection", JSON.stringify({ ...emptyState(), sessions: null }), "state.sessions must be an array"],
+    [
+      "invalid nested field",
+      JSON.stringify({
+        ...emptyState(),
+        deliveries: [{
+          id: "delivery",
+          eventId: "event",
+          channelId: "manual",
+          clientId: "client",
+          handlerId: "handler",
+          status: "waiting",
+          attempts: 0,
+          maxAttempts: 1,
+          createdAt: "now",
+          updatedAt: "now",
+        }],
+      }),
+      "state.deliveries[0].status",
+    ],
+    [
+      "dangling reference",
+      JSON.stringify({
+        ...emptyState(),
+        notes: [{ id: "note", sessionId: "missing", message: "message", createdAt: "now" }],
+      }),
+      "references missing session",
+    ],
+    [
+      "exhausted pending delivery",
+      JSON.stringify({
+        ...emptyState(),
+        events: [{
+          id: "event",
+          channelId: "manual",
+          sourceId: "source",
+          dedupeKey: "manual:source",
+          sessionKey: "session",
+          receivedAt: "now",
+        }],
+        deliveries: [{
+          id: "delivery",
+          eventId: "event",
+          channelId: "manual",
+          clientId: "client",
+          handlerId: "handler",
+          status: "pending",
+          attempts: 1,
+          maxAttempts: 1,
+          createdAt: "now",
+          updatedAt: "now",
+        }],
+      }),
+      "has no retry attempts remaining",
+    ],
+    [
+      "duplicate event dedupe identity",
+      JSON.stringify({
+        ...emptyState(),
+        events: ["first", "second"].map((id) => ({
+          id,
+          channelId: "manual",
+          sourceId: id,
+          dedupeKey: "manual:same",
+          sessionKey: id,
+          receivedAt: "now",
+        })),
+      }),
+      "duplicates a channelId and dedupeKey identity",
+    ],
+    [
+      "duplicate delivery route identity",
+      JSON.stringify({
+        ...emptyState(),
+        events: [{
+          id: "event",
+          channelId: "manual",
+          sourceId: "source",
+          dedupeKey: "manual:source",
+          sessionKey: "session",
+          receivedAt: "now",
+        }],
+        deliveries: ["first", "second"].map((id) => ({
+          id,
+          eventId: "event",
+          channelId: "manual",
+          clientId: "client",
+          handlerId: "handler",
+          status: "pending",
+          attempts: 0,
+          maxAttempts: 1,
+          createdAt: "now",
+          updatedAt: "now",
+        })),
+      }),
+      "duplicates an eventId, clientId, and handlerId identity",
+    ],
+    [
+      "mismatched delivery session",
+      JSON.stringify({
+        ...emptyState(),
+        sessions: [{ id: "session", key: "other", status: "active", state: {}, createdAt: "now", updatedAt: "now" }],
+        events: [{
+          id: "event",
+          channelId: "manual",
+          sourceId: "source",
+          dedupeKey: "manual:source",
+          sessionKey: "expected",
+          receivedAt: "now",
+        }],
+        deliveries: [{
+          id: "delivery",
+          eventId: "event",
+          channelId: "manual",
+          clientId: "client",
+          handlerId: "handler",
+          status: "pending",
+          attempts: 0,
+          maxAttempts: 1,
+          createdAt: "now",
+          updatedAt: "now",
+          sessionId: "session",
+        }],
+      }),
+      "does not match its event sessionKey",
+    ],
+    [
+      "unknown nested field",
+      JSON.stringify({
+        ...emptyState(),
+        sessions: [{ id: "session", key: "key", status: "active", state: {}, createdAt: "now", updatedAt: "now", extra: true }],
+      }),
+      "state.sessions[0].extra is not recognized",
+    ],
+  ])("rejects %s with an actionable error and preserves the file", async (_name, raw, message) => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "state.json");
+    await writeFile(path, raw, "utf8");
+
+    const error = await jsonFileStore(path).read().catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(StateValidationError);
+    expect(String(error)).toContain(path);
+    expect(String(error)).toContain(message);
+    expect(String(error)).toContain("not modified");
+    expect(await readFile(path, "utf8")).toBe(raw);
+  });
+
+  it("validates JSON-safe values before replacing existing state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "state.json");
+    const store = jsonFileStore(path);
+    await store.init();
+    const original = await readFile(path, "utf8");
+    const invalid = emptyState();
+    invalid.cursors.poll = { value: Number.NaN };
+
+    await expect(store.write(invalid)).rejects.toThrow("state.cursors.poll.value must be JSON-safe");
+    expect(await readFile(path, "utf8")).toBe(original);
+  });
+
+  it("rejects excessive JSON nesting on reads and writes without replacing state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "state.json");
+    let nested: unknown = "value";
+    for (let depth = 0; depth < 102; depth += 1) nested = { nested };
+    const invalid = emptyState();
+    invalid.cursors.poll = { nested };
+    const invalidRaw = JSON.stringify(invalid);
+    await writeFile(path, invalidRaw, "utf8");
+
+    await expect(jsonFileStore(path).read()).rejects.toThrow("maximum JSON nesting depth of 100");
+    expect(await readFile(path, "utf8")).toBe(invalidRaw);
+
+    const original = JSON.stringify(emptyState(), null, 2);
+    await writeFile(path, original, "utf8");
+    await expect(jsonFileStore(path).write(invalid)).rejects.toThrow("maximum JSON nesting depth of 100");
+    expect(await readFile(path, "utf8")).toBe(original);
+  });
+
+  it.each([
+    ["sparse arrays", () => {
+      const value: unknown[] = [];
+      value.length = 1;
+      return value;
+    }],
+    ["array properties", () => Object.assign([1], { extra: true })],
+    ["custom array serialization", () => Object.assign([1], { toJSON: () => "changed" })],
+  ])("rejects %s before JSON serialization changes them", async (_name, createValue) => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "state.json");
+    const store = jsonFileStore(path);
+    await store.init();
+    const original = await readFile(path, "utf8");
+    const invalid = emptyState();
+    invalid.cursors.poll = { value: createValue() };
+
+    await expect(store.write(invalid)).rejects.toThrow(/JSON array/);
+    expect(await readFile(path, "utf8")).toBe(original);
+  });
+
+  it.each([
+    ["sparse collections", () => {
+      const value = [] as ReturnType<typeof emptyState>["sessions"];
+      value.length = 1;
+      return value;
+    }],
+    [
+      "custom collection serialization",
+      () => Object.assign([] as ReturnType<typeof emptyState>["sessions"], { toJSON: () => [] }),
+    ],
+  ])("rejects %s before replacing state", async (_name, createSessions) => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const path = join(root, "state.json");
+    const store = jsonFileStore(path);
+    await store.init();
+    const original = await readFile(path, "utf8");
+    const invalid = emptyState();
+    invalid.sessions = createSessions();
+
+    await expect(store.write(invalid)).rejects.toThrow(/JSON array/);
+    expect(await readFile(path, "utf8")).toBe(original);
   });
 });

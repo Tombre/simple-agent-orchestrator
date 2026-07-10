@@ -187,7 +187,7 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 });
 ```
 
-Startup and each drain automatically requeue deliveries left `processing` by an interrupted attempt, preserving the consumed attempt and warning that external effects may repeat.
+Runtime instances are one-shot. Call `start()` once, or use sequential direct `drain()` calls followed by `stop()`; do not overlap drains or try to restart a stopped runtime. Startup and each drain automatically requeue deliveries left `processing` by an interrupted attempt, preserving the consumed attempt and warning that external effects may repeat. `start({ drain: true })` and failed startup clean up automatically. Environments unmount in reverse mount order, hooks unmount in reverse registration order, and cleanup continues after failures. Make unmount hooks retry-safe because a later `stop()` retries hooks that failed.
 
 ## Key helpers
 
@@ -213,4 +213,6 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` rejects a second active runtime or offline operation for the same state file and reclaims ownership left by a dead PID. Runtime ownership requires a local filesystem with atomic hard-link support and fails explicitly when unavailable. CLI `dispatch`, `sessions end`, and `events retry` acquire ownership and fail before writing while `start` is active; inspection commands remain available. Direct library mutations require an explicit `runtime.runOffline(...)` scope. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.
+Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 2 is current; valid version 1 state is upgraded in memory and persisted by the next successful write, while invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
+
+The JSON store rejects a second active runtime or offline operation for the same state file and reclaims ownership left by a dead PID. Atomic first-run initialization and runtime ownership require a local filesystem with atomic hard-link support and fail explicitly when unavailable. CLI `dispatch`, `sessions end`, and `events retry` acquire ownership and fail before writing while `start` is active; inspection commands remain available. Direct library mutations require an explicit `runtime.runOffline(...)` scope. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.

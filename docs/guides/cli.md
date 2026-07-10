@@ -16,7 +16,15 @@ Use `--force` to overwrite template files.
 npx simple-agent-orchestrator doctor
 ```
 
-Loads the project config and prints discovered runtime resources.
+Loads the project config, validates persisted state, and prints discovered runtime resources. It does not run polls, handlers, or environment hooks.
+
+## state validate
+
+```bash
+npx simple-agent-orchestrator state validate
+```
+
+Loads the project and validates that the complete persisted snapshot is compatible. It is an inspection command and does not rewrite a valid version 1 file, so it remains available while `start` is active. A missing JSON state file is initialized as an empty current snapshot, consistent with `doctor` and other first-run commands. Invalid JSON, invalid shapes or references, obsolete versions, and future versions exit unsuccessfully with recovery guidance; the invalid file is not replaced.
 
 ## start
 
@@ -28,7 +36,7 @@ Starts pollers and client workers.
 
 When using `jsonFileStore`, a local ownership lock rejects a second runtime or offline mutation for the same state and reports the active PID and start time. Ownership is released on normal shutdown, and a lock left by a process that exited is reclaimed on the next operation.
 
-`doctor`, `print-config`, `sessions list`, `sessions show`, and `events list` only inspect runtime state and are safe while `start` is active. `dispatch`, `sessions end`, and `events retry` are offline mutations: they fail before writing unless the long-running runtime is stopped. This does not make direct library writes or arbitrary JSON-store writers safe.
+`doctor`, `print-config`, `state validate`, `sessions list`, `sessions show`, and `events list` only inspect runtime state and are safe while `start` is active. `dispatch`, `sessions end`, and `events retry` are offline mutations: they fail before writing unless the long-running runtime is stopped. This does not make direct library writes or arbitrary JSON-store writers safe.
 
 Options:
 

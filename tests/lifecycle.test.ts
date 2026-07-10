@@ -16,6 +16,7 @@ import {
   type Store,
 } from "../src/index.js";
 import { createTestRuntime } from "../src/testing/index.js";
+import { emptyState } from "../src/stores/store.js";
 import { createRuntime, deferred, waitFor } from "./helpers.js";
 
 type OwnerMessage = { type: "ready"; pid: number } | { type: "error"; message: string };
@@ -683,6 +684,71 @@ describe("resource lifecycle", () => {
     const initRuntime = await createRuntime({ store: failingStore });
     await expect(initRuntime.start({ prettyStartupLog: false })).rejects.toThrow("init failed");
     await assertReplacementStarts(initStatePath);
+  });
+
+  it("rejects invalid persisted state before polling or mounting and releases ownership", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-state-validation-"));
+    const statePath = join(root, "state.json");
+    const invalid = JSON.stringify({
+      ...emptyState(),
+      events: [{
+        id: "event",
+        channelId: "source",
+        sourceId: "source",
+        dedupeKey: "source:source",
+        sessionKey: "session",
+        receivedAt: "now",
+      }],
+      deliveries: [{
+        id: "delivery",
+        eventId: "event",
+        channelId: "source",
+        clientId: "client",
+        handlerId: "source:0",
+        status: "pending",
+        attempts: 1,
+        maxAttempts: 1,
+        createdAt: "now",
+        updatedAt: "now",
+      }],
+    });
+    await writeFile(statePath, invalid, "utf8");
+    let polled = false;
+    let mounted = false;
+    const channel = createChannel("source", (builder) => {
+      builder.poll({
+        every: "1m",
+        fetch() {
+          polled = true;
+          return [];
+        },
+      });
+    });
+    const environment = createEnvironment("service", (builder) => {
+      builder.onMount(() => {
+        mounted = true;
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+    });
+    const runtime = await createRuntime({
+      channels: [channel],
+      clients: [client],
+      store: jsonFileStore(statePath),
+    });
+
+    await expect(runtime.start({ drain: true, prettyStartupLog: false })).rejects.toThrow(
+      "has no retry attempts remaining",
+    );
+    expect(polled).toBe(false);
+    expect(mounted).toBe(false);
+    expect(await readFile(statePath, "utf8")).toBe(invalid);
+
+    await writeFile(statePath, JSON.stringify(emptyState()), "utf8");
+    const replacement = await createRuntime({ store: jsonFileStore(statePath) });
+    await replacement.start({ prettyStartupLog: false });
+    await replacement.stop();
   });
 
   it("persists a created sandbox across handler retries and cleans it after session end", async () => {

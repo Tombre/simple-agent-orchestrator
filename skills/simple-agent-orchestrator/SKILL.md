@@ -18,7 +18,7 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
    - channel: add or edit a source of events.
    - client: route a channel to a session and call project agent/tool code.
    - environment: mount shared runtime resources or create/cleanup sandboxes.
-   - debug: inspect config, sessions, events, deliveries, and retries.
+   - debug: inspect config, persisted-state compatibility, sessions, events, deliveries, and retries.
    - review: check routing identity, idempotency, cleanup, and validation.
    Done when the intended branch is explicit in the changes.
 
@@ -49,14 +49,15 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
 8. **Validate with the CLI.** Prefer these checks after edits:
 
    ```bash
-   npx simple-agent-orchestrator doctor
+    npx simple-agent-orchestrator doctor
+    npx simple-agent-orchestrator state validate
    npx simple-agent-orchestrator print-config
    npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
    npx simple-agent-orchestrator sessions list
    npx simple-agent-orchestrator events list
    ```
 
-   Run the `dispatch` smoke test only after stopping a long-running JSON-store runtime; it is an offline command and will fail before writing while `start` is active. Inspection commands such as `doctor`, `print-config`, `sessions list`, and `events list` remain safe while `start` is active. Also run the project’s TypeScript/test commands when available. Done when config loads and the changed route can be smoke-tested or the remaining blocker is named.
+   Run the `dispatch` smoke test only after stopping a long-running JSON-store runtime; it is an offline command and will fail before writing while `start` is active. Inspection commands such as `doctor`, `state validate`, `print-config`, `sessions list`, and `events list` remain safe while `start` is active. `state validate` reports malformed, incompatible, or unsupported persisted state without replacing it. Also run the project’s TypeScript/test commands when available. Done when config and state validate and the changed route can be smoke-tested or the remaining blocker is named.
 
 ## References
 

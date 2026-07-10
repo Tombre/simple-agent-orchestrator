@@ -109,6 +109,7 @@ export class OrchestratorRuntime {
     if (this.initialized) return;
     this.validateConfiguration();
     await this.store.init();
+    await this.store.read();
     for (const channel of this.channels) {
       channel.__attachDispatch((event) => this.dispatch(channel.id, event));
     }

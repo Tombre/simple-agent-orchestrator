@@ -107,6 +107,25 @@ describe("CLI", () => {
     expect(await runCli("sessions", "show", "work-1", "--root", root)).toContain('"endReason": "operator"');
   });
 
+  it("validates current and supported persisted state without rewriting it", async () => {
+    const { root, stateFile } = await createFixture();
+    await runCli("doctor", "--root", root);
+    const state = JSON.parse(await readFile(stateFile, "utf8")) as Record<string, unknown>;
+    const versionOne = `${JSON.stringify({ ...state, version: 1 }, null, 2)}\n`;
+    await writeFile(stateFile, versionOne, "utf8");
+
+    expect(await runCli("state", "validate", "--root", root)).toContain("State is valid and compatible");
+    expect(await readFile(stateFile, "utf8")).toBe(versionOne);
+
+    const malformed = "not json";
+    await writeFile(stateFile, malformed, "utf8");
+    const failure = await runCliResult("state", "validate", "--root", root);
+    expect(failure.failed).toBe(true);
+    expect(failure.stderr).toContain("contains invalid JSON");
+    expect(failure.stderr).toContain("not modified");
+    expect(await readFile(stateFile, "utf8")).toBe(malformed);
+  });
+
   it("rejects offline mutations before writing while allowing inspection during an active runtime", async () => {
     const { root, stateFile } = await createFixture();
     await runCli("dispatch", "manual", "--root", root, "--id", "success", "--session", "work-1", "--input", "hello");
@@ -122,6 +141,7 @@ describe("CLI", () => {
     try {
       expect(await runCli("doctor", "--root", root)).toContain("Doctor completed.");
       expect(await runCli("print-config", "--root", root)).toContain('"events": 2');
+      expect(await runCli("state", "validate", "--root", root)).toContain("State is valid and compatible");
       expect(await runCli("sessions", "list", "--root", root)).toContain("work-1");
       expect(await runCli("sessions", "show", "work-1", "--root", root)).toContain('"lastInput": "hello"');
       expect(await runCli("events", "list", "--root", root)).toContain("failed");
@@ -150,7 +170,7 @@ describe("CLI", () => {
     const mutationHeading = output.indexOf("Offline mutation commands (require start to be stopped)");
     expect(inspectionHeading).toBeGreaterThan(-1);
     expect(mutationHeading).toBeGreaterThan(inspectionHeading);
-    for (const command of ["doctor", "print-config", "sessions list", "sessions show", "events list"]) {
+    for (const command of ["doctor", "print-config", "state validate", "sessions list", "sessions show", "events list"]) {
       expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeGreaterThan(inspectionHeading);
       expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeLessThan(mutationHeading);
     }

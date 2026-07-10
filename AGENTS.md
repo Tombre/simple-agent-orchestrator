@@ -109,7 +109,8 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Cursor mutations made during a poll persist only after `fetch`, `map`, dispatch, and `commit` complete.
 - Poll cursor identity is `${channelId}:${pollRegistrationIndex}`; reordering polls can reinterpret persisted cursors.
 - `memoryStore` isolates reads and writes by cloning.
-- `jsonFileStore` does not replace malformed state silently and writes via temporary file plus rename.
+- `jsonFileStore` validates the full snapshot before runtime work and writes, does not replace invalid state, and writes via temporary file plus rename.
+- State version 2 is current. Structurally valid version 1 snapshots migrate deterministically in memory and persist as version 2 on the next successful write; inspection does not rewrite them.
 - Persisted event, session, note, and cursor values must be JSON-safe when using `jsonFileStore`.
 - Dispatch may return `queued` with no matching handlers. Sessions are created only when a delivery is processed.
 
@@ -135,8 +136,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 Do not claim these are solved unless code and regression tests explicitly solve them.
 
 - The JSON store rejects multiple active runtimes and scopes explicit `runOffline()` operations, but it is not safe for unscoped or arbitrary concurrent writers.
-- JSON-store runtime ownership requires a local filesystem with atomic hard-link support.
-- Persisted state has no schema-validation or migration system. The JSON store currently coerces the read version to `1` instead of rejecting unsupported versions.
+- JSON-store first-run initialization and runtime ownership require a local filesystem with atomic hard-link support.
 - There is no distributed worker coordination or distributed per-session lock.
 - Runtime lifecycle calls do not yet have complete duplicate-start or restart guards.
 - Processing is not exactly once, and retries can repeat external side effects.
@@ -152,7 +152,7 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - `dev` has no watch or reload behavior.
 - No webhook server, provider integration, prompt renderer, approval system, or agent queue is bundled.
 - TypeScript config files are transpiled by `tsx` at runtime, not type-checked while loading.
-- `doctor` validates config loading, identifiers, and store initialization; it does not execute environment hooks, polls, handlers, or sandboxes.
+- `doctor` validates config loading, identifiers, and persisted state; it does not execute environment hooks, polls, handlers, or sandboxes. `state validate` performs the state compatibility check directly.
 - `paused` and `failed` are session status types, but pause/resume and session-failure workflows are not implemented.
 - After a session key has historical and active records, lookup by key can select an older record; use the session ID when the distinction matters.
 

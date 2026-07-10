@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "sessions": [
+    {
+      "id": "session-active",
+      "key": "work-1",
+      "status": "active",
+      "state": {
+        "ordinary": "value",
+        "ensured": {
+          "id": "resource-1"
+        },
+        "__sao.sandbox.agent.created": true
+      },
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:01:00.000Z"
+    },
+    {
+      "id": "session-ended",
+      "key": "work-1",
+      "status": "ended",
+      "state": {
+        "result": "complete"
+      },
+      "createdAt": "2023-12-31T00:00:00.000Z",
+      "updatedAt": "2023-12-31T01:00:00.000Z",
+      "endedAt": "2023-12-31T01:00:00.000Z",
+      "endReason": "completed"
+    }
+  ],
+  "events": [
+    {
+      "id": "event-internal",
+      "channelId": "manual",
+      "sourceId": "source-1",
+      "dedupeKey": "manual:source-1:v2",
+      "sessionKey": "work-1",
+      "type": "issue.updated",
+      "input": "Handle this",
+      "payload": {
+        "number": 7
+      },
+      "meta": {
+        "sender": "octocat"
+      },
+      "occurredAt": "2024-01-01T00:00:00.000Z",
+      "receivedAt": "2024-01-01T00:00:01.000Z"
+    }
+  ],
+  "deliveries": [
+    {
+      "id": "delivery-pending",
+      "eventId": "event-internal",
+      "channelId": "manual",
+      "clientId": "agent",
+      "handlerId": "manual:0",
+      "status": "pending",
+      "attempts": 1,
+      "maxAttempts": 3,
+      "createdAt": "2024-01-01T00:00:01.000Z",
+      "updatedAt": "2024-01-01T00:00:02.000Z",
+      "lastError": "retryable",
+      "sessionId": "session-active"
+    }
+  ],
+  "notes": [
+    {
+      "id": "note-1",
+      "sessionId": "session-active",
+      "message": "Working",
+      "data": {
+        "step": 2
+      },
+      "createdAt": "2024-01-01T00:01:00.000Z"
+    }
+  ],
+  "cursors": {
+    "github:0": {
+      "page": 3,
+      "watermark": "cursor-value"
+    }
+  }
+}

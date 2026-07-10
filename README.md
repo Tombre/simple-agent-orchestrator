@@ -63,6 +63,7 @@ Check the setup:
 
 ```bash
 npx simple-agent-orchestrator doctor
+npx simple-agent-orchestrator state validate
 ```
 
 Send a manual event:
@@ -92,7 +93,7 @@ The `dispatch` command processes the event in a one-shot runtime and exits. Afte
 npx simple-agent-orchestrator start
 ```
 
-The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, and `events retry` are offline operations: they acquire the same ownership lock and fail before writing if `start` is active. Inspection commands remain available while the runtime is running.
+The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, and `events retry` are offline operations: they acquire the same ownership lock and fail before writing if `start` is active. Inspection commands, including `state validate`, remain available while the runtime is running.
 
 ## Project-local config
 
@@ -224,6 +225,7 @@ simple-agent-orchestrator dev
 # Inspection (safe while start is active)
 simple-agent-orchestrator doctor
 simple-agent-orchestrator print-config
+simple-agent-orchestrator state validate
 simple-agent-orchestrator sessions list
 simple-agent-orchestrator sessions show <id-or-key>
 simple-agent-orchestrator events list
@@ -255,7 +257,9 @@ See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
 
 This generated project is intentionally small and dependency-light. It ships with an in-memory store and a JSON-file store. The public store interface is small so that you can add a SQLite or Postgres adapter later without changing user code.
 
-The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Ownership requires a local hard-link-capable filesystem and fails explicitly when the filesystem cannot provide atomic hard links. After acquiring ownership, startup and drain recover stale `processing` deliveries automatically. The CLI rejects offline mutations while `start` is active, but direct unscoped library writes remain unsafe. Multi-process worker coordination is not implemented.
+The JSON-file store strictly validates state before runtime work and writes. State version 2 is current; valid version 1 snapshots are upgraded deterministically in memory and persisted as version 2 by the next successful write. Validation and inspection do not rewrite version 1 files. Malformed, structurally invalid, obsolete, and future versions fail with actionable errors and are not replaced. Run `state validate` for a read-only compatibility check.
+
+The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Atomic first-run state initialization and runtime ownership require a local hard-link-capable filesystem and fail explicitly when the filesystem cannot provide atomic hard links. After acquiring ownership, startup and drain recover stale `processing` deliveries automatically. The CLI rejects offline mutations while `start` is active, but direct unscoped library writes remain unsafe. Multi-process worker coordination is not implemented.
 
 The package is ESM-only and requires Node.js 20 or newer.
 

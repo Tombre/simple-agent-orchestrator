@@ -133,7 +133,7 @@ export interface SessionNote {
 }
 
 export interface OrchestratorState {
-  version: 1;
+  version: 2;
   sessions: StoredSession[];
   events: StoredEvent[];
   deliveries: StoredDelivery[];

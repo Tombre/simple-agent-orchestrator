@@ -45,6 +45,8 @@ The returned value is persisted eagerly and survives a later failed attempt. The
 
 Ordinary `set`, `delete`, `note`, and `end` changes made by handlers or hooks persist only after the entire attempt succeeds. They are discarded when `handle`, `onSuccess`, cleanup, or final persistence fails. State mutations made during sandbox creation are a separate eager-persistence path.
 
+Values persisted in session state, notes, events, and cursors must be JSON-safe and no more than 100 levels deep when using `jsonFileStore`. Unsupported values such as `undefined`, `NaN`, infinities, class instances, and circular objects fail validation instead of being silently changed by JSON serialization.
+
 ## Notes
 
 A session can record human-readable notes:

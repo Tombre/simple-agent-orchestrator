@@ -239,6 +239,10 @@ Persistent JSON-file store.
 jsonFileStore(project.statePath("state.json"));
 ```
 
+The current state version is `CURRENT_STATE_VERSION` (`2`), and `MINIMUM_STATE_VERSION` is `1`. JSON reads and writes validate the complete snapshot, including entity shapes, statuses, retry counters, unique IDs, references, cursor records, and JSON-safe durable values up to 100 nested levels. A valid version 1 snapshot is deterministically migrated in memory; read-only inspection leaves the file unchanged, while the next successful write persists version 2. Missing files are initialized with a current empty snapshot. Invalid JSON, invalid state, versions older than 1, and versions newer than 2 throw `StateValidationError` without replacing the file. Its `code` is `invalid-json`, `invalid-state`, or `unsupported-version`.
+
+`validateAndMigrateState(value, source?)` is available for custom stores that decode untrusted persisted data. It returns a validated current `OrchestratorState` or throws `StateValidationError`. Custom `Store.read()` implementations are responsible for returning a valid current snapshot.
+
 The store interface is:
 
 ```ts
@@ -253,7 +257,7 @@ type Store = {
 
 `runtimeLockPath` opts a store into local single-active-runtime enforcement. `jsonFileStore` sets it automatically beside the state file. Custom stores should set it when they rely on the runtime's process-local coordination. A store may omit it when each runtime has isolated state or when the store independently rejects additional active runtimes; the snapshot `Store` interface does not make coordinated multi-runtime execution safe.
 
-Local ownership records use atomic hard links and therefore require a local hard-link-capable filesystem. Unsupported filesystems fail startup with an explicit ownership error rather than running without enforcement.
+Atomic missing-state initialization and local ownership records use hard links and therefore require a local hard-link-capable filesystem. Unsupported filesystems fail initialization or startup with an explicit error rather than risking replacement or running without ownership enforcement.
 
 ## Runtime API
 
@@ -265,6 +269,10 @@ import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
 const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });
 await runtime.start();
 ```
+
+Each runtime instance has one lifecycle. `start()` may be called once; duplicate starts, a start after direct draining, and restart after `stop()` or failed startup are rejected. A direct `drain()` claims the runtime for draining and may be repeated sequentially until `stop()`, but overlapping drains are rejected. `stop()` rejects while startup or a drain is in progress, shares cleanup across concurrent calls, and is otherwise idempotent. Create a fresh runtime rather than attempting to restart a stopped instance.
+
+Runtime initialization reads state before attaching channels or starting work. Invalid state therefore rejects startup before polls, environment hooks, recovery, or handlers run. If startup otherwise fails after mounting resources or creating pollers, the runtime aborts in-flight work, clears intervals, unmounts environments, and releases store ownership before rejecting. Environments are unmounted in reverse mount order, their hooks run in reverse registration order, and cleanup continues after a hook fails. A later `stop()` retries only failed unmount hooks. When startup and shutdown both fail, the runtime throws an `AggregateError` containing both failures.
 
 Inspection methods can use the loaded runtime while it is active:
 
@@ -298,7 +306,7 @@ try {
 }
 ```
 
-`start()` and `drain()` acquire the configured store's runtime lock and hold it until `stop()`; `start({ drain: true })` releases it automatically. After ownership is acquired, every processing lifecycle automatically requeues persisted `processing` deliveries and warns with their IDs and interrupted attempt numbers. Recovery preserves the consumed attempt and grants one replacement attempt only when needed to make an interruption at the retry limit eligible again. The complete handler attempt may repeat, including uncertain external effects.
+`start()` and `drain()` acquire the configured store's runtime lock and hold it until `stop()`; `start({ drain: true })` releases it automatically even when polling, mounting, or processing fails. After ownership is acquired, every processing lifecycle automatically requeues persisted `processing` deliveries and warns with their IDs and interrupted attempt numbers. Recovery preserves the consumed attempt and grants one replacement attempt only when needed to make an interruption at the retry limit eligible again. The complete handler attempt may repeat, including uncertain external effects.
 
 `runOffline(operation)` requires an unused runtime, acquires the same ownership before invoking the callback, then always stops the one-shot runtime and releases ownership. Its callback receives an owned `drain()` function for processing deliveries without opening another lifecycle scope; that drain also performs interrupted-delivery recovery. Use the scope for direct offline calls to `dispatch`, `endSession`, or `retryDelivery`; an active owner causes it to fail before invoking the callback. A lock whose PID is no longer alive is reclaimed automatically. Mutation-only offline operations do not recover deliveries unless they invoke `drain()`.
 

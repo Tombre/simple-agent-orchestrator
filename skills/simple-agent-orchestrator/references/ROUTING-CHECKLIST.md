@@ -45,15 +45,22 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 
 ```bash
 npx simple-agent-orchestrator doctor
+npx simple-agent-orchestrator state validate
 npx simple-agent-orchestrator print-config
 npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
 npx simple-agent-orchestrator sessions list
 npx simple-agent-orchestrator events list
 ```
 
-`dispatch`, `sessions end`, and `events retry` are offline mutations and require the long-running runtime to be stopped. The inspection commands remain available while `start` is active.
+`dispatch`, `sessions end`, and `events retry` are offline mutations and require the long-running runtime to be stopped. The inspection commands, including `state validate`, remain available while `start` is active.
 
 ## Common failures
+
+### Persisted state does not validate
+
+Cause: the JSON is malformed, its shape or references are invalid, or its version is outside the supported range.
+
+Fix: run `state validate` for the exact path and recovery category. Do not delete or overwrite the file automatically; back it up, then repair it, restore a compatible backup, upgrade the package for future state, or use an intermediate package version for obsolete state.
 
 ### Duplicate external agent sessions
 
