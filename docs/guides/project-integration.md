@@ -107,3 +107,9 @@ export default defineConfig(({ project }) => ({
 ```
 
 The store interface is intentionally small so you can add a database-backed adapter later.
+
+`jsonFileStore` also creates sibling `.runtime-lock` ownership records while `start()` or `drain()` is active. A second active runtime for the same state fails early with the owning PID and start time; a lock left by a process that has exited is reclaimed automatically. The active lock is released by `stop()`, including automatic shutdown after `start({ drain: true })`; abrupt acquisition-stage exits may leave harmless `.candidate` sidecars, and generation-qualified recovery records remain after crash recovery to make concurrent takeover safe.
+
+Ownership records use atomic hard links and require a local hard-link-capable filesystem. Unsupported filesystems fail startup explicitly instead of silently disabling enforcement.
+
+This enforces the supported one-active-runtime model, but it does not make the JSON store safe for arbitrary concurrent writers. Keep offline mutating CLI commands and direct library mutations stopped while the long-running runtime is active.

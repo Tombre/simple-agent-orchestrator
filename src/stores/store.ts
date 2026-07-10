@@ -2,6 +2,7 @@ import type { OrchestratorState } from "../core/types.js";
 
 export interface Store {
   readonly name: string;
+  readonly runtimeLockPath?: string;
   init(): Promise<void>;
   read(): Promise<OrchestratorState>;
   write(state: OrchestratorState): Promise<void>;

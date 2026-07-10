@@ -6,6 +6,7 @@ import { emptyState, type Store } from "./store.js";
 export function jsonFileStore(filePath: string): Store {
   return {
     name: `json-file:${filePath}`,
+    runtimeLockPath: `${filePath}.runtime-lock`,
 
     async init() {
       await mkdir(dirname(filePath), { recursive: true });

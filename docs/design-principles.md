@@ -67,6 +67,10 @@ Important primitives:
 
 Avoid large abstractions until repeated real-world integrations prove they are necessary.
 
+## One active local runtime
+
+Worker claims, session merging, polling, and resource locks coordinate within one process. Stores that depend on those guarantees should identify a project-local runtime lock so a second active runtime fails early instead of appearing to provide unsupported distributed coordination. Stale local ownership may be reclaimed after its process exits; this is not a lease, consensus mechanism, or replacement for a multi-process-safe store.
+
 ## Keep paths project-aware
 
 Handlers and config receive `project` so code can use:

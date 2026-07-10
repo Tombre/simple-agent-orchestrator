@@ -243,12 +243,17 @@ The store interface is:
 
 ```ts
 type Store = {
-  name: string;
+  readonly name: string;
+  readonly runtimeLockPath?: string;
   init(): Promise<void>;
   read(): Promise<OrchestratorState>;
   write(state: OrchestratorState): Promise<void>;
 };
 ```
+
+`runtimeLockPath` opts a store into local single-active-runtime enforcement. `jsonFileStore` sets it automatically beside the state file. Custom stores should set it when they rely on the runtime's process-local coordination. A store may omit it when each runtime has isolated state or when the store independently rejects additional active runtimes; the snapshot `Store` interface does not make coordinated multi-runtime execution safe.
+
+Local ownership records use atomic hard links and therefore require a local hard-link-capable filesystem. Unsupported filesystems fail startup with an explicit ownership error rather than running without enforcement.
 
 ## Runtime API
 
@@ -275,6 +280,8 @@ await runtime.listEvents();
 await runtime.retryDelivery(deliveryId);
 await runtime.printConfig();
 ```
+
+`start()` and `drain()` acquire the configured store's runtime lock and hold it until `stop()`; `start({ drain: true })` releases it automatically. A second active runtime fails with the owning PID and start time. A lock whose PID is no longer alive is reclaimed automatically. This is local process-ownership enforcement, not general multi-process store coordination: callers must still avoid separate writes such as `dispatch`, `endSession`, or `retryDelivery` while another runtime is active.
 
 ## Testing API
 

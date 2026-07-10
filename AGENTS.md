@@ -103,6 +103,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Concurrent deliveries merge mutations to different session-state keys.
 - Concurrent writes to the same state key use completion-order last-write-wins behavior.
 - Executions of the same poll do not overlap within one runtime process.
+- `jsonFileStore` permits one active `start` or `drain` runtime per state file, releases ownership on `stop()`, and reclaims locks whose owning PID has exited.
 - Poll mapping is sequential. Mapped events are durably dispatched before `commit`.
 - Cursor mutations made during a poll persist only after `fetch`, `map`, dispatch, and `commit` complete.
 - Poll cursor identity is `${channelId}:${pollRegistrationIndex}`; reordering polls can reinterpret persisted cursors.
@@ -132,7 +133,8 @@ Preserve these contracts unless implementation, tests, and documentation are del
 
 Do not claim these are solved unless code and regression tests explicitly solve them.
 
-- The JSON store is not safe for multiple orchestrator processes; atomic rename is not cross-process locking.
+- The JSON store rejects multiple active runtimes but is not safe for general concurrent writers; runtime ownership is not cross-process store locking for offline mutations.
+- JSON-store runtime ownership requires a local filesystem with atomic hard-link support.
 - Persisted state has no schema-validation or migration system. The JSON store currently coerces the read version to `1` instead of rejecting unsupported versions.
 - There is no distributed worker coordination or distributed per-session lock.
 - Runtime lifecycle calls do not yet have complete duplicate-start or restart guards.

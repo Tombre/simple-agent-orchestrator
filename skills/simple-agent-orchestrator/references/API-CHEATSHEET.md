@@ -211,4 +211,4 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-Use `memoryStore()` in tests. A custom durable store can improve persistence, but the runtime remains single-process because worker, session, poll, and sandbox coordination is process-local.
+Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` rejects a second active `start` or `drain` for the same state file and reclaims ownership left by a dead PID. Runtime ownership requires a local filesystem with atomic hard-link support and fails startup explicitly when unavailable. The runtime remains single-process because worker, session, poll, and sandbox coordination is process-local; do not run offline mutating commands beside an active JSON-store runtime. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.

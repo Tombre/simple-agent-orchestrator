@@ -23,6 +23,7 @@ import { StoreMutex } from "../stores/store.js";
 import { newId } from "../utils/id.js";
 import { consoleLogger } from "../utils/logger.js";
 import { nowIso, parseDuration } from "../utils/time.js";
+import { acquireRuntimeOwnership, type RuntimeOwnership } from "./ownership.js";
 
 export interface RuntimeOptions {
   project: ProjectContext;
@@ -81,6 +82,8 @@ export class OrchestratorRuntime {
   private readonly processingSessionKeys = new Set<string>();
   private readonly ensureLocks = new Map<string, Promise<unknown>>();
   private readonly sandboxLocks = new Map<string, Promise<void>>();
+  private ownership: RuntimeOwnership | undefined;
+  private ownershipPromise: Promise<RuntimeOwnership> | undefined;
   private initialized = false;
 
   constructor(private readonly options: RuntimeOptions) {
@@ -105,22 +108,32 @@ export class OrchestratorRuntime {
   }
 
   async start(options: StartOptions = {}): Promise<void> {
-    await this.init();
-    if (options.prettyStartupLog ?? true) this.printStartupSummary();
+    await this.ensureRuntimeOwnership();
+    try {
+      await this.init();
+      if (options.prettyStartupLog ?? true) this.printStartupSummary();
 
-    if (options.drain) {
-      try {
-        await this.runAllPollsOnce();
-        await this.drain();
-      } finally {
-        await this.stop();
+      if (options.drain) {
+        try {
+          await this.runAllPollsOnce();
+          await this.drain();
+        } finally {
+          await this.stop();
+        }
+        return;
       }
-      return;
-    }
 
-    await this.mountAllEnvironments();
-    this.startPollers();
-    this.startWorkers();
+      await this.mountAllEnvironments();
+      this.startPollers();
+      this.startWorkers();
+    } catch (error) {
+      try {
+        await this.releaseRuntimeOwnership();
+      } catch (releaseError) {
+        throw new AggregateError([error, releaseError], "Runtime startup and ownership release failed");
+      }
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -129,10 +142,27 @@ export class OrchestratorRuntime {
     this.intervalHandles.length = 0;
     await Promise.allSettled(this.pollPromises.values());
     await Promise.allSettled(this.workerPromises);
-    await this.unmountAllEnvironments();
+    let unmountError: unknown;
+    try {
+      await this.unmountAllEnvironments();
+    } catch (error) {
+      unmountError = error;
+    }
+    let releaseError: unknown;
+    try {
+      await this.releaseRuntimeOwnership();
+    } catch (error) {
+      releaseError = error;
+    }
+    if (unmountError && releaseError) {
+      throw new AggregateError([unmountError, releaseError], "Runtime shutdown and ownership release failed");
+    }
+    if (unmountError) throw unmountError;
+    if (releaseError) throw releaseError;
   }
 
   async drain(): Promise<void> {
+    await this.ensureRuntimeOwnership();
     await this.mountAllEnvironments();
     while (true) {
       let processed = false;
@@ -289,6 +319,24 @@ export class OrchestratorRuntime {
       channels: this.channels.map((channel) => channel.id).join(", ") || "none",
       clients: this.clients.map((client) => client.id).join(", ") || "none",
     });
+  }
+
+  private async ensureRuntimeOwnership(): Promise<void> {
+    const lockPath = this.store.runtimeLockPath;
+    if (!lockPath || this.ownership) return;
+    this.ownershipPromise ??= acquireRuntimeOwnership(lockPath);
+    try {
+      this.ownership = await this.ownershipPromise;
+    } finally {
+      this.ownershipPromise = undefined;
+    }
+  }
+
+  private async releaseRuntimeOwnership(): Promise<void> {
+    const ownership = this.ownership;
+    if (!ownership) return;
+    await ownership.release();
+    if (this.ownership === ownership) this.ownership = undefined;
   }
 
   private startPollers(): void {

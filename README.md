@@ -250,7 +250,7 @@ See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
 
 This generated project is intentionally small and dependency-light. It ships with an in-memory store and a JSON-file store. The public store interface is small so that you can add a SQLite or Postgres adapter later without changing user code.
 
-The runtime is suitable as a starting point for local/project-embedded orchestration. Before publishing as a production package, harden cross-process locking, stale `processing` delivery recovery, and durable database storage.
+The JSON-file store enforces one active `start` or `drain` runtime per state file with a local PID lock and reclaims stale ownership after a process exits. Ownership requires a local hard-link-capable filesystem and fails explicitly when the filesystem cannot provide atomic hard links. This does not make arbitrary concurrent JSON writers safe, so offline mutating commands must not run beside an active runtime. Stale `processing` delivery recovery and multi-process worker coordination are not implemented.
 
 The package is ESM-only and requires Node.js 20 or newer.
 

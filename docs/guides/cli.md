@@ -26,7 +26,7 @@ npx simple-agent-orchestrator start
 
 Starts pollers and client workers.
 
-When using `jsonFileStore`, this must be the only mutating orchestrator process. Do not run CLI `dispatch`, retry, or session-end commands concurrently with it.
+When using `jsonFileStore`, a local ownership lock rejects a second `start`, `dev`, or `--drain` runtime for the same state and reports the active PID and start time. Ownership is released on normal shutdown, and a lock left by a process that exited is reclaimed on the next start. Do not run CLI `dispatch`, retry, or session-end commands concurrently with an active runtime; the ownership lock does not turn the JSON store into a general concurrent-writer store.
 
 Options:
 
