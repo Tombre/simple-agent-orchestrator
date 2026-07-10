@@ -15,7 +15,7 @@ The framework gives you durable plumbing and gets out of your way:
 - Clients subscribe to channels and handle deliveries.
 - Sessions preserve state across related events.
 - Environments mount project resources and optional sandboxes.
-- A project-level Hono server provides health checks and trusted route extension hooks.
+- A project-level Hono server provides normalized webhook ingress, bounded operational inspection, health checks, and route extension hooks.
 - CLI commands let you inspect sessions, events, and failed deliveries.
 
 ## Install
@@ -94,6 +94,19 @@ The `dispatch` command processes currently eligible work in a one-shot runtime a
 npx simple-agent-orchestrator start
 ```
 
+While it is running, the generated `manual` channel accepts normalized events:
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/webhooks/manual \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"http-1","sessionKey":"http-demo","input":"Hello over HTTP"}'
+curl http://127.0.0.1:3000/api/v1/status
+curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
+curl 'http://127.0.0.1:3000/api/v1/sessions?limit=25'
+```
+
+A new event returns `202` with `{ "status": "queued", "eventId": "..." }`; a duplicate returns `200` with the original `eventId`. Acceptance means durable ingestion, not completed delivery processing.
+
 The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline operations: they acquire the same ownership lock and fail before writing if `start` is active. Inspection commands, including `state validate` and a `state prune` preview without `--apply`, remain available while the runtime is running.
 
 ## Project-local config
@@ -119,10 +132,15 @@ export default defineConfig(({ project }) => ({
   http: {
     hostname: "127.0.0.1",
     port: 3000,
+    middleware({ app }) {
+      app.use("*", projectAuthenticationMiddleware);
+    },
     routes({ app, dispatch }) {
       app.post("/project-hook", async (context) => {
         const result = await dispatch("github.reviews", { id: crypto.randomUUID() });
-        return context.json(result, 202);
+        return result.status === "queued"
+          ? context.json(result, 202)
+          : context.json(result, 200);
       });
     },
   },
@@ -135,7 +153,7 @@ export default defineConfig(({ project }) => ({
 
 The config receives a project context so you can resolve paths relative to the repository root or the `.simple-agent-orchestrator` directory.
 
-Normal `start` and `dev` runs bind HTTP to `127.0.0.1:3000` by default. `SAO_HTTP_PORT` overrides the configured port. `GET /health` is built in; `/health`, `/webhooks/*`, and `/api/v1/*` are reserved. Project middleware runs before built-ins and project routes are registered afterward. The server provides no authentication, signature verification, CORS, rate limiting, or TLS, so treat custom routes as trusted config and add the required controls before exposing it. Use `--no-http` to disable the listener.
+Normal `start` and `dev` runs bind HTTP to `127.0.0.1:3000` by default. `SAO_HTTP_PORT` overrides the configured port. Built-ins are `GET /health`, `POST /webhooks/:channelId`, `GET /api/v1/status`, `GET /api/v1/events?limit=N`, and `GET /api/v1/sessions?limit=N`; these namespaces are reserved. Webhooks require strict `application/json`, accept at most 1 MiB, and validate normalized JSON-safe events. Operational lists default to 25, allow at most 100, reject invalid limits, and omit event bodies, metadata, session state, notes, delivery errors, and individual deliveries. Project middleware runs before built-ins and project routes are registered afterward. The server does not log request bodies by default and provides no authentication, signature verification, CORS, rate limiting, or TLS. Add those controls before exposure: unauthenticated dispatch can trigger project side effects and unbounded durable state growth. Use `--no-http` to disable the listener.
 
 ## Core example
 
@@ -210,7 +228,7 @@ export const codingClient = createClient("coding", (client) => {
 
 ### Channel
 
-A channel is an event source. It can poll, expose a manual dispatch target, or receive events from project routes on the runtime-owned HTTP server.
+A channel is an event source. It can poll or receive normalized webhook, CLI, or project-route dispatches on the runtime-owned HTTP server.
 
 ### Event
 

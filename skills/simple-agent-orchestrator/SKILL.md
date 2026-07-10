@@ -7,7 +7,7 @@ metadata:
   version: "0.1.0"
 ---
 
-Simple Agent Orchestrator is an embedded project runtime: events enter through **channels**, clients route them into durable **sessions**, sessions keep state for persistent agents, **environments** provide shared resources and optional sandboxes, and an optional project-level **HTTP** listener hosts trusted ingress routes.
+Simple Agent Orchestrator is an embedded project runtime: events enter through **channels**, clients route them into durable **sessions**, sessions keep state for persistent agents, **environments** provide shared resources and optional sandboxes, and an optional project-level **HTTP** listener hosts normalized webhook ingress, bounded operational inspection, and project routes.
 
 ## Procedure
 
@@ -18,7 +18,7 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
    - channel: add or edit a source of events.
    - client: route a channel to a session and call project agent/tool code.
    - environment: mount shared runtime resources or create/cleanup sandboxes.
-   - HTTP: register project middleware or custom routes on the runtime-owned Hono app.
+   - HTTP: use normalized webhook/operational built-ins or register project middleware and custom routes on the runtime-owned Hono app.
    - debug: inspect config, persisted-state compatibility, sessions, events, deliveries, and retries.
    - review: check routing identity, idempotency, cleanup, and validation.
    Done when the intended branch is explicit in the changes.
@@ -56,12 +56,15 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
    npx simple-agent-orchestrator state validate
    npx simple-agent-orchestrator print-config
    npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
-   npx simple-agent-orchestrator sessions list
-   npx simple-agent-orchestrator events list
-   curl http://127.0.0.1:3000/health
-   ```
+    npx simple-agent-orchestrator sessions list
+    npx simple-agent-orchestrator events list
+    curl http://127.0.0.1:3000/health
+    curl -X POST http://127.0.0.1:3000/webhooks/manual -H 'Content-Type: application/json' -d '{"id":"http-smoke","sessionKey":"smoke","input":"Smoke test"}'
+    curl http://127.0.0.1:3000/api/v1/status
+    curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
+    ```
 
-   Run the `dispatch` smoke test only after stopping a long-running JSON-store runtime; it is an offline command and will fail before writing while `start` is active. Normal `start`/`dev` opens HTTP by default; use `--no-http` when unwanted. The listener has no built-in authentication, signature verification, CORS, rate limiting, or TLS, so add project middleware before exposing routes and do not treat loopback as an authentication boundary. Inspection commands such as `doctor`, `state validate`, `print-config`, `sessions list`, `events list`, and `state prune --before <timestamp>` without `--apply` remain safe while `start` is active and never open HTTP. `state validate` reports malformed, incompatible, or unsupported persisted state without replacing it. If state growth requires retention, preview exact IDs, back up the state file, and stop the runtime before adding `--apply`; do not add `--drop-dedupe` unless redispatching old source identities is acceptable. Also run the project’s TypeScript/test commands when available. Done when config and state validate and the changed route can be smoke-tested or the remaining blocker is named.
+   Run the CLI `dispatch` smoke test only after stopping a long-running JSON-store runtime; it is an offline command and will fail before writing while `start` is active. Normal `start`/`dev` opens HTTP by default; use `--no-http` when unwanted. The normalized webhook requires strict JSON, limits bodies to 1 MiB, and reports durable queued/duplicate ingestion rather than processing success. Operational lists default to 25, allow at most 100, and omit bodies, state, notes, and errors. The listener has no built-in authentication, signature verification, CORS, rate limiting, or TLS, so add project middleware before exposing routes and do not treat loopback as an authentication boundary. Unauthenticated dispatch can trigger external effects and unbounded state growth. Inspection commands such as `doctor`, `state validate`, `print-config`, `sessions list`, `events list`, and `state prune --before <timestamp>` without `--apply` remain safe while `start` is active and never open HTTP. `state validate` reports malformed, incompatible, or unsupported persisted state without replacing it. If state growth requires retention, preview exact IDs, back up the state file, and stop the runtime before adding `--apply`; do not add `--drop-dedupe` unless redispatching old source identities is acceptable. Also run the project’s TypeScript/test commands when available. Done when config and state validate and the changed route can be smoke-tested or the remaining blocker is named.
 
 ## References
 

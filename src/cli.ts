@@ -79,6 +79,14 @@ Usage:
   simple-agent-orchestrator dispatch <channel> --id <id> --session <sessionKey> --input <text>
   simple-agent-orchestrator sessions end <id-or-key> [--reason <reason>]
   simple-agent-orchestrator events retry <delivery-id>
+
+HTTP during ordinary start/dev:
+  POST /webhooks/:channelId
+  GET  /api/v1/status
+  GET  /api/v1/events?limit=N
+  GET  /api/v1/sessions?limit=N
+
+  The listener has no built-in authentication. --no-http and --drain do not open it.
 `);
 }
 
@@ -148,6 +156,9 @@ async function start(flags: Record<string, string | boolean>, dev = false): Prom
   };
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());
+  process.once("message", (message) => {
+    if (message === "shutdown") void shutdown();
+  });
 
   if (dev) {
     console.log("Development mode is running. Press Ctrl+C to stop.");

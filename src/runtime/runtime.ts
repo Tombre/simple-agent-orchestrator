@@ -5,6 +5,7 @@ import { dirname, resolve } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { getRequestListener } from "@hono/node-server";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import type { ChannelDefinition, PollDefinition } from "../core/channel.js";
 import { CursorImpl, pollCursorId } from "../core/channel.js";
 import type { ClientDefinition, HandlerContext, RegisteredHandler } from "../core/client.js";
@@ -15,6 +16,8 @@ import { HandlerTimeoutError } from "../core/errors.js";
 import { createStoredSession, SessionImpl } from "../core/session.js";
 import type {
   DispatchEvent,
+  JsonRecord,
+  JsonValue,
   Logger,
   OrchestratorEvent,
   OrchestratorState,
@@ -79,6 +82,127 @@ interface HttpRequestToken {
 const DEFAULT_HTTP_HOSTNAME = "127.0.0.1";
 const DEFAULT_HTTP_PORT = 3_000;
 const MAX_HTTP_PORT_ATTEMPTS = 10;
+const WEBHOOK_BODY_LIMIT_BYTES = 1024 * 1024;
+const WEBHOOK_IDENTIFIER_LIMIT = 512;
+const WEBHOOK_TYPE_LIMIT = 256;
+const MAX_JSON_NESTING_DEPTH = 100;
+const DEFAULT_OPERATIONAL_LIMIT = 25;
+const MAX_OPERATIONAL_LIMIT = 100;
+
+interface DeliveryCounts {
+  pending: number;
+  processing: number;
+  processed: number;
+  failed: number;
+}
+
+class WebhookValidationError extends Error {}
+
+function emptyDeliveryCounts(): DeliveryCounts {
+  return { pending: 0, processing: 0, processed: 0, failed: 0 };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateJsonValue(value: unknown, depth = 0): asserts value is JsonValue {
+  if (depth > MAX_JSON_NESTING_DEPTH) throw new WebhookValidationError("JSON nesting is too deep.");
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new WebhookValidationError("Numbers must be finite.");
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) validateJsonValue(item, depth + 1);
+    return;
+  }
+  if (!isRecord(value)) throw new WebhookValidationError("Values must be JSON-safe.");
+  for (const item of Object.values(value)) validateJsonValue(item, depth + 1);
+}
+
+function validateOptionalString(
+  value: Record<string, unknown>,
+  field: string,
+  maximumLength: number,
+): string | undefined {
+  const item = value[field];
+  if (item === undefined) return undefined;
+  if (typeof item !== "string") throw new WebhookValidationError(`${field} must be a string.`);
+  if (item.length > maximumLength) {
+    throw new WebhookValidationError(`${field} must not exceed ${maximumLength} characters.`);
+  }
+  return item;
+}
+
+function validateWebhookEvent(value: unknown): DispatchEvent<JsonValue, JsonValue, JsonRecord> {
+  if (!isRecord(value)) throw new WebhookValidationError("The request body must be an object.");
+  const allowed = new Set(["id", "type", "dedupeKey", "sessionKey", "input", "payload", "meta", "occurredAt"]);
+  for (const field of Object.keys(value)) {
+    if (!allowed.has(field)) throw new WebhookValidationError("The request body contains an unknown field.");
+  }
+
+  const id = validateOptionalString(value, "id", WEBHOOK_IDENTIFIER_LIMIT);
+  if (id === undefined || id.trim().length === 0) throw new WebhookValidationError("id must be a non-empty string.");
+  const type = validateOptionalString(value, "type", WEBHOOK_TYPE_LIMIT);
+  const dedupeKey = validateOptionalString(value, "dedupeKey", WEBHOOK_IDENTIFIER_LIMIT);
+  const sessionKey = validateOptionalString(value, "sessionKey", WEBHOOK_IDENTIFIER_LIMIT);
+  const occurredAt = validateOptionalString(value, "occurredAt", WEBHOOK_IDENTIFIER_LIMIT);
+  if (occurredAt !== undefined && !Number.isFinite(Date.parse(occurredAt))) {
+    throw new WebhookValidationError("occurredAt must be a valid date string.");
+  }
+  if (value.input !== undefined) validateJsonValue(value.input);
+  if (value.payload !== undefined) validateJsonValue(value.payload);
+  if (value.meta !== undefined) {
+    if (!isRecord(value.meta)) throw new WebhookValidationError("meta must be an object.");
+    validateJsonValue(value.meta);
+  }
+
+  return {
+    id,
+    ...(type === undefined ? {} : { type }),
+    ...(dedupeKey === undefined ? {} : { dedupeKey }),
+    ...(sessionKey === undefined ? {} : { sessionKey }),
+    ...(value.input === undefined ? {} : { input: value.input }),
+    ...(value.payload === undefined ? {} : { payload: value.payload }),
+    ...(value.meta === undefined ? {} : { meta: value.meta as JsonRecord }),
+    ...(occurredAt === undefined ? {} : { occurredAt }),
+  };
+}
+
+function parseOperationalLimit(url: string): number {
+  const values = new URL(url).searchParams.getAll("limit");
+  if (values.length === 0) return DEFAULT_OPERATIONAL_LIMIT;
+  if (values.length !== 1 || !/^[1-9][0-9]*$/.test(values[0]!)) {
+    throw new Error("invalid-limit");
+  }
+  const limit = Number(values[0]);
+  if (limit > MAX_OPERATIONAL_LIMIT) throw new Error("invalid-limit");
+  return limit;
+}
+
+function selectNewest<T>(
+  items: readonly T[],
+  limit: number,
+  timestamp: (item: T) => string,
+  id: (item: T) => string,
+): T[] {
+  const selected: T[] = [];
+  const compare = (left: T, right: T) =>
+    timestamp(right).localeCompare(timestamp(left)) || id(right).localeCompare(id(left));
+  for (const item of items) {
+    let low = 0;
+    let high = selected.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (compare(item, selected[middle]!) < 0) high = middle;
+      else low = middle + 1;
+    }
+    selected.splice(low, 0, item);
+    if (selected.length > limit) selected.pop();
+  }
+  return selected;
+}
 
 function parseHttpPort(value: number | string, source: string): number {
   const valid = typeof value === "number"
@@ -235,6 +359,8 @@ export class OrchestratorRuntime {
   private httpServer: Server | undefined;
   private httpAccepting = false;
   private httpReady = false;
+  private httpAddress: { hostname: string; port: number } | undefined;
+  private runtimeStartedAt: number | undefined;
 
   constructor(private readonly options: RuntimeOptions) {
     this.store = options.config.store ?? memoryStore();
@@ -260,6 +386,7 @@ export class OrchestratorRuntime {
 
   async start(options: StartOptions = {}): Promise<void> {
     this.claimStart();
+    this.runtimeStartedAt = Date.now();
     let startupError: unknown;
     let startupFailed = false;
     try {
@@ -402,6 +529,156 @@ export class OrchestratorRuntime {
       ? honoContext.json({ status: "ok" })
       : honoContext.json({ status: "starting" }, 503));
     app.all("/health", (honoContext) => honoContext.notFound());
+    app.post(
+      "/webhooks/:channelId",
+      bodyLimit({
+        maxSize: WEBHOOK_BODY_LIMIT_BYTES,
+        onError: (honoContext) => honoContext.json({
+          error: { code: "payload_too_large", message: "The request body exceeds 1 MiB." },
+        }, 413),
+      }),
+      async (honoContext) => {
+        if (honoContext.req.header("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
+          return honoContext.json({
+            error: { code: "unsupported_media_type", message: "Content-Type must be application/json." },
+          }, 415);
+        }
+        const channelId = honoContext.req.param("channelId");
+        if (!this.channels.some((channel) => channel.id === channelId)) {
+          return honoContext.json({
+            error: { code: "unknown_channel", message: "The channel does not exist." },
+          }, 404);
+        }
+        let value: unknown;
+        try {
+          value = await honoContext.req.json();
+        } catch {
+          return honoContext.json({
+            error: { code: "invalid_request", message: "The request body must be valid JSON." },
+          }, 400);
+        }
+        let event: DispatchEvent;
+        try {
+          event = validateWebhookEvent(value);
+        } catch (error) {
+          if (!(error instanceof WebhookValidationError)) throw error;
+          return honoContext.json({
+            error: { code: "invalid_request", message: error.message },
+          }, 400);
+        }
+        try {
+          const result = await dispatch(channelId, event);
+          return result.status === "queued"
+            ? honoContext.json(result, 202)
+            : honoContext.json(result, 200);
+        } catch (error) {
+          this.logger.error("Webhook dispatch failed", { error: formatError(error), channelId });
+          return honoContext.json({
+            error: { code: "internal_error", message: "The request could not be completed." },
+          }, 500);
+        }
+      },
+    );
+    app.get("/api/v1/status", async (honoContext) => {
+      try {
+        const state = await this.store.read();
+        const deliveries = emptyDeliveryCounts();
+        for (const delivery of state.deliveries) deliveries[delivery.status] += 1;
+        return honoContext.json({
+          uptimeMs: Math.max(0, Date.now() - (this.runtimeStartedAt ?? Date.now())),
+          http: this.httpAddress,
+          totals: {
+            events: state.events.length,
+            sessions: state.sessions.length,
+            deliveries,
+          },
+        });
+      } catch (error) {
+        this.logger.error("Operational status read failed", { error: formatError(error) });
+        return honoContext.json({
+          error: { code: "internal_error", message: "The request could not be completed." },
+        }, 500);
+      }
+    });
+    app.get("/api/v1/events", async (honoContext) => {
+      let limit: number;
+      try {
+        limit = parseOperationalLimit(honoContext.req.url);
+      } catch {
+        return honoContext.json({
+          error: { code: "invalid_limit", message: `limit must be an integer from 1 through ${MAX_OPERATIONAL_LIMIT}.` },
+        }, 400);
+      }
+      try {
+        const state = await this.store.read();
+        const selectedEvents = selectNewest(
+          state.events,
+          limit + 1,
+          (event) => event.receivedAt,
+          (event) => event.id,
+        );
+        const selectedIds = new Set(selectedEvents.map((event) => event.id));
+        const countsByEvent = new Map<string, DeliveryCounts>();
+        for (const delivery of state.deliveries) {
+          if (!selectedIds.has(delivery.eventId)) continue;
+          const counts = countsByEvent.get(delivery.eventId) ?? emptyDeliveryCounts();
+          counts[delivery.status] += 1;
+          countsByEvent.set(delivery.eventId, counts);
+        }
+        const summaries = selectedEvents
+          .map((event) => ({
+            id: event.id,
+            sourceId: event.sourceId,
+            channelId: event.channelId,
+            dedupeKey: event.dedupeKey,
+            sessionKey: event.sessionKey,
+            ...(event.type === undefined ? {} : { type: event.type }),
+            ...(event.occurredAt === undefined ? {} : { occurredAt: event.occurredAt }),
+            receivedAt: event.receivedAt,
+            deliveries: countsByEvent.get(event.id) ?? emptyDeliveryCounts(),
+          }));
+        return honoContext.json({ events: summaries.slice(0, limit), hasMore: selectedEvents.length > limit });
+      } catch (error) {
+        this.logger.error("Operational event read failed", { error: formatError(error) });
+        return honoContext.json({
+          error: { code: "internal_error", message: "The request could not be completed." },
+        }, 500);
+      }
+    });
+    app.get("/api/v1/sessions", async (honoContext) => {
+      let limit: number;
+      try {
+        limit = parseOperationalLimit(honoContext.req.url);
+      } catch {
+        return honoContext.json({
+          error: { code: "invalid_limit", message: `limit must be an integer from 1 through ${MAX_OPERATIONAL_LIMIT}.` },
+        }, 400);
+      }
+      try {
+        const state = await this.store.read();
+        const selectedSessions = selectNewest(
+          state.sessions,
+          limit + 1,
+          (session) => session.updatedAt,
+          (session) => session.id,
+        );
+        const summaries = selectedSessions
+          .map((session) => ({
+            id: session.id,
+            key: session.key,
+            status: session.status,
+            createdAt: session.createdAt,
+            updatedAt: session.updatedAt,
+            ...(session.endedAt === undefined ? {} : { endedAt: session.endedAt }),
+          }));
+        return honoContext.json({ sessions: summaries.slice(0, limit), hasMore: selectedSessions.length > limit });
+      } catch (error) {
+        this.logger.error("Operational session read failed", { error: formatError(error) });
+        return honoContext.json({
+          error: { code: "internal_error", message: "The request could not be completed." },
+        }, 500);
+      }
+    });
     app.all("/webhooks", (honoContext) => honoContext.notFound());
     app.all("/webhooks/*", (honoContext) => honoContext.notFound());
     app.all("/api/v1", (honoContext) => honoContext.notFound());
@@ -421,6 +698,7 @@ export class OrchestratorRuntime {
         this.httpAccepting = true;
         const url = formatHttpUrl(hostname, port);
         const address = server.address() as AddressInfo;
+        this.httpAddress = { hostname: address.address, port: address.port };
         if (!isLoopbackAddress(address.address)) {
           this.logger.warn("HTTP server has no built-in authentication and is bound to a non-loopback hostname", {
             hostname,
@@ -485,6 +763,7 @@ export class OrchestratorRuntime {
           return;
         }
         if (this.httpServer === server) this.httpServer = undefined;
+        this.httpAddress = undefined;
         resolveClose();
       });
       closeIdleConnections();

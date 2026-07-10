@@ -1,8 +1,18 @@
 # Channels
 
-Channels are event sources. They can poll APIs, receive manual CLI events, or receive dispatches from project routes registered on the runtime-owned Hono server.
+Channels are event sources. They can poll APIs or receive normalized webhook, manual CLI, or project-route dispatches on the runtime-owned Hono server.
 
-The HTTP config's `routes({ app, dispatch })` hook can durably dispatch from trusted custom routes in the same process that owns workers and the JSON store. Add project middleware for authentication and source signature verification before exposing ingress. Built-in normalized webhook routes are not included yet, and `/webhooks/*` is reserved.
+Ordinary startup provides `POST /webhooks/:channelId`. For example, with the generated `manual` channel:
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/webhooks/manual \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"manual-1","type":"manual.message","sessionKey":"demo","input":"Run a local agent task","occurredAt":"2026-07-10T10:30:00Z"}'
+```
+
+The route accepts at most 1 MiB of strict JSON. `id` is required and non-whitespace; `type`, `dedupeKey`, `sessionKey`, `input`, `payload`, `meta`, and `occurredAt` are optional. Values must be JSON-safe with at most 100 levels; `meta` must be an object and `occurredAt` a valid date string. A new durable event returns `202 queued`; a duplicate returns `200 duplicate` with the original internal event ID. Unknown channels return `404`. Neither success waits for handlers.
+
+The HTTP config's `routes({ app, dispatch })` hook remains available for provider-specific conversion and acknowledgement protocols. Add project middleware for authentication, source signature verification, and rate limiting before exposing ingress. The runtime does not bundle provider formats or signatures.
 
 ## Manual channel
 
@@ -83,11 +93,13 @@ Fields:
 | Field | Purpose |
 | --- | --- |
 | `id` | Source event id. Required. |
+| `type` | Optional event type. |
 | `dedupeKey` | Optional event uniqueness key. Defaults to `id`. |
 | `sessionKey` | Optional durable session mapping key. Defaults to `channelId:id`. |
 | `input` | Agent-facing input. |
 | `payload` | Structured source payload. |
 | `meta` | Lightweight routing/resource metadata. |
+| `occurredAt` | Optional source occurrence date. |
 
 ## Dedupe behavior
 

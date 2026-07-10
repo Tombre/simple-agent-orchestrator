@@ -2,7 +2,7 @@
 
 An environment mounts resources that handlers need, such as local servers, API clients, credentials, or sandboxes.
 
-The runtime-owned Hono listener is not an environment: it is a single project/runtime-level resource configured through `http`, while environments are client-scoped and may have multiple instances.
+The runtime-owned Hono listener is not an environment: it is a single project/runtime-level resource configured through `http` for built-in webhook/operational routes and project extensions, while environments are client-scoped and may have multiple instances.
 
 ## Basic environment
 

@@ -19,10 +19,12 @@ export default defineConfig(({ project }) => ({
       app.use("*", projectAuthenticationMiddleware);
     },
     routes({ app, dispatch }) {
-      app.post("/source", async (context) => context.json(
-        await dispatch("source", await verifiedEvent(context.req.raw)),
-        202,
-      ));
+      app.post("/source", async (context) => {
+        const result = await dispatch("source", await verifiedEvent(context.req.raw));
+        return result.status === "queued"
+          ? context.json(result, 202)
+          : context.json(result, 200);
+      });
     },
   },
 }));
@@ -30,7 +32,9 @@ export default defineConfig(({ project }) => ({
 
 The config lives at `.simple-agent-orchestrator/orchestrator.ts`.
 
-Normal `start()` binds HTTP by default; `SAO_HTTP_PORT` overrides config, and `start({ http: false })` or CLI `--no-http` disables it. Middleware runs before built-ins and routes afterward. `GET /health` is built in; `/health`, `/webhooks/*`, and `/api/v1/*` are reserved. Hooks receive the Hono `app`, `project`, `logger`, runtime `signal`, and durable `dispatch`. The server has no built-in authentication, signature checks, CORS, rate limiting, or TLS.
+Normal `start()` binds HTTP by default; `SAO_HTTP_PORT` overrides config, and `start({ http: false })` or CLI `--no-http` disables it. Middleware runs before built-ins and routes afterward. Built-ins are `GET /health`, `POST /webhooks/:channelId`, `GET /api/v1/status`, `GET /api/v1/events?limit=N`, and `GET /api/v1/sessions?limit=N`; their namespaces are reserved. Hooks receive the Hono `app`, `project`, `logger`, runtime `signal`, and durable `dispatch`. The server has no built-in authentication, signature checks, CORS, rate limiting, or TLS.
+
+The webhook accepts a normalized JSON object up to 1 MiB. It requires non-empty `id` and permits `type`, `dedupeKey`, `sessionKey`, JSON-safe `input`/`payload`, object `meta`, and string `occurredAt`. It returns `202 queued` after durable ingestion or `200 duplicate` with the original event ID. Operational lists default to 25, max at 100, and omit event bodies, session state, notes, deliveries, and errors. Add middleware before exposure; unauthenticated dispatch can trigger side effects and state growth.
 
 The `project` helper exposes stable paths:
 
@@ -99,6 +103,8 @@ type DispatchEvent = {
   occurredAt?: string | Date;
 };
 ```
+
+The HTTP representation is JSON-only: `occurredAt` must be a valid string, values may nest at most 100 levels, identifiers are limited to 512 characters, and `type` to 256.
 
 ## Clients
 
@@ -214,7 +220,7 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 });
 ```
 
-Runtime instances are one-shot. Call `start()` once, or use sequential direct `drain()` calls followed by `stop()`; do not overlap drains or try to restart a stopped runtime. Startup and each drain automatically requeue deliveries left `processing` by an interrupted attempt, preserving the consumed attempt and warning that external effects may repeat. HTTP starts only during ordinary `start()`, after environment mounts and before pollers/workers. `start({ drain: true })`, direct drains, offline work, inspection, and test-harness initialization do not open it. Failed startup and one-shot start clean up automatically. Shutdown closes HTTP and settles accepted dispatches before releasing ownership. Environments unmount in reverse mount order, hooks unmount in reverse registration order, and cleanup continues after failures. Make cleanup hooks retry-safe because a later `stop()` retries unresolved cleanup.
+Runtime instances are one-shot. Call `start()` once, or use sequential direct `drain()` calls followed by `stop()`; do not overlap drains or try to restart a stopped runtime. Startup and each drain automatically requeue deliveries left `processing` by an interrupted attempt, preserving the consumed attempt and warning that external effects may repeat. HTTP starts only during ordinary `start()`, after environment mounts and before pollers/workers. `start({ drain: true })`, direct drains, offline work, inspection, and test-harness initialization do not open it. Failed startup and one-shot start clean up automatically. Shutdown closes HTTP and settles accepted requests and dispatches before releasing ownership. Environments unmount in reverse mount order, hooks unmount in reverse registration order, and cleanup continues after failures. Make cleanup hooks retry-safe because a later `stop()` retries unresolved cleanup.
 
 ## Key helpers
 

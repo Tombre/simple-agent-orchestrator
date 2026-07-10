@@ -45,6 +45,16 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
+Ordinary startup now exposes normalized `POST /webhooks/manual` plus bounded `/api/v1/status`, `/api/v1/events`, and `/api/v1/sessions`. Add authentication and provider signature checks with `http.middleware` before exposing the listener. Provider-specific payload conversion remains project-owned.
+
+```bash
+curl -X POST http://127.0.0.1:3000/webhooks/manual \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"manual-1","sessionKey":"demo","input":"Hello"}'
+```
+
+The first request returns `202 queued` after durable ingestion; a duplicate returns `200 duplicate` with the original internal event ID.
+
 ## Manual channel
 
 ```ts

@@ -63,6 +63,19 @@ npx simple-agent-orchestrator start
 
 The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root and validates persisted state before polling, mounting environments, opening HTTP, recovering deliveries, or invoking handlers. The listener defaults to `http://127.0.0.1:3000`; check `GET /health`, or pass `--no-http` when it is not needed. The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` fail before writing while `start` is active; inspection commands such as `state validate`, a retention preview, `sessions show`, and `events list` remain available.
 
+In another terminal, exercise the running listener:
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/webhooks/manual \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"http-first","sessionKey":"http-demo","input":"Hello agent runtime"}'
+curl http://127.0.0.1:3000/api/v1/status
+curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
+curl 'http://127.0.0.1:3000/api/v1/sessions?limit=25'
+```
+
+The webhook response confirms durable ingestion, not successful handling. Stop with Ctrl+C before using offline mutation commands. `--no-http` and `--drain` do not expose these routes. The default loopback bind is not authentication; add project middleware before exposing the listener.
+
 ## 6. Replace the echo client
 
 Edit:

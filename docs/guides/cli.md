@@ -46,7 +46,7 @@ Events are retained by default because they suppress duplicate dispatch. Add `--
 npx simple-agent-orchestrator start
 ```
 
-Starts the project-level HTTP listener, pollers, and client workers. HTTP defaults to `127.0.0.1:3000`; `SAO_HTTP_PORT` overrides `http.port`, and occupied ports trigger up to nine sequential fallback attempts. Startup logs the actual URL.
+Starts the project-level HTTP listener, pollers, and client workers. HTTP defaults to `127.0.0.1:3000`; `SAO_HTTP_PORT` overrides `http.port`, and occupied ports trigger up to nine sequential fallback attempts. Startup logs the actual URL. The listener provides `GET /health`, normalized `POST /webhooks/:channelId`, and bounded read-only `GET /api/v1/status`, `/api/v1/events`, and `/api/v1/sessions`. Status reports the actual fallback address.
 
 When using `jsonFileStore`, a local ownership lock rejects a second runtime or offline mutation for the same state and reports the active PID and start time. Ownership is released on normal shutdown, and a lock left by a process that exited is reclaimed on the next operation.
 
@@ -63,7 +63,7 @@ Options:
 
 `--drain` runs polls once, processes currently eligible pending deliveries, and exits. It does not wait for future delayed retries or start HTTP. `--no-http` disables HTTP for an otherwise normal `start`.
 
-The HTTP server has no built-in authentication, signature verification, CORS, rate limiting, or TLS. A non-loopback bind warns because custom routes may be remotely reachable; loopback binding is still not an authentication boundary.
+The webhook accepts at most 1 MiB of strict JSON and returns after durable ingestion, before processing. Operational lists default to 25, allow at most 100, and omit event bodies, state, notes, and errors. The HTTP server has no built-in authentication, signature verification, CORS, rate limiting, or TLS. A non-loopback bind warns because dispatch and custom routes may be remotely reachable; loopback binding is still not an authentication boundary. Unauthenticated dispatch can trigger external side effects and unbounded state growth.
 
 ## dev
 

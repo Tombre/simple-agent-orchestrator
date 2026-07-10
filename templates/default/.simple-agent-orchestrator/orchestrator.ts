@@ -10,6 +10,8 @@ export default defineConfig(({ project }) => ({
   http: {
     hostname: "127.0.0.1",
     port: 3000,
+    // Add authentication and signature checks in middleware before exposing
+    // the built-in webhook and operational routes beyond a trusted boundary.
   },
 
   channels: [manualChannel],

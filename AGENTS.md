@@ -6,7 +6,7 @@ Simple Agent Orchestrator is a dependency-light Node.js 20+ TypeScript library a
 
 The framework owns event ingestion, deduplication, deliveries, retries, durable sessions, state, notes, polling cursors, client environments, session sandboxes, config discovery, and operational inspection.
 
-User integrations own source APIs, webhooks, prompts, agent/tool invocation, source acknowledgement, authorization, security policy, and project-specific resource behavior.
+User integrations own source APIs, provider-specific webhook formats and signatures, prompts, agent/tool invocation, source acknowledgement, authorization, security policy, and project-specific resource behavior.
 
 ## Design Ethos
 
@@ -24,7 +24,7 @@ Read [the design principles](docs/design-principles.md) before changing project 
 ## Domain Model
 
 - **Project**: an existing repository containing project-local orchestration code, normally under `.simple-agent-orchestrator/`.
-- **Channel**: a globally identified source of events. A channel may register polls or receive dispatches from user-owned webhook/server code. A manual channel is simply a channel without polls.
+- **Channel**: a globally identified source of events. A channel may register polls or receive normalized webhook, CLI, or project-route dispatches. A manual channel is simply a channel without polls.
 - **Poll and cursor**: a poll fetches source items and optionally maps them to dispatch events. Its durable cursor records source progress.
 - **Event**: the durable input unit. Source IDs, dedupe keys, and session keys are separate identities and must be chosen deliberately.
 - **Delivery**: one event's processing record for one matching client handler. Fan-out creates multiple independent deliveries.
@@ -35,7 +35,7 @@ Read [the design principles](docs/design-principles.md) before changing project 
 - **Sandbox**: an optional session-scoped resource created and cleaned up by an environment. The package tracks lifecycle state; integrations own the actual resource.
 - **Store**: a full runtime-state snapshot adapter. The package ships isolated memory storage and a local JSON-file store.
 - **Runtime**: the one-shot, in-process coordinator for dispatch, polling, workers, lifecycle, locking, and persistence.
-- **HTTP server**: the optional project/runtime-scoped Hono listener started by ordinary `start()` for health and trusted project routes; it is not a client environment.
+- **HTTP server**: the optional project/runtime-scoped Hono listener started by ordinary `start()` for health, normalized webhook ingestion, bounded read-only operational summaries, and project routes; it is not a client environment.
 
 Canonical API details live in [the API reference](docs/api-reference.md), not in this summary.
 
@@ -90,6 +90,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Dispatch persists the event and matching deliveries before returning `queued`.
 - Ordinary startup binds HTTP after recovery and environment mounting but before pollers and workers. Drain, offline, inspection, config loading, and test-harness initialization never bind it.
 - HTTP middleware registers before built-ins, custom routes register afterward, and `/health`, `/webhooks/*`, and `/api/v1/*` are reserved.
+- Normalized webhooks accept at most 1 MiB of strict JSON and return only after dispatch persistence; operational lists default to 25 records, permit at most 100, and omit event bodies, session state, notes, and errors.
 - HTTP shutdown stops acceptance and closes idle connections before waiting for workers or releasing store ownership, and accepted dispatch work settles before ownership release.
 - Duplicate dispatch returns the original internal event ID and creates no new deliveries.
 - Events fan out across clients and across handlers on one client.
@@ -162,7 +163,7 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Runtime shutdown unmounts environments but does not clean every active session sandbox.
 - Poll dispatch, source acknowledgement, cursor commit, and external effects are not transactionally coupled.
 - `dev` has no watch or reload behavior.
-- No built-in or provider-specific webhook route, provider integration, prompt renderer, approval system, or agent queue is bundled.
+- No provider-specific webhook route, provider integration, prompt renderer, approval system, or agent queue is bundled.
 - TypeScript config files are transpiled by `tsx` at runtime, not type-checked while loading.
 - `doctor` validates config loading, identifiers, and persisted state; it does not execute environment hooks, polls, handlers, or sandboxes. `state validate` performs the state compatibility check directly.
 - `paused` and `failed` are session status types, but pause/resume and session-failure workflows are not implemented.
@@ -228,9 +229,9 @@ An end-to-end package smoke test should perform this sequence in a temporary con
 
 1. From the repository root, run `npm run pack:local`; then install the resulting archive into an empty npm project.
 2. From the temporary consumer, run `npx simple-agent-orchestrator init` and `npx simple-agent-orchestrator doctor`.
-3. Import `loadProjectOrchestrator` from `simple-agent-orchestrator/runtime` in a short Node script, call `runtime.dispatch("manual", { id: "smoke-1", sessionKey: "smoke", input: "Smoke test" })`, and exit without draining. This leaves a pending delivery using only public package APIs.
-4. Run `npx simple-agent-orchestrator start --drain` to execute the installed CLI, orchestrator, and handler.
-5. Run `npx simple-agent-orchestrator sessions show smoke` and `npx simple-agent-orchestrator events list`; confirm the delivery is `processed`.
+3. Start the installed CLI on an available loopback port and wait for readiness.
+4. POST a normalized event to `/webhooks/manual`, inspect `/api/v1/status`, and poll the bounded event/session summaries until processing completes.
+5. Stop the CLI cleanly, then run `sessions show smoke` and `events list`; confirm the delivery is `processed`.
 6. Remove the temporary consumer and local package archive.
 
 Tarball installation may need registry access for the package's dependencies unless npm's cache is already populated. Keep the runtime sequence sequential when using the generated JSON store; do not run a second mutating process beside `start`.

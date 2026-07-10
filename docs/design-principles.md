@@ -9,7 +9,7 @@ The orchestrator should be installed into an existing TypeScript project and use
 The framework owns boring but important stateful plumbing:
 
 - event ingestion
-- a project-level HTTP listener and extension hooks
+- normalized webhook ingestion, bounded operational summaries, and project-level HTTP extension hooks
 - dedupe
 - delivery attempts
 - session resolution
@@ -23,7 +23,7 @@ The framework owns boring but important stateful plumbing:
 User code owns:
 
 - how source APIs are called
-- HTTP authentication, source signature verification, CORS, rate limiting, TLS, and exposure policy
+- provider payload conversion, HTTP authentication, source signature verification, CORS, rate limiting, TLS, and exposure policy
 - how prompts are rendered
 - how agents are invoked
 - how external effects are made idempotent or reconciled
@@ -47,6 +47,8 @@ Future events with the same key reuse the same active session.
 ## Event dedupe is not processing success
 
 The runtime dedupes events when they are dispatched. A duplicate event is not enqueued twice.
+
+For normalized HTTP ingress, `202 queued` means the event and matching deliveries are durable, not that processing succeeded. `200 duplicate` returns the original internal event ID and likewise says nothing about delivery success.
 
 A delivery is only marked processed after the handler, success hook, required sandbox cleanup, and final persistence succeed.
 
@@ -81,7 +83,7 @@ A fixed cooperative delivery-attempt deadline is also local reliability plumbing
 
 Worker claims, session merging, polling, and resource locks coordinate within one process. Stores that depend on those guarantees should identify a project-local runtime lock so a second active runtime fails early instead of appearing to provide unsupported distributed coordination. Stale local ownership may be reclaimed after its process exits; this is not a lease, consensus mechanism, or replacement for a multi-process-safe store.
 
-Webhook ingress that mutates the default JSON store belongs on the same runtime-owned HTTP server, not in a second process or a client-scoped environment. This keeps dispatch, workers, the mutex, and store ownership together without turning the runtime into a hosted web platform. Project code still owns every security and provider-specific concern.
+Normalized webhook ingress that mutates the default JSON store belongs on the same runtime-owned HTTP server, not in a second process or a client-scoped environment. This keeps dispatch, workers, the mutex, and store ownership together without turning the runtime into a hosted web platform. The same listener exposes only bounded read-only operational summaries; it does not expose event bodies, session state, notes, cursors, errors, resources, paths, or administrative mutations. The framework owns the webhook's 1 MiB validation limit and operational list bounds. Project code still owns every security, provider-specific, edge, and exposure concern.
 
 ## Keep paths project-aware
 

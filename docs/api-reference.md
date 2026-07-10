@@ -63,7 +63,13 @@ type HttpRegistrationContext = {
 
 Ordinary `start()` binds a Hono listener by default. The default is `127.0.0.1:3000`; the port resolves from `SAO_HTTP_PORT`, then `http.port`, then `3000`. Ports must be base-10 integers from `1` through `65535`. On `EADDRINUSE`, startup tries at most nine subsequent ports without probing and never wraps; all other listen errors fail immediately. The final URL and requested/actual ports are logged.
 
-The awaited `middleware` hook runs before built-ins and the awaited `routes` hook runs afterward. Both are trusted project config. `GET /health` returns `{ "status": "ok" }` after ordinary runtime startup completes. `/health`, `/webhooks/*`, and `/api/v1/*` are reserved; the latter namespaces currently return `404`. The server does not provide authentication, authorization, signature verification, CORS, rate limiting, TLS, or exposure policy. A non-loopback bind logs a warning, but loopback is not an authentication boundary.
+The awaited `middleware` hook runs before built-ins and the awaited `routes` hook runs afterward. Both are trusted project config. `GET /health` returns `{ "status": "ok" }` after ordinary runtime startup completes. `/health`, `/webhooks/*`, and `/api/v1/*` are reserved. The server does not provide authentication, authorization, signature verification, CORS, rate limiting, TLS, or exposure policy. A non-loopback bind logs a warning, but loopback is not an authentication boundary. Unauthenticated dispatch can trigger project side effects and unbounded durable state growth. Request bodies are not logged by default.
+
+`POST /webhooks/:channelId` accepts a normalized event with `Content-Type: application/json` and a maximum encoded body size of 1 MiB. The body is an object with required non-whitespace `id`; optional `type`, `dedupeKey`, and `sessionKey` strings; optional JSON-safe `input` and `payload`; optional JSON object `meta`; and optional valid date string `occurredAt`. Unknown fields, primitives, arrays, malformed JSON, non-finite numbers, more than 100 levels of nesting, identifiers over 512 characters, and types over 256 characters are rejected. A new durable dispatch returns `202 { "status": "queued", "eventId": "..." }`; a duplicate returns `200 { "status": "duplicate", "eventId": "..." }` with the original internal ID. This confirms durable ingestion only and does not wait for handlers or promise exactly-once processing.
+
+Webhook errors use `{ "error": { "code": "...", "message": "..." } }`: `400 invalid_request`, `404 unknown_channel`, `413 payload_too_large`, `415 unsupported_media_type`, or `500 internal_error`. Internal failures do not expose runtime messages or stack traces.
+
+`GET /api/v1/status` returns `uptimeMs`, the actual bound `http.hostname` and `http.port`, event and session totals, and delivery totals for `pending`, `processing`, `processed`, and `failed`. `GET /api/v1/events?limit=N` returns `{ events, hasMore }`; each summary contains the internal and source IDs, channel, dedupe key, session key, optional type and occurrence time, receive time, and aggregate delivery counts. It omits input, payload, metadata, errors, and individual deliveries. `GET /api/v1/sessions?limit=N` returns `{ sessions, hasMore }` with IDs, keys, statuses, and lifecycle timestamps, omitting state, notes, and end reasons. Lists sort descending by `receivedAt` or `updatedAt`, then descending ID. The default limit is 25, the maximum is 100, and a missing limit is the only default; repeated, empty, non-integer, non-positive, or oversized values return `400 invalid_limit`.
 
 ## `createChannel(id, setup?)`
 
@@ -130,6 +136,8 @@ type DispatchEvent<TPayload = unknown, TInput = unknown, TMeta = Record<string, 
 - `input` is intended for agent-facing content.
 - `payload` is structured source data.
 - `meta` is lightweight metadata used for routing or resource setup.
+
+The normalized webhook transport is stricter than this in-process type: it accepts only JSON values, requires `occurredAt` to be a string, and applies the validation and size limits documented under HTTP config.
 
 ## `createClient(id, setup)`
 
@@ -284,6 +292,8 @@ Completed sandbox creation, its state mutations, and its marker are persisted ea
 
 Processing is retryable, not exactly once. Event dedupe prevents duplicate dispatch records; it does not prevent handlers, hooks, resource operations, or source acknowledgement from repeating after a failed attempt. Use stable operation-specific external idempotency keys that do not include `attempt`. See [Failure semantics and idempotency](guides/failure-semantics.md).
 
+A webhook `202` is returned after event and matching-delivery persistence, before delivery processing. A `200 duplicate` identifies the original event; neither response reports processing success.
+
 `StoredDelivery.retryDelayMs` records the resolved fixed delay. A pending delivery with `nextAttemptAt` is delayed until that durable timestamp; `listEvents()` and `events list` expose it for inspection.
 
 ## Stores
@@ -339,7 +349,7 @@ A drain stops when no delivery is currently eligible. It never sleeps for a futu
 
 Runtime initialization reads state before attaching channels or starting work. Invalid state therefore rejects startup before polls, environment hooks, recovery, HTTP setup, or handlers run. Ordinary startup acquires ownership, validates state, recovers interrupted deliveries, mounts environments, sets up and binds HTTP, then starts pollers and workers. Route setup or listener failure therefore rolls back without starting orchestration side effects. Failed startup closes HTTP, aborts in-flight work, clears intervals, unmounts environments, and releases store ownership before rejecting. Environments are unmounted in reverse mount order, their hooks run in reverse registration order, and cleanup continues after a hook fails. A later `stop()` retries only unresolved cleanup. When startup and shutdown both fail, the runtime throws an `AggregateError` containing both failures.
 
-Shutdown first stops HTTP acceptance and closes idle connections, then waits for accepted request/dispatch work and workers before unmounting environments and releasing ownership. HTTP-close, environment, and ownership failures are aggregated, and repeated or concurrent `stop()` calls retain the existing deterministic retry behavior.
+Shutdown first stops HTTP acceptance and closes idle connections, then waits for accepted webhook, custom request, and dispatch work and workers before unmounting environments and releasing ownership. HTTP-close, environment, and ownership failures are aggregated, and repeated or concurrent `stop()` calls retain the existing deterministic retry behavior.
 
 Inspection methods can use the loaded runtime while it is active:
 
@@ -351,6 +361,8 @@ await runtime.listEvents();
 await runtime.printConfig();
 await runtime.previewStatePrune({ before: "2026-01-01T00:00:00Z" });
 ```
+
+These in-process methods and CLI inspection can expose complete stored records. The operational HTTP API is separately bounded and sanitized.
 
 `previewStatePrune(options)` returns a `StatePrunePlan` without writing. `before` is a `Date` or an ISO 8601 timestamp with a timezone. Only processed deliveries whose `processedAt` is strictly before the cutoff are selected. Ended sessions whose `endedAt` is before the cutoff are selected only when no retained delivery references them and no durable `__sao.sandbox.*.created` marker is true; their notes are selected with them. Pending, processing, and failed deliveries, active/paused/failed sessions, cursors, missing or invalid historical timestamps, and sessions with active sandbox markers are preserved.
 

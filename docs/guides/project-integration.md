@@ -97,14 +97,19 @@ export default defineConfig({
     routes({ app, dispatch }) {
       app.post("/source", async (context) => {
         const event = await parseAndVerifySourceRequest(context.req.raw);
-        return context.json(await dispatch("source", event), 202);
+        const result = await dispatch("source", event);
+        return result.status === "queued"
+          ? context.json(result, 202)
+          : context.json(result, 200);
       });
     },
   },
 });
 ```
 
-Middleware is registered before built-ins; custom routes are registered afterward. Hooks also receive `project`, `logger`, and the runtime `signal`. `/health`, `/webhooks/*`, and `/api/v1/*` are reserved. The runtime deliberately does not own authentication, signatures, CORS, rate limiting, TLS, or public exposure policy. HTTP belongs at project/runtime scope rather than in a client environment, which may be mounted once per client.
+Middleware is registered before built-ins; custom routes are registered afterward. Hooks also receive `project`, `logger`, and the runtime `signal`. Built-ins are `GET /health`, normalized `POST /webhooks/:channelId`, and bounded read-only `GET /api/v1/status`, `/api/v1/events`, and `/api/v1/sessions`; their namespaces are reserved. Middleware that inspects a body needed by a later handler should read `context.req.raw.clone()`. Provider-specific parsing, authentication, signatures, source acknowledgement, CORS, rate limiting, TLS, and public exposure policy remain project responsibilities.
+
+The normalized webhook requires `application/json`, limits encoded bodies to 1 MiB, rejects unknown or non-JSON-safe fields, and durably dispatches before returning `202 queued` or `200 duplicate`. It does not wait for delivery processing. Operational lists default to 25 and allow at most 100; they omit event bodies and metadata, session state and notes, delivery errors, and individual deliveries. Request bodies are not logged by default. Add security middleware before exposure because unauthenticated ingress can trigger external effects and unbounded state growth. HTTP belongs at project/runtime scope rather than in a client environment, which may be mounted once per client.
 
 ## TypeScript loading
 
@@ -134,7 +139,7 @@ The store interface is intentionally small so you can add a database-backed adap
 
 JSON state version 3 is current. The store validates the full snapshot before any runtime work and before replacing the file. Valid version 1 and 2 snapshots are migrated deterministically in memory with immediate retry defaults and persisted as version 3 by the next successful write. Inspection, including `state validate`, does not rewrite them. Older, future, malformed, structurally invalid, or internally inconsistent snapshots fail with the state path and recovery guidance instead of being coerced or replaced. Back up the file before manual recovery, and use an intermediate package version when a state version falls below the documented minimum.
 
-State, event payloads, metadata, notes, and cursors must contain only JSON-safe values with at most 100 nested levels. The validator rejects values that JSON would silently drop or reinterpret, including `undefined`, non-finite numbers, and non-plain objects in durable value positions. Custom stores should return a valid current `OrchestratorState`; `validateAndMigrateState` is exported for adapters that need the package validator.
+State, event payloads, metadata, notes, and cursors must contain only JSON-safe values with at most 100 nested levels. The normalized webhook enforces that constraint before dispatch. The state validator rejects values that JSON would silently drop or reinterpret, including `undefined`, non-finite numbers, and non-plain objects in durable value positions. Custom stores should return a valid current `OrchestratorState`; `validateAndMigrateState` is exported for adapters that need the package validator.
 
 `jsonFileStore` also creates sibling `.runtime-lock` ownership records while `start()`, `drain()`, or `runOffline()` is active. A second runtime or offline operation for the same state fails early with the owning PID and start time; a lock left by a process that has exited is reclaimed automatically. The active lock is released by `stop()`, including automatic shutdown after `start({ drain: true })` and `runOffline()`; abrupt acquisition-stage exits may leave harmless `.candidate` sidecars, and generation-qualified recovery records remain after crash recovery to make concurrent takeover safe.
 

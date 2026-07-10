@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -177,65 +178,93 @@ void createTestRuntime({ config });
   const tsc = join(repositoryRoot, "node_modules", "typescript", "bin", "tsc");
   await run(process.execPath, [tsc, "-p", join(consumerRoot, "tsconfig.json")], { cwd: consumerRoot });
 
-  await writeFile(
-    join(consumerRoot, "dispatch.mjs"),
-    `import assert from "node:assert/strict";
-import * as api from "simple-agent-orchestrator";
-import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
-import * as testing from "simple-agent-orchestrator/testing";
+  const probe = createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  const address = probe.address();
+  assert(address && typeof address === "object");
+  const port = address.port;
+  await new Promise((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
 
-assert.equal(typeof api.createClient, "function");
-assert.equal(api.CURRENT_STATE_VERSION, 3);
-assert.equal(typeof api.HandlerTimeoutError, "function");
-assert.equal(typeof api.validateAndMigrateState, "function");
-assert.equal(typeof testing.createTestRuntime, "function");
-const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });
-const result = await runtime.dispatch("manual", {
-  id: "smoke-1",
-  sessionKey: "smoke",
-  input: "Smoke test",
-});
-assert.equal(result.status, "queued");
-const [{ deliveries }] = await runtime.listEvents();
-assert.equal(deliveries[0]?.status, "pending");
-`,
-    "utf8",
-  );
-  await run(process.execPath, [join(consumerRoot, "dispatch.mjs")], { cwd: consumerRoot });
+  console.log("Running the installed CLI webhook and operational API smoke test...");
+  const cliPath = join(consumerRoot, "node_modules", "simple-agent-orchestrator", "dist", "cli.js");
+  const child = spawn(process.execPath, [cliPath, "start"], {
+    cwd: consumerRoot,
+    env: { ...process.env, NO_COLOR: "1", SAO_HTTP_PORT: String(port) },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  let childOutput = "";
+  child.stdout.on("data", (chunk) => {
+    childOutput += chunk.toString();
+  });
+  child.stderr.on("data", (chunk) => {
+    childOutput += chunk.toString();
+  });
+  let childExit;
+  const exited = new Promise((resolveExit) => {
+    child.once("exit", (code, signal) => {
+      childExit = { code, signal };
+      resolveExit(childExit);
+    });
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  try {
+    const deadline = Date.now() + 10_000;
+    while (true) {
+      if (childExit) throw new Error(`Installed CLI exited before readiness:\n${childOutput}`);
+      try {
+        const health = await fetch(`${baseUrl}/health`);
+        if (health.status === 200) break;
+      } catch {
+        // The listener may not be bound yet.
+      }
+      if (Date.now() >= deadline) throw new Error(`Installed CLI did not become ready:\n${childOutput}`);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    }
 
-  await writeFile(
-    join(consumerRoot, "http-smoke.mjs"),
-    `import assert from "node:assert/strict";
-import { createServer } from "node:http";
-import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
+    const webhook = await fetch(`${baseUrl}/webhooks/manual`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "smoke-1", sessionKey: "smoke", input: "Smoke test" }),
+    });
+    assert.equal(webhook.status, 202);
+    const accepted = await webhook.json();
+    assert.equal(accepted.status, "queued");
+    assert.equal(typeof accepted.eventId, "string");
 
-const probe = createServer();
-await new Promise((resolve, reject) => {
-  probe.once("error", reject);
-  probe.listen(0, "127.0.0.1", resolve);
-});
-const address = probe.address();
-assert(address && typeof address === "object");
-const port = address.port;
-await new Promise((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
-process.env.SAO_HTTP_PORT = String(port);
+    const status = await fetch(`${baseUrl}/api/v1/status`).then((response) => response.json());
+    assert.equal(status.http.port, port);
+    assert.equal(status.totals.events, 1);
 
-const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });
-await runtime.start({ prettyStartupLog: false });
-try {
-  const response = await fetch(\`http://127.0.0.1:\${port}/health\`);
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { status: "ok" });
-} finally {
-  await runtime.stop();
-}
-`,
-    "utf8",
-  );
-  await run(process.execPath, [join(consumerRoot, "http-smoke.mjs")], { cwd: consumerRoot });
+    const processingDeadline = Date.now() + 10_000;
+    while (true) {
+      const body = await fetch(`${baseUrl}/api/v1/events`).then((response) => response.json());
+      assert.equal(body.events[0].input, undefined);
+      assert.equal(body.events[0].payload, undefined);
+      if (body.events[0].deliveries.processed === 1) break;
+      if (Date.now() >= processingDeadline) throw new Error("Installed CLI did not process the webhook delivery");
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    }
+    const sessions = await fetch(`${baseUrl}/api/v1/sessions`).then((response) => response.json());
+    assert.equal(sessions.sessions[0].key, "smoke");
+    assert.equal(sessions.sessions[0].state, undefined);
+  } finally {
+    if (!childExit) child.send("shutdown");
+    const cleanExit = await Promise.race([
+      exited,
+      new Promise((resolveExit) => setTimeout(() => resolveExit(undefined), 10_000)),
+    ]);
+    if (!cleanExit) {
+      child.kill();
+      await exited;
+      throw new Error(`Installed CLI did not stop cleanly:\n${childOutput}`);
+    }
+  }
+  assert.deepEqual(childExit, { code: 0, signal: null }, childOutput);
 
-  console.log("Running the installed CLI against persisted package state...");
-  await runCli(["start", "--drain"]);
+  console.log("Inspecting persisted package state with the installed CLI...");
   const session = JSON.parse((await runCli(["sessions", "show", "smoke"])).stdout);
   assert.equal(session.key, "smoke");
   assert.equal(session.state["example.messageCount"], 1);
