@@ -15,25 +15,23 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.js",
       "default": "./dist/index.js"
     },
     "./runtime": {
       "types": "./dist/runtime/index.d.ts",
       "import": "./dist/runtime/index.js",
-      "require": "./dist/runtime/index.js",
       "default": "./dist/runtime/index.js"
     },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js",
-      "require": "./dist/testing/index.js",
       "default": "./dist/testing/index.js"
     }
   },
   "files": [
     "dist",
     "templates",
+    "skills",
     "README.md",
     "docs"
   ],
@@ -41,6 +39,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "prepack": "npm run build",
     "dev": "tsx src/cli.ts",
     "pack:local": "npm pack"
   },

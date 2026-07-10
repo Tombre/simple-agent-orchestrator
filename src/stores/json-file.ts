@@ -11,7 +11,8 @@ export function jsonFileStore(filePath: string): Store {
       await mkdir(dirname(filePath), { recursive: true });
       try {
         await readFile(filePath, "utf8");
-      } catch {
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         await writeFile(filePath, JSON.stringify(emptyState(), null, 2), "utf8");
       }
     },

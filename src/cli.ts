@@ -169,7 +169,11 @@ async function dispatchCommand(args: ParsedArgs): Promise<void> {
     payload: payloadJson ? JSON.parse(payloadJson) : undefined,
     meta: metaJson ? JSON.parse(metaJson) : undefined,
   });
-  await runtime.drain();
+  try {
+    await runtime.drain();
+  } finally {
+    await runtime.stop();
+  }
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -185,7 +189,8 @@ async function sessionsCommand(args: ParsedArgs): Promise<void> {
     const id = args.positional[2];
     if (!id) throw new Error("Usage: simple-agent-orchestrator sessions show <id-or-key>");
     const session = await runtime.getSession(id);
-    console.log(JSON.stringify(session ?? null, null, 2));
+    const notes = session ? await runtime.listSessionNotes(session.id) : [];
+    console.log(JSON.stringify(session ? { ...session, notes } : null, null, 2));
     return;
   }
   if (action === "end") {
@@ -225,7 +230,13 @@ async function eventsCommand(args: ParsedArgs): Promise<void> {
     const id = args.positional[2];
     if (!id) throw new Error("Usage: simple-agent-orchestrator events retry <delivery-id>");
     const retried = await runtime.retryDelivery(id);
-    if (retried) await runtime.drain();
+    if (retried) {
+      try {
+        await runtime.drain();
+      } finally {
+        await runtime.stop();
+      }
+    }
     console.log(retried ? "retried" : "not found");
     return;
   }

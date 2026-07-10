@@ -46,7 +46,7 @@ export interface RegisteredHandler {
   id: string;
   channelId: string;
   channel: ChannelDefinition;
-  retries: Required<RetryOptions>;
+  retries: RetryOptions;
   handle: EventHandler;
   onSuccess?: ((ctx: HandlerContext) => Promise<void> | void) | undefined;
   onFailure?: ((ctx: HandlerContext & { error: unknown }) => Promise<void> | void) | undefined;
@@ -71,14 +71,14 @@ export interface ClientDefinition {
   readonly handlers: RegisteredHandler[];
   readonly environment?: EnvironmentDefinition | undefined;
   readonly concurrencyOptions: Required<ConcurrencyOptions>;
-  readonly retryOptions: Required<RetryOptions>;
+  readonly retryOptions: RetryOptions;
 }
 
 export function createClient(id: string, setup: (client: ClientBuilder) => void): ClientDefinition {
   const handlers: RegisteredHandler[] = [];
   let environment: EnvironmentDefinition | undefined;
   let concurrencyOptions: Required<ConcurrencyOptions> = { workers: 1, perSession: false };
-  let retryOptions: Required<RetryOptions> = { attempts: 3 };
+  let retryOptions: RetryOptions = {};
 
   const builder: ClientBuilder = {
     useEnvironment(next) {
@@ -91,7 +91,7 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
       };
     },
     retries(options) {
-      retryOptions = { attempts: Math.max(1, options.attempts ?? retryOptions.attempts) };
+      if (options.attempts !== undefined) retryOptions = { attempts: Math.max(1, options.attempts) };
     },
     handle(channel, handlerOrOptions) {
       const options = (typeof handlerOrOptions === "function"
@@ -102,7 +102,9 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
         id: handlerId,
         channelId: channel.id,
         channel,
-        retries: { attempts: Math.max(1, options.retries?.attempts ?? retryOptions.attempts) },
+        retries: options.retries?.attempts !== undefined
+          ? { attempts: Math.max(1, options.retries.attempts) }
+          : { ...retryOptions },
         handle: options.handle as EventHandler,
         onSuccess: options.onSuccess as RegisteredHandler["onSuccess"],
         onFailure: options.onFailure as RegisteredHandler["onFailure"],

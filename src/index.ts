@@ -43,6 +43,7 @@ export type {
   OrchestratorEvent,
   ProjectContext,
   RetryOptions,
+  SessionNote,
   StateKey,
   StoredDelivery,
   StoredEvent,

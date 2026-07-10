@@ -63,6 +63,8 @@ client.handle(githubReviewsChannel, {
 });
 ```
 
+Retry defaults are resolved in this order: handler options, `client.retries(...)`, global config `retries`, then three attempts. Automatic retries run immediately without backoff. Manual retry accepts only a failed delivery and grants one additional attempt.
+
 ## Concurrency
 
 Default client concurrency is one worker.
@@ -75,3 +77,5 @@ client.concurrency({ workers: 4, perSession: true });
 - `perSession: true` prevents two deliveries for the same session key from running at the same time in the same runtime process.
 
 For agents with their own queueing, you can leave `perSession` disabled.
+
+Concurrent successful deliveries merge writes to different session-state keys. Concurrent writes to the same key use completion order, so enable `perSession` when same-session ordering matters.

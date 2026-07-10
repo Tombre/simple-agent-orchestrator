@@ -38,7 +38,7 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
     every: "60s",
 
     async fetch({ cursor }) {
-      const since = await cursor.get<string>("lastUpdatedAt");
+      const since = cursor.get<string>("lastUpdatedAt");
       return fetchRecentReviewCandidates({ since });
     },
 
@@ -60,7 +60,7 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
 
     async commit({ cursor, items }) {
       const latest = items.map((item) => item.updatedAt).sort().at(-1);
-      if (latest) await cursor.set("lastUpdatedAt", latest);
+      if (latest) cursor.set("lastUpdatedAt", latest);
     },
   });
 });
@@ -109,21 +109,21 @@ Handler context:
 
 ```ts
 type HandlerContext = {
-  event: StoredEvent;
+  event: OrchestratorEvent;
   session: Session;
-  environment?: EnvironmentRuntime;
+  environment: EnvironmentInstance;
   client: ClientDefinition;
   project: ProjectContext;
   logger: Logger;
   attempt: number;
-  signal?: AbortSignal;
+  signal: AbortSignal;
 };
 ```
 
 ## Sessions
 
 ```ts
-import { sessionKey, createSessionResource } from "simple-agent-orchestrator";
+import { sessionKey } from "simple-agent-orchestrator";
 
 const agentSessionId = sessionKey<string>("opencode.sessionId");
 
@@ -134,28 +134,10 @@ const id = await session.ensure(agentSessionId, async () => {
 
 session.set("github.prNumber", event.meta.prNumber);
 session.note("Sent review to agent", { reviewId: event.payload.id });
-await session.end({ reason: "github.pr.merged" });
+session.end({ reason: "github.pr.merged" });
 ```
 
-Use `session.ensure` when a value must be created once per session. Use `session.resource` when the value also needs cleanup.
-
-```ts
-const opencodeSession = createSessionResource(agentSessionId, {
-  async create({ environment, event }) {
-    const serverUrl = environment!.get(opencodeServerUrl);
-    const agentSession = await createAgentSession(serverUrl, event.input);
-    return agentSession.id;
-  },
-
-  async cleanup({ environment, value }) {
-    const serverUrl = environment!.get(opencodeServerUrl);
-    await closeAgentSession(serverUrl, value);
-  },
-});
-
-client.useResource(opencodeSession);
-const id = await session.resource(opencodeSession);
-```
+Use `session.ensure` when a value must be created once per session. Use an environment sandbox when an external resource also needs cleanup.
 
 ## Environments and sandboxes
 
@@ -165,10 +147,17 @@ import { createEnvironment, envKey } from "simple-agent-orchestrator";
 export const opencodeServerUrl = envKey<string>("opencode.serverUrl");
 
 export const opencodeEnvironment = createEnvironment("opencode", (environment) => {
-  environment.onMount(async ({ project }) => {
+  let shutdown: (() => Promise<void>) | undefined;
+
+  environment.onMount(async ({ environment, project }) => {
     const server = await startPersistentOpencodeServer({ cwd: project.root });
     environment.set(opencodeServerUrl, server.url);
-    environment.onUnmount(() => server.shutdown());
+    shutdown = () => server.shutdown();
+  });
+
+  environment.onUnmount(async () => {
+    await shutdown?.();
+    shutdown = undefined;
   });
 
   environment.useSandbox({

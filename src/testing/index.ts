@@ -32,6 +32,7 @@ export async function createTestRuntime(options: TestRuntimeOptions) {
     sessions: {
       list: () => runtime.listSessions(),
       get: (idOrKey: string) => runtime.getSession(idOrKey),
+      notes: (idOrKey: string) => runtime.listSessionNotes(idOrKey),
     },
     events: {
       list: () => runtime.listEvents(),

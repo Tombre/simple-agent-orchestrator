@@ -89,3 +89,5 @@ Fields:
 Events are deduped by `channelId + dedupeKey`. A duplicate dispatch is not enqueued again, but the original event remains available in the store.
 
 A delivery is only marked `processed` after the client handler succeeds.
+
+Executions of the same poll do not overlap within one runtime process. Mapped events are durably dispatched before `commit` runs, and cursor changes are persisted only if the poll and commit complete. Poll cursor identity uses the channel id and poll registration order, so avoid reordering polls after state exists.

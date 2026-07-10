@@ -159,14 +159,16 @@ export const githubReviewsChannel = createChannel(
 
 export const codingClient = createClient("coding", (client) => {
   client.handle(githubReviewsChannel, async ({ event, session }) => {
+    let createdNow = false;
     const id = await session.ensure(agentSessionId, async () => {
+      createdNow = true;
       const created = await createAgentSession({
         initialPrompt: String(event.input),
       });
       return created.id;
     });
 
-    await sendToAgent(id, String(event.input));
+    if (!createdNow) await sendToAgent(id, String(event.input));
   });
 });
 ```
@@ -234,6 +236,8 @@ See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
 This generated project is intentionally small and dependency-light. It ships with an in-memory store and a JSON-file store. The public store interface is small so that you can add a SQLite or Postgres adapter later without changing user code.
 
 The runtime is suitable as a starting point for local/project-embedded orchestration. Before publishing as a production package, harden cross-process locking, stale `processing` delivery recovery, and durable database storage.
+
+The package is ESM-only and requires Node.js 20 or newer.
 
 ## License
 

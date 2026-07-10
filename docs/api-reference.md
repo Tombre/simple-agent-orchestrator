@@ -161,6 +161,8 @@ session.note(message, data);
 session.end({ reason });
 ```
 
+Ordinary state changes and notes are committed when the delivery succeeds. Values created through `session.ensure` are persisted eagerly so retries reuse them.
+
 ## `sessionKey`, `envKey`, `cursorKey`
 
 Typed state keys.
@@ -213,7 +215,7 @@ environment.useSandbox({
 });
 ```
 
-The sandbox is created once per active session and cleaned up when the session ends.
+The sandbox is created once per active session and reused across retries. Cleanup runs after a successful handler-driven `session.end()`. This guarantee is process-local; external create and cleanup functions should be idempotent.
 
 ## Stores
 
@@ -259,6 +261,7 @@ await runtime.drain();
 await runtime.stop();
 await runtime.listSessions();
 await runtime.getSession(idOrKey);
+await runtime.listSessionNotes(idOrKey);
 await runtime.endSession(idOrKey, reason);
 await runtime.listEvents();
 await runtime.retryDelivery(deliveryId);
@@ -275,4 +278,5 @@ import { createTestRuntime } from "simple-agent-orchestrator/testing";
 const test = await createTestRuntime({ config });
 await test.dispatch("manual", { id: "1", sessionKey: "demo", input: "hello" });
 const session = await test.sessions.get("demo");
+const notes = await test.sessions.notes("demo");
 ```

@@ -29,11 +29,16 @@ export type EnsureCoordinator = <T>(
   factory: () => Promise<T> | T,
 ) => Promise<T>;
 
+export type SessionMutation =
+  | { type: "set"; name: string; value: unknown }
+  | { type: "delete"; name: string };
+
 export class SessionImpl implements Session {
   private readonly notes: SessionNote[] = [];
   private ended = false;
   private endReason: string | undefined;
   private readonly ensureCache = new Map<string, Promise<unknown>>();
+  private readonly mutations = new Map<string, SessionMutation>();
 
   constructor(
     private readonly stored: StoredSession,
@@ -63,7 +68,9 @@ export class SessionImpl implements Session {
   }
 
   set<T = unknown>(key: KeyLike<T>, value: T): void {
-    this.stored.state[keyName(key)] = value;
+    const name = keyName(key);
+    this.stored.state[name] = value;
+    this.mutations.set(name, { type: "set", name, value });
     this.stored.updatedAt = nowIso();
   }
 
@@ -72,7 +79,9 @@ export class SessionImpl implements Session {
   }
 
   delete(key: KeyLike): void {
-    delete this.stored.state[keyName(key)];
+    const name = keyName(key);
+    delete this.stored.state[name];
+    this.mutations.set(name, { type: "delete", name });
     this.stored.updatedAt = nowIso();
   }
 
@@ -118,6 +127,27 @@ export class SessionImpl implements Session {
 
   toStored(): StoredSession {
     return { ...this.stored, state: { ...this.stored.state } };
+  }
+
+  pendingMutations(): SessionMutation[] {
+    return [...this.mutations.values()];
+  }
+
+  clearMutations(): void {
+    this.mutations.clear();
+  }
+
+  clearMutation(name: string): void {
+    this.mutations.delete(name);
+  }
+
+  mergeStoredState(state: Record<string, unknown>): void {
+    for (const name of Object.keys(this.stored.state)) {
+      if (!this.mutations.has(name) && !(name in state)) delete this.stored.state[name];
+    }
+    for (const [name, value] of Object.entries(state)) {
+      if (!this.mutations.has(name)) this.stored.state[name] = value;
+    }
   }
 
   drainNotes(): SessionNote[] {

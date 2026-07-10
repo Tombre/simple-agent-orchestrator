@@ -40,7 +40,7 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
 
 4. **Use durable identity deliberately.** Every dispatched event should have a stable `id`; add `dedupeKey` when the source id is not the desired processing identity; add `sessionKey` for the durable work unit. Prefer `defineKey` for structured session keys. Done when duplicate suppression and session routing are both explainable from the code.
 
-5. **Make handlers first-event safe.** Any channel event may be the first event for a session. Use `session.ensure(...)` or `session.resource(...)` for persistent external resources such as agent session ids, worktrees, browsers, or temporary servers. Done when no handler assumes another handler already initialized session state.
+5. **Make handlers first-event safe.** Any channel event may be the first event for a session. Use `session.ensure(...)` for persistent external identifiers and environment sandboxes for resources that need cleanup. Done when no handler assumes another handler already initialized session state.
 
 6. **Keep source acknowledgement after success.** If a source item must be marked handled, reacted to, labelled, or checkpointed, do it in route/client `onSuccess` or after the handler succeeds, not during polling before durable dispatch. Done when failed deliveries remain retryable.
 
@@ -49,9 +49,9 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
    ```bash
    npx simple-agent-orchestrator doctor
    npx simple-agent-orchestrator print-config
-   npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test" --process
+   npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
    npx simple-agent-orchestrator sessions list
-   npx simple-agent-orchestrator events deliveries
+   npx simple-agent-orchestrator events list
    ```
 
    Also run the project’s TypeScript/test commands when available. Done when config loads and the changed route can be smoke-tested or the remaining blocker is named.

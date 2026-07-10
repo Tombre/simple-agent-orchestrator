@@ -1,9 +1,10 @@
-import type { DispatchEvent, Logger, ProjectContext } from "./types.js";
+import type { DispatchEvent, KeyLike, Logger, ProjectContext } from "./types.js";
+import { keyName } from "./types.js";
 
 export interface Cursor {
-  get<T = unknown>(key: string): T | undefined;
-  set<T = unknown>(key: string, value: T): void;
-  delete(key: string): void;
+  get<T = unknown>(key: KeyLike<T>): T | undefined;
+  set<T = unknown>(key: KeyLike<T>, value: T): void;
+  delete(key: KeyLike): void;
   entries(): Record<string, unknown>;
 }
 
@@ -80,16 +81,16 @@ export function createManualChannel(id = "manual"): ChannelDefinition {
 export class CursorImpl implements Cursor {
   constructor(private readonly state: Record<string, unknown>) {}
 
-  get<T = unknown>(key: string): T | undefined {
-    return this.state[key] as T | undefined;
+  get<T = unknown>(key: KeyLike<T>): T | undefined {
+    return this.state[keyName(key)] as T | undefined;
   }
 
-  set<T = unknown>(key: string, value: T): void {
-    this.state[key] = value;
+  set<T = unknown>(key: KeyLike<T>, value: T): void {
+    this.state[keyName(key)] = value;
   }
 
-  delete(key: string): void {
-    delete this.state[key];
+  delete(key: KeyLike): void {
+    delete this.state[keyName(key)];
   }
 
   entries(): Record<string, unknown> {

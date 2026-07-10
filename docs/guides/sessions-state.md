@@ -53,10 +53,16 @@ session.note("Sent review to agent", {
 
 Notes are persisted in the store and are useful for later CLI or UI inspection.
 
+```bash
+npx simple-agent-orchestrator sessions show <id-or-key>
+```
+
+Programmatic callers can use `runtime.listSessionNotes(idOrKey)`.
+
 ## Ending a session
 
 ```ts
-await session.end({ reason: "github.pr.merged" });
+session.end({ reason: "github.pr.merged" });
 ```
 
 An ended session is kept for history. A future event with the same `sessionKey` creates a new active session.

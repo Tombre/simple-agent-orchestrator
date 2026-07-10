@@ -86,7 +86,7 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
 
     async fetch({ cursor }) {
       return fetchRecentReviewCandidates({
-        since: await cursor.get<string>("lastUpdatedAt"),
+        since: cursor.get<string>("lastUpdatedAt"),
       });
     },
 
@@ -113,7 +113,7 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
 
     async commit({ cursor, items }) {
       const latest = items.map((review) => review.updatedAt).sort().at(-1);
-      if (latest) await cursor.set("lastUpdatedAt", latest);
+      if (latest) cursor.set("lastUpdatedAt", latest);
     },
   });
 });
@@ -124,43 +124,32 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
 ```ts
 import {
   createClient,
-  createSessionResource,
   sessionKey,
-  untrustedMarkdown,
 } from "simple-agent-orchestrator";
 import { githubReviewsChannel } from "../channels/github";
 import { opencodeEnvironment, opencodeServerUrl } from "../environments/opencode";
-import { createAgentSession, sendToAgent, closeAgentSession } from "../../src/lib/opencode";
+import { createAgentSession, sendToAgent } from "../../src/lib/opencode";
 
 const opencodeSessionId = sessionKey<string>("opencode.sessionId");
 
-const opencodeSession = createSessionResource(opencodeSessionId, {
-  async create({ environment, event }) {
-    const serverUrl = environment!.get(opencodeServerUrl);
-    const agentSession = await createAgentSession(serverUrl, {
-      prompt: `You are working on this event.\n\n${untrustedMarkdown("External event", event.input)}`,
-    });
-    return agentSession.id;
-  },
-
-  async cleanup({ environment, value }) {
-    const serverUrl = environment!.get(opencodeServerUrl);
-    await closeAgentSession(serverUrl, value);
-  },
-});
-
 export const codingClient = createClient("coding", (client) => {
   client.useEnvironment(opencodeEnvironment);
-  client.useResource(opencodeSession);
   client.concurrency({ workers: 2, perSession: true });
 
   client.handle(githubReviewsChannel, {
     id: "coding.githubReviews",
 
     async handle({ event, session, environment }) {
-      const serverUrl = environment!.get(opencodeServerUrl);
-      const agentSessionId = await session.resource(opencodeSession);
-      await sendToAgent(serverUrl, agentSessionId, event.input);
+      const serverUrl = environment.get(opencodeServerUrl);
+      let createdNow = false;
+      const agentSessionId = await session.ensure(opencodeSessionId, async () => {
+        createdNow = true;
+        const agentSession = await createAgentSession(serverUrl, {
+          initialPrompt: String(event.input),
+        });
+        return agentSession.id;
+      });
+      if (!createdNow) await sendToAgent(serverUrl, agentSessionId, event.input);
     },
 
     async onSuccess({ event }) {
@@ -180,10 +169,17 @@ import { createWorktree, closeWorktree } from "../../src/lib/worktrees";
 export const opencodeServerUrl = envKey<string>("opencode.serverUrl");
 
 export const opencodeEnvironment = createEnvironment("opencode", (environment) => {
-  environment.onMount(async ({ project }) => {
+  let shutdown: (() => Promise<void>) | undefined;
+
+  environment.onMount(async ({ environment, project }) => {
     const server = await startPersistentOpencodeServer({ cwd: project.root });
     environment.set(opencodeServerUrl, server.url);
-    environment.onUnmount(() => server.shutdown());
+    shutdown = () => server.shutdown();
+  });
+
+  environment.onUnmount(async () => {
+    await shutdown?.();
+    shutdown = undefined;
   });
 
   environment.useSandbox({

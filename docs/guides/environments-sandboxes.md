@@ -10,14 +10,18 @@ import { createEnvironment, envKey } from "simple-agent-orchestrator";
 const opencodeServerUrl = envKey<string>("opencode.serverUrl");
 
 export const opencodeEnvironment = createEnvironment("opencode", (environment) => {
+  let shutdown: (() => Promise<void>) | undefined;
+
   environment.onMount(async ({ environment }) => {
     const server = await startPersistentOpencodeServer();
 
     environment.set(opencodeServerUrl, server.url);
+    shutdown = () => server.shutdown();
+  });
 
-    environment.onUnmount(async () => {
-      await server.shutdown();
-    });
+  environment.onUnmount(async () => {
+    await shutdown?.();
+    shutdown = undefined;
   });
 });
 ```
@@ -59,4 +63,6 @@ export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (env
 });
 ```
 
-The runtime creates the sandbox before the first delivery for a session. If the handler calls `session.end()`, sandbox cleanup runs after the handler succeeds.
+The runtime creates the sandbox before the first delivery for a session and persists its state before running the handler, so automatic retries reuse it. If the handler calls `session.end()`, sandbox cleanup runs after the handler and `onSuccess` succeed.
+
+Sandbox creation and cleanup are serialized only inside one runtime process. External hooks should still be idempotent because a process can crash between creating a resource and persisting its marker. Administratively ending a session with `sessions end` records the end state but does not run sandbox cleanup.

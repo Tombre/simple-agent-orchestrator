@@ -79,14 +79,18 @@ import { createHerdrWorkTree, closeHerdrWorkTree } from "../../src/lib/herdr/wor
 import { herdrWorktreeId, opencodeServerUrl } from "../keys";
 
 export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (environment) => {
+  let shutdown: (() => Promise<void>) | undefined;
+
   environment.onMount(async ({ environment, project }) => {
     const server = await startPersistentOpencodeServer({ cwd: project.root });
 
     environment.set(opencodeServerUrl, server.url);
+    shutdown = () => server.shutdown();
+  });
 
-    environment.onUnmount(async () => {
-      await server.shutdown();
-    });
+  environment.onUnmount(async () => {
+    await shutdown?.();
+    shutdown = undefined;
   });
 
   environment.useSandbox({
@@ -129,7 +133,9 @@ export const codingClient = createClient("coding", (client) => {
     async handle({ event, session, environment }) {
       const serverUrl = environment.get(opencodeServerUrl);
 
+      let createdNow = false;
       const agentSessionId = await session.ensure(opencodeSessionId, async () => {
+        createdNow = true;
         const created = await createAgentSession(serverUrl, {
           initialPrompt: String(event.input),
         });
@@ -137,7 +143,7 @@ export const codingClient = createClient("coding", (client) => {
         return created.id;
       });
 
-      await sendToAgent(serverUrl, agentSessionId, String(event.input));
+      if (!createdNow) await sendToAgent(serverUrl, agentSessionId, String(event.input));
     },
 
     async onSuccess({ event }) {

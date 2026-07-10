@@ -22,7 +22,7 @@ This creates `.simple-agent-orchestrator` at your project root.
 npx simple-agent-orchestrator doctor
 ```
 
-`doctor` loads your config, checks that the runtime can start, and prints the discovered channels and clients.
+`doctor` loads your config, initializes the store, validates identifiers, and prints the discovered channels and clients. It does not run environment hooks, pollers, or handlers.
 
 ## 4. Start the runtime
 
@@ -73,14 +73,18 @@ Replace the handler with your own agent integration:
 
 ```ts
 client.handle(manualChannel, async ({ event, session }) => {
+  let createdNow = false;
   const agentSessionId = await session.ensure("agent.sessionId", async () => {
+    createdNow = true;
     const created = await createAgentSession({ initialPrompt: String(event.input) });
     return created.id;
   });
 
-  await sendToAgent(agentSessionId, String(event.input));
+  if (!createdNow) await sendToAgent(agentSessionId, String(event.input));
 });
 ```
+
+The `createdNow` check prevents the first event from being sent twice when `initialPrompt` already submits it during session creation.
 
 ## 7. Add real channels
 

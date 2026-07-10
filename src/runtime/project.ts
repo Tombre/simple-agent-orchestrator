@@ -1,4 +1,4 @@
-import { access, mkdir, readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -28,8 +28,9 @@ async function exists(path: string): Promise<boolean> {
 async function readJson(path: string): Promise<Record<string, unknown>> {
   try {
     return JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
-  } catch {
-    return {};
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
   }
 }
 
@@ -45,7 +46,13 @@ async function findUp(start: string, predicate: (dir: string) => Promise<boolean
 
 export async function findProjectRoot(options: { cwd?: string; root?: string; config?: string } = {}): Promise<string> {
   if (options.root) return resolve(options.root);
-  if (options.config) return dirname(resolve(options.config));
+  if (options.config) {
+    const configDir = dirname(resolve(options.cwd ?? process.cwd(), options.config));
+    const orchestratorRoot = await findUp(configDir, async (dir) => exists(join(dir, ".simple-agent-orchestrator")));
+    if (orchestratorRoot) return orchestratorRoot;
+    const packageRoot = await findUp(configDir, async (dir) => exists(join(dir, "package.json")));
+    return packageRoot ?? configDir;
+  }
   const cwd = resolve(options.cwd ?? process.cwd());
 
   const orchestratorRoot = await findUp(cwd, async (dir) => exists(join(dir, ".simple-agent-orchestrator")));
@@ -89,16 +96,16 @@ export async function createProjectContext(root: string): Promise<ProjectContext
 export async function findConfigFile(project: ProjectContext, explicitConfig?: string): Promise<string> {
   if (explicitConfig) return isAbsolute(explicitConfig) ? explicitConfig : resolve(project.root, explicitConfig);
 
+  for (const name of CONFIG_NAMES) {
+    const candidate = join(project.orchestratorDir, name);
+    if (await exists(candidate)) return candidate;
+  }
+
   const pointer = project.packageJson.simpleAgentOrchestrator;
   if (typeof pointer === "string") return resolve(project.root, pointer);
   if (pointer && typeof pointer === "object" && "config" in pointer) {
     const config = (pointer as { config?: unknown }).config;
     if (typeof config === "string") return resolve(project.root, config);
-  }
-
-  for (const name of CONFIG_NAMES) {
-    const candidate = join(project.orchestratorDir, name);
-    if (await exists(candidate)) return candidate;
   }
 
   throw new Error(
@@ -144,10 +151,15 @@ export async function loadProjectConfig(options: LoadProjectOptions = {}): Promi
   configFile: string;
   config: OrchestratorConfig;
 }> {
-  const root = await findProjectRoot(options);
+  const explicitConfig = options.config
+    ? isAbsolute(options.config)
+      ? options.config
+      : resolve(options.root ?? options.cwd ?? process.cwd(), options.config)
+    : undefined;
+  const rootOptions = explicitConfig ? { ...options, config: explicitConfig } : options;
+  const root = await findProjectRoot(rootOptions);
   const project = await createProjectContext(root);
-  await mkdir(project.orchestratorDir, { recursive: true });
-  const configFile = await findConfigFile(project, options.config);
+  const configFile = await findConfigFile(project, explicitConfig);
   const config = await loadConfigFile(configFile, project);
   return { project, configFile, config };
 }

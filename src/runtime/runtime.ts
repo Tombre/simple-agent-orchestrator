@@ -13,6 +13,7 @@ import type {
   OrchestratorEvent,
   OrchestratorState,
   ProjectContext,
+  SessionNote,
   StoredDelivery,
   StoredEvent,
   StoredSession,
@@ -73,10 +74,13 @@ export class OrchestratorRuntime {
   private readonly mutex = new StoreMutex();
   private readonly abortController = new AbortController();
   private readonly environmentInstances = new Map<string, EnvironmentInstanceImpl>();
+  private readonly environmentMounts = new Map<string, Promise<EnvironmentInstanceImpl>>();
   private readonly intervalHandles: NodeJS.Timeout[] = [];
   private readonly workerPromises: Promise<void>[] = [];
+  private readonly pollPromises = new Map<string, Promise<void>>();
   private readonly processingSessionKeys = new Set<string>();
   private readonly ensureLocks = new Map<string, Promise<unknown>>();
+  private readonly sandboxLocks = new Map<string, Promise<void>>();
   private initialized = false;
 
   constructor(private readonly options: RuntimeOptions) {
@@ -92,6 +96,7 @@ export class OrchestratorRuntime {
 
   async init(): Promise<void> {
     if (this.initialized) return;
+    this.validateConfiguration();
     await this.store.init();
     for (const channel of this.channels) {
       channel.__attachDispatch((event) => this.dispatch(channel.id, event));
@@ -104,8 +109,12 @@ export class OrchestratorRuntime {
     if (options.prettyStartupLog ?? true) this.printStartupSummary();
 
     if (options.drain) {
-      await this.runAllPollsOnce();
-      await this.drain();
+      try {
+        await this.runAllPollsOnce();
+        await this.drain();
+      } finally {
+        await this.stop();
+      }
       return;
     }
 
@@ -117,6 +126,8 @@ export class OrchestratorRuntime {
   async stop(): Promise<void> {
     this.abortController.abort();
     for (const handle of this.intervalHandles) clearInterval(handle);
+    this.intervalHandles.length = 0;
+    await Promise.allSettled(this.pollPromises.values());
     await Promise.allSettled(this.workerPromises);
     await this.unmountAllEnvironments();
   }
@@ -171,7 +182,10 @@ export class OrchestratorRuntime {
       for (const client of this.clients) {
         for (const handler of client.handlers.filter((candidate) => candidate.channelId === channelId)) {
           const duplicateDelivery = state.deliveries.some(
-            (delivery) => delivery.eventId === storedEvent.id && delivery.handlerId === handler.id,
+            (delivery) =>
+              delivery.eventId === storedEvent.id &&
+              delivery.clientId === client.id &&
+              delivery.handlerId === handler.id,
           );
           if (duplicateDelivery) continue;
           state.deliveries.push({
@@ -182,7 +196,7 @@ export class OrchestratorRuntime {
             handlerId: handler.id,
             status: "pending",
             attempts: 0,
-            maxAttempts: handler.retries.attempts,
+            maxAttempts: Math.max(1, handler.retries.attempts ?? this.options.config.retries?.attempts ?? 3),
             createdAt: nowIso(),
             updatedAt: nowIso(),
           });
@@ -202,6 +216,15 @@ export class OrchestratorRuntime {
   async getSession(idOrKey: string): Promise<StoredSession | undefined> {
     const state = await this.store.read();
     return state.sessions.find((session) => session.id === idOrKey || session.key === idOrKey);
+  }
+
+  async listSessionNotes(idOrKey: string): Promise<SessionNote[]> {
+    const state = await this.store.read();
+    const session = state.sessions.find((candidate) => candidate.id === idOrKey || candidate.key === idOrKey);
+    if (!session) return [];
+    return state.notes
+      .filter((note) => note.sessionId === session.id)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async endSession(idOrKey: string, reason = "manual"): Promise<boolean> {
@@ -232,9 +255,11 @@ export class OrchestratorRuntime {
     return this.mutex.run(async () => {
       const state = await this.store.read();
       const delivery = state.deliveries.find((candidate) => candidate.id === id);
-      if (!delivery) return false;
+      if (!delivery || delivery.status !== "failed") return false;
       delivery.status = "pending";
+      delivery.maxAttempts = Math.max(delivery.maxAttempts, delivery.attempts + 1);
       delivery.lastError = undefined;
+      delivery.processedAt = undefined;
       delivery.updatedAt = nowIso();
       await this.store.write(state);
       return true;
@@ -269,9 +294,9 @@ export class OrchestratorRuntime {
   private startPollers(): void {
     for (const channel of this.channels) {
       channel.polls.forEach((poll, index) => {
-        if (poll.immediate ?? true) void this.runPoll(channel, poll, index);
+        if (poll.immediate ?? true) void this.schedulePoll(channel, poll, index);
         const interval = setInterval(() => {
-          void this.runPoll(channel, poll, index);
+          void this.schedulePoll(channel, poll, index);
         }, parseDuration(poll.every));
         this.intervalHandles.push(interval);
       });
@@ -282,9 +307,20 @@ export class OrchestratorRuntime {
     for (const channel of this.channels) {
       for (let index = 0; index < channel.polls.length; index += 1) {
         const poll = channel.polls[index]!;
-        await this.runPoll(channel, poll, index);
+        await this.schedulePoll(channel, poll, index);
       }
     }
+  }
+
+  private schedulePoll(channel: ChannelDefinition, poll: PollDefinition, index: number): Promise<void> {
+    const cursorId = `${channel.id}:${index}`;
+    const existing = this.pollPromises.get(cursorId);
+    if (existing) return existing;
+    const promise = this.runPoll(channel, poll, index).finally(() => {
+      if (this.pollPromises.get(cursorId) === promise) this.pollPromises.delete(cursorId);
+    });
+    this.pollPromises.set(cursorId, promise);
+    return promise;
   }
 
   private async runPoll(channel: ChannelDefinition, poll: PollDefinition, index: number): Promise<void> {
@@ -441,10 +477,13 @@ export class OrchestratorRuntime {
   }
 
   private toRuntimeEvent(event: StoredEvent): OrchestratorEvent {
+    const dedupePrefix = `${event.channelId}:`;
     return {
       id: event.sourceId,
       channelId: event.channelId,
-      dedupeKey: event.dedupeKey,
+      dedupeKey: event.dedupeKey.startsWith(dedupePrefix)
+        ? event.dedupeKey.slice(dedupePrefix.length)
+        : event.dedupeKey,
       sessionKey: event.sessionKey,
       type: event.type,
       input: event.input,
@@ -521,10 +560,7 @@ export class OrchestratorRuntime {
   private async persistSuccess(deliveryId: string, session: SessionImpl): Promise<void> {
     await this.mutex.run(async () => {
       const state = await this.store.read();
-      const stored = session.toStored();
-      const sessionIndex = state.sessions.findIndex((candidate) => candidate.id === stored.id);
-      if (sessionIndex >= 0) state.sessions[sessionIndex] = stored;
-      else state.sessions.push(stored);
+      this.mergeSession(state, session);
       state.notes.push(...session.drainNotes());
       const delivery = state.deliveries.find((candidate) => candidate.id === deliveryId);
       if (delivery) {
@@ -535,6 +571,7 @@ export class OrchestratorRuntime {
       }
       await this.store.write(state);
     });
+    session.clearMutations();
   }
 
   private async persistFailure(deliveryId: string, error: unknown): Promise<void> {
@@ -561,17 +598,40 @@ export class OrchestratorRuntime {
     const key = `${client.id}:${definition.id}`;
     const existing = this.environmentInstances.get(key);
     if (existing) return existing;
+    const existingMount = this.environmentMounts.get(key);
+    if (existingMount) return existingMount;
 
-    const instance = new EnvironmentInstanceImpl(definition.id);
-    this.environmentInstances.set(key, instance);
-    for (const hook of definition.mountHooks) {
-      await hook({
-        environment: instance,
-        project: this.project,
-        logger: this.logger,
-        signal: this.abortController.signal,
-      });
+    const mounting = this.mountEnvironment(key, definition);
+    this.environmentMounts.set(key, mounting);
+    try {
+      return await mounting;
+    } finally {
+      if (this.environmentMounts.get(key) === mounting) this.environmentMounts.delete(key);
     }
+  }
+
+  private async mountEnvironment(key: string, definition: EnvironmentDefinition): Promise<EnvironmentInstanceImpl> {
+    const instance = new EnvironmentInstanceImpl(definition.id);
+    try {
+      for (const hook of definition.mountHooks) {
+        await hook({
+          environment: instance,
+          project: this.project,
+          logger: this.logger,
+          signal: this.abortController.signal,
+        });
+      }
+    } catch (error) {
+      for (const hook of [...definition.unmountHooks].reverse()) {
+        try {
+          await hook({ environment: instance, project: this.project, logger: this.logger, signal: this.abortController.signal });
+        } catch (rollbackError) {
+          this.logger.warn("Environment rollback failed", { error: formatError(rollbackError) });
+        }
+      }
+      throw error;
+    }
+    this.environmentInstances.set(key, instance);
     return instance;
   }
 
@@ -588,6 +648,7 @@ export class OrchestratorRuntime {
           signal: this.abortController.signal,
         });
       }
+      this.environmentInstances.delete(`${client.id}:${definition.id}`);
     }
   }
 
@@ -600,9 +661,13 @@ export class OrchestratorRuntime {
     const definition = client.environment;
     if (!definition?.sandbox) return;
     const flag = `__sao.sandbox.${definition.id}.created`;
-    if (session.getOptional<boolean>(flag)) return;
-    await definition.sandbox.create(this.sandboxContext(environment, session, event));
-    session.set(flag, true);
+    await this.withSandboxLock(`${session.id}:${flag}`, async () => {
+      await this.refreshSessionState(session);
+      if (session.getOptional<boolean>(flag)) return;
+      await definition.sandbox!.create(this.sandboxContext(environment, session, event));
+      session.set(flag, true);
+      await this.persistSessionMutations(session);
+    });
   }
 
   private async cleanupSandbox(
@@ -614,9 +679,13 @@ export class OrchestratorRuntime {
     const definition = client.environment;
     if (!definition?.sandbox?.cleanup) return;
     const flag = `__sao.sandbox.${definition.id}.created`;
-    if (!session.getOptional<boolean>(flag)) return;
-    await definition.sandbox.cleanup(this.sandboxContext(environment, session, event));
-    session.set(flag, false);
+    await this.withSandboxLock(`${session.id}:${flag}`, async () => {
+      await this.refreshSessionState(session);
+      if (!session.getOptional<boolean>(flag)) return;
+      await definition.sandbox!.cleanup!(this.sandboxContext(environment, session, event));
+      session.set(flag, false);
+      await this.persistSandboxFlag(session, flag, false);
+    });
   }
 
   private sandboxContext(
@@ -632,6 +701,87 @@ export class OrchestratorRuntime {
       session,
       event: this.toRuntimeEvent(event),
     };
+  }
+
+  private validateConfiguration(): void {
+    this.assertUnique(this.channels.map(({ id }) => id), "channel");
+    this.assertUnique(this.clients.map(({ id }) => id), "client");
+    for (const client of this.clients) {
+      this.assertUnique(client.handlers.map(({ id }) => id), "handler", ` for client ${client.id}`);
+    }
+  }
+
+  private assertUnique(ids: string[], kind: string, suffix = ""): void {
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (seen.has(id)) throw new Error(`Duplicate ${kind} id${suffix}: ${id}`);
+      seen.add(id);
+    }
+  }
+
+  private mergeSession(state: OrchestratorState, session: SessionImpl): StoredSession {
+    const snapshot = session.toStored();
+    let stored = state.sessions.find((candidate) => candidate.id === snapshot.id);
+    if (!stored) {
+      stored = { ...snapshot, state: {} };
+      state.sessions.push(stored);
+    }
+    for (const mutation of session.pendingMutations()) {
+      if (mutation.type === "set") stored.state[mutation.name] = mutation.value;
+      else delete stored.state[mutation.name];
+    }
+    if (stored.status !== "ended" && snapshot.status === "ended") {
+      stored.status = "ended";
+      stored.endedAt = snapshot.endedAt;
+      stored.endReason = snapshot.endReason;
+    }
+    stored.updatedAt = nowIso();
+    return stored;
+  }
+
+  private async persistSessionMutations(session: SessionImpl): Promise<void> {
+    await this.mutex.run(async () => {
+      const state = await this.store.read();
+      this.mergeSession(state, session);
+      await this.store.write(state);
+    });
+    session.clearMutations();
+  }
+
+  private async persistSandboxFlag(session: SessionImpl, flag: string, value: boolean): Promise<void> {
+    await this.mutex.run(async () => {
+      const state = await this.store.read();
+      const stored = state.sessions.find((candidate) => candidate.id === session.id);
+      if (stored) {
+        stored.state[flag] = value;
+        stored.updatedAt = nowIso();
+        await this.store.write(state);
+      }
+    });
+    session.clearMutation(flag);
+  }
+
+  private async refreshSessionState(session: SessionImpl): Promise<void> {
+    const state = await this.mutex.run(() => this.store.read());
+    const stored = state.sessions.find((candidate) => candidate.id === session.id);
+    if (stored) session.mergeStoredState(stored.state);
+  }
+
+  private async withSandboxLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.sandboxLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      release = resolveGate;
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.sandboxLocks.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.sandboxLocks.get(key) === tail) this.sandboxLocks.delete(key);
+    }
   }
 }
 

@@ -69,6 +69,8 @@ npx simple-agent-orchestrator sessions show <id-or-key>
 npx simple-agent-orchestrator sessions end <id-or-key> --reason manual
 ```
 
+`show` includes persisted session notes. `end` records the session as ended but does not invoke sandbox cleanup hooks.
+
 ## events
 
 ```bash
@@ -76,7 +78,7 @@ npx simple-agent-orchestrator events list
 npx simple-agent-orchestrator events retry <delivery-id>
 ```
 
-`retry` marks a failed delivery as pending and drains the runtime once.
+`retry` grants one additional attempt to a failed delivery and drains the runtime once. Pending, processing, and processed deliveries are not requeued.
 
 ## print-config
 

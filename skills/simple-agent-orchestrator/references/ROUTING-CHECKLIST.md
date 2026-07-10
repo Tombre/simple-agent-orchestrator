@@ -13,10 +13,10 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 ## Handler safety
 
 - Each handler works when it is the first event for a session.
-- Persistent external resources are created with `session.ensure` or `session.resource`.
+- Persistent external identifiers are created with `session.ensure`; resources that need cleanup use an environment sandbox.
 - The handler does not require state created by another channel unless it can recreate or recover it.
 - External source acknowledgement happens after successful handling.
-- Untrusted external text is separated from system/developer instructions, usually with `untrustedMarkdown` or equivalent formatting.
+- Untrusted external text is separated from system/developer instructions using the target agent SDK's supported content or escaping mechanism.
 
 ## Session lifecycle
 
@@ -34,7 +34,7 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 ## Queue and retries
 
 - Dedupe is not treated as successful processing.
-- Failed deliveries remain visible through `events deliveries`.
+- Failed deliveries remain visible through `events list`.
 - Retry settings are explicit when the default is not enough.
 - `client.concurrency({ perSession: true })` is used when the target agent/tool cannot safely receive same-session messages concurrently.
 
@@ -43,10 +43,9 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 ```bash
 npx simple-agent-orchestrator doctor
 npx simple-agent-orchestrator print-config
-npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test" --process
+npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
 npx simple-agent-orchestrator sessions list
 npx simple-agent-orchestrator events list
-npx simple-agent-orchestrator events deliveries
 ```
 
 ## Common failures
@@ -55,7 +54,7 @@ npx simple-agent-orchestrator events deliveries
 
 Cause: handler used `session.get` then created the resource manually.
 
-Fix: use `session.ensure` or `session.resource`.
+Fix: use `session.ensure` for the durable external identifier.
 
 ### Review routes to the wrong session
 
