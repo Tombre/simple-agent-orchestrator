@@ -34,6 +34,8 @@ expect(session?.state.count).toBe(1);
 
 The test runtime uses the memory store and drains deliveries immediately after dispatch.
 
+Test failure paths as well as successful persistence. In particular, verify that ordinary state and notes from a failed attempt disappear, ensured values remain, and repeated external calls receive the same idempotency key. A dedupe test alone does not prove external processing is exactly once.
+
 Prefer behavior-focused TDD: write a failing test through public channels, clients, and runtime methods, then make the smallest implementation change that passes it. Use direct `OrchestratorRuntime` instances with deterministic barriers for worker concurrency and lifecycle tests; do not depend on arbitrary sleeps.
 
 The repository verification commands are:

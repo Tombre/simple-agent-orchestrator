@@ -171,16 +171,16 @@ export const githubReviewsChannel = createChannel(
 
 export const codingClient = createClient("coding", (client) => {
   client.handle(githubReviewsChannel, async ({ event, session }) => {
-    let createdNow = false;
     const id = await session.ensure(agentSessionId, async () => {
-      createdNow = true;
       const created = await createAgentSession({
-        initialPrompt: String(event.input),
+        idempotencyKey: `agent-session:${session.id}`,
       });
       return created.id;
     });
 
-    if (!createdNow) await sendToAgent(id, String(event.input));
+    await sendToAgent(id, String(event.input), {
+      idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+    });
   });
 });
 ```
@@ -198,6 +198,8 @@ An event is the durable unit of input. Events have a source `id`, optional `dedu
 ### Delivery
 
 A delivery is a client/handler-specific attempt to process an event. One event can be delivered to multiple clients.
+
+Delivery processing is retryable, not exactly once. A later failure can repeat handlers, hooks, and external effects even though event dispatch was deduped. Integrations must use stable external idempotency keys or reconciliation; see [Failure semantics and idempotency](docs/guides/failure-semantics.md).
 
 ### Client
 
@@ -235,6 +237,7 @@ See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
 - [Project integration](docs/guides/project-integration.md)
 - [Channels](docs/guides/channels.md)
 - [Clients and handlers](docs/guides/clients.md)
+- [Failure semantics and idempotency](docs/guides/failure-semantics.md)
 - [Sessions and state](docs/guides/sessions-state.md)
 - [Environments and sandboxes](docs/guides/environments-sandboxes.md)
 - [Testing](docs/guides/testing.md)

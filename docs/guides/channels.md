@@ -88,6 +88,8 @@ Fields:
 
 Events are deduped by `channelId + dedupeKey`. A duplicate dispatch is not enqueued again, but the original event remains available in the store.
 
-A delivery is only marked `processed` after the client handler succeeds.
+A delivery is only marked `processed` after the handler, `onSuccess`, required sandbox cleanup, and final persistence succeed. Dedupe does not prevent a failed delivery attempt or its external effects from repeating.
 
-Executions of the same poll do not overlap within one runtime process. Mapped events are durably dispatched before `commit` runs, and cursor changes are persisted only if the poll and commit complete. Poll cursor identity uses the channel id and poll registration order, so avoid reordering polls after state exists.
+Executions of the same poll do not overlap within one runtime process. Mapping is sequential. Mapped events are durably dispatched before `commit` runs, and cursor changes are persisted only after `fetch`, mapping, dispatch, and `commit` complete. Previously dispatched events remain if a later poll step fails, so stable dedupe keys must make refetching safe.
+
+`commit` records ingestion progress; it does not wait for delivery processing and is not source acknowledgement. Keep acknowledgement in a retry-safe, designated client `onSuccess`. Because hooks are per delivery, there is no event-wide acknowledgement hook that waits for every fan-out delivery. Poll cursor identity uses the channel id and poll registration order, so avoid reordering polls after state exists.

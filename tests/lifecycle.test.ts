@@ -41,6 +41,89 @@ describe("resource lifecycle", () => {
     expect(seenResources).toEqual(["workspace-1", "workspace-1", "workspace-1"]);
   });
 
+  it("retries sandbox creation failures before constructing a handler context", async () => {
+    const channel = createChannel("sandbox");
+    let creates = 0;
+    let handles = 0;
+    let failures = 0;
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({
+        create() {
+          creates += 1;
+          if (creates === 1) throw new Error("creation uncertain");
+        },
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, {
+        retries: { attempts: 2 },
+        handle() {
+          handles += 1;
+        },
+        onFailure() {
+          failures += 1;
+        },
+      });
+    });
+    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+    await test.dispatch("sandbox", { id: "event", sessionKey: "work" });
+
+    expect(creates).toBe(2);
+    expect(handles).toBe(1);
+    expect(failures).toBe(0);
+    expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "processed", attempts: 2 });
+  });
+
+  it("retries the whole attempt when sandbox cleanup fails", async () => {
+    const channel = createChannel("sandbox");
+    let creates = 0;
+    let cleanups = 0;
+    const calls: string[] = [];
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({
+        create() {
+          creates += 1;
+        },
+        cleanup() {
+          cleanups += 1;
+          if (cleanups === 1) throw new Error("cleanup uncertain");
+        },
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, {
+        retries: { attempts: 2 },
+        handle({ attempt, session }) {
+          calls.push(`handle:${attempt}`);
+          session.end({ reason: "done" });
+        },
+        onSuccess({ attempt }) {
+          calls.push(`success:${attempt}`);
+        },
+        onFailure({ attempt, error }) {
+          calls.push(`failure:${attempt}:${error instanceof Error ? error.message : String(error)}`);
+        },
+      });
+    });
+    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+    await test.dispatch("sandbox", { id: "event", sessionKey: "work" });
+
+    expect(creates).toBe(1);
+    expect(cleanups).toBe(2);
+    expect(calls).toEqual([
+      "handle:1",
+      "success:1",
+      "failure:1:cleanup uncertain",
+      "handle:2",
+      "success:2",
+    ]);
+    expect(await test.sessions.get("work")).toMatchObject({ status: "ended" });
+  });
+
   it("unmounts environments before one-shot drain startup resolves", async () => {
     const channel = createChannel("drain");
     const lifecycle: string[] = [];
@@ -174,6 +257,34 @@ describe("resource lifecycle", () => {
 
     expect(nextPage).toBeUndefined();
     expect(await secondRuntime.listEvents()).toHaveLength(1);
+  });
+
+  it("safely redelivers a polled item after commit failure when its dedupe key is stable", async () => {
+    const store = memoryStore();
+    const page = cursorKey<number>("page");
+    let commits = 0;
+    const channel = createChannel("poll", (builder) => {
+      builder.poll({
+        every: "1h",
+        fetch: () => [{ id: "event", revision: 1 }],
+        map: (item) => ({ id: item.id, dedupeKey: `${item.id}:${item.revision}` }),
+        commit({ cursor }) {
+          commits += 1;
+          cursor.set(page, 1);
+          if (commits === 1) throw new Error("commit failed");
+        },
+      });
+    });
+
+    const firstRuntime = await createRuntime({ channels: [channel], store });
+    await firstRuntime.start({ drain: true, prettyStartupLog: false });
+    const secondRuntime = await createRuntime({ channels: [channel], store });
+    await secondRuntime.start({ drain: true, prettyStartupLog: false });
+
+    expect(commits).toBe(2);
+    expect(await secondRuntime.listEvents()).toHaveLength(1);
+    const state = await store.read();
+    expect(state.cursors["poll:0"]).toEqual({ page: 1 });
   });
 
   it("does not commit ordinary handler state when final success persistence fails", async () => {

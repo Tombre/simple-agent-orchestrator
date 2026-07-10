@@ -51,7 +51,8 @@ export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (env
         throw new Error("Expected event.meta.branch");
       }
 
-      const worktreeId = await createHerdrWorkTree({
+      const worktreeId = await ensureActiveHerdrWorkTree({
+        resourceKey: `worktree:${session.id}`,
         sourceCheckout: "main",
         branch,
         rootDirectory: "/",
@@ -62,12 +63,12 @@ export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (env
 
     async cleanup({ session }) {
       const worktreeId = session.getOptional<string>("herdr.worktreeId");
-      if (worktreeId) await closeHerdrWorkTree(worktreeId);
+      if (worktreeId) await closeHerdrWorkTreeIdempotently(worktreeId);
     },
   });
 });
 ```
 
-The runtime creates the sandbox before the first delivery for a session and persists its state before running the handler, so automatic retries reuse it. If the handler calls `session.end()`, sandbox cleanup runs after the handler and `onSuccess` succeed.
+The runtime creates the sandbox before the first delivery for a session and eagerly persists all state mutations made by `create`, so normal handler retries reuse it. If the handler calls `session.end()`, sandbox cleanup runs after the handler and `onSuccess` succeed.
 
-Sandbox creation and cleanup are serialized only inside one runtime process. External hooks should still be idempotent because a process can crash between creating a resource and persisting its marker. Administratively ending a session with `sessions end` records the end state but does not run sandbox cleanup.
+Sandbox creation and cleanup are serialized only inside one runtime process. Creation can repeat if external work succeeds before its marker is persisted; cleanup can repeat after an uncertain failure. Cleanup can also succeed before final delivery persistence fails, requiring creation of a new active resource on retry. External hooks must reconcile by stable resource identity across create, cleanup, and recreate, rather than blindly replaying an identifier for a resource that may now be closed. Administratively ending a session with `sessions end` records the end state but does not run sandbox cleanup.

@@ -82,7 +82,7 @@ npx simple-agent-orchestrator events list
 npx simple-agent-orchestrator events retry <delivery-id>
 ```
 
-`retry` grants one additional attempt to a failed delivery and drains the runtime once. Pending, processing, and processed deliveries are not requeued.
+`retry` grants one additional attempt to a failed delivery and drains the runtime once. Pending, processing, and processed deliveries are not requeued. The complete handler attempt can run again, so external effects and source acknowledgement must use stable idempotency keys or reconciliation.
 
 ## print-config
 

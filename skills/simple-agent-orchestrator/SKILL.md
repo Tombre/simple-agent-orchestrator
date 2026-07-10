@@ -40,11 +40,13 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
 
 4. **Use durable identity deliberately.** Every dispatched event should have a stable `id`; add `dedupeKey` when the source id is not the desired processing identity; add `sessionKey` for the durable work unit. Prefer `defineKey` for structured session keys. Done when duplicate suppression and session routing are both explainable from the code.
 
-5. **Make handlers first-event safe.** Any channel event may be the first event for a session. Use `session.ensure(...)` for persistent external identifiers and environment sandboxes for resources that need cleanup. Done when no handler assumes another handler already initialized session state.
+5. **Make handlers first-event and retry safe.** Any channel event may be the first event for a session. Use `session.ensure(...)` for persistent external identifiers and environment sandboxes for resources that need cleanup, but make their external factories idempotent or reconciling because creation can repeat before local markers persist. Do not submit the first event as part of ensured resource creation and then depend on an attempt-local `createdNow` flag. Done when no handler assumes prior initialization and every retryable external operation has a stable identity.
 
-6. **Keep source acknowledgement after success.** If a source item must be marked handled, reacted to, labelled, or checkpointed, do it in route/client `onSuccess` or after the handler succeeds, not during polling before durable dispatch. Done when failed deliveries remain retryable.
+6. **Keep source acknowledgement after handling.** If a source item must be marked handled, reacted to, or labelled, do it in a designated client `onSuccess`, not during polling or at the start of `handle`. Hooks are per delivery; there is no event-wide hook that waits for all fan-out deliveries. Make acknowledgement idempotent because a later cleanup or persistence failure can repeat it. Treat poll `commit` as an ingestion cursor checkpoint, not successful-processing acknowledgement. Done when acknowledgement ownership is explicit, failed deliveries remain retryable, and repeated acknowledgement is safe.
 
-7. **Validate with the CLI.** Prefer these checks after edits:
+7. **Assume at-least-once external effects.** Event dedupe is not exactly-once processing. `handle`, `onSuccess`, `onFailure`, sandbox hooks, and external agent operations can repeat after uncertain failures. Use operation-specific idempotency keys derived from stable event/session identity, never from `attempt`; reconcile current external state when providers do not support keys. Done when every external effect is safe to retry or its residual risk is explicit.
+
+8. **Validate with the CLI.** Prefer these checks after edits:
 
    ```bash
    npx simple-agent-orchestrator doctor

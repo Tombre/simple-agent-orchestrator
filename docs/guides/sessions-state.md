@@ -28,18 +28,22 @@ const id = session.get(agentSessionId);
 const id = session.getOptional(agentSessionId);
 ```
 
-## Idempotent resource creation
+## Eager resource identifiers
 
-Use `session.ensure` when a value should be created once and reused:
+Use `session.ensure` when retries and concurrent deliveries should reuse a persisted value:
 
 ```ts
 const id = await session.ensure(agentSessionId, async () => {
-  const created = await createAgentSession();
+  const created = await createAgentSession({
+    idempotencyKey: `agent-session:${session.id}`,
+  });
   return created.id;
 });
 ```
 
-This is the recommended way to store external agent session ids, worktree ids, or other durable resources.
+The returned value is persisted eagerly and survives a later failed attempt. The external creation and local write are not one transaction, so the factory can run again after an uncertain process or store failure. Make the factory retry-safe with provider idempotency or lookup-and-reconcile behavior.
+
+Ordinary `set`, `delete`, `note`, and `end` changes made by handlers or hooks persist only after the entire attempt succeeds. They are discarded when `handle`, `onSuccess`, cleanup, or final persistence fails. State mutations made during sandbox creation are a separate eager-persistence path.
 
 ## Notes
 
@@ -51,7 +55,7 @@ session.note("Sent review to agent", {
 });
 ```
 
-Notes are persisted in the store and are useful for later CLI or UI inspection.
+Notes from successful attempts are persisted in the store and are useful for later CLI or UI inspection. Notes from failed attempts are discarded.
 
 ```bash
 npx simple-agent-orchestrator sessions show <id-or-key>

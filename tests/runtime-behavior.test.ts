@@ -107,6 +107,80 @@ describe("runtime behavior", () => {
     expect(deliveries[0]).toMatchObject({ status: "processed", attempts: 2, lastError: undefined });
   });
 
+  it("retries after a success hook error and rolls back ordinary attempt changes", async () => {
+    const channel = createChannel("retry");
+    const calls: string[] = [];
+    const operationKeys: string[] = [];
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        retries: { attempts: 2 },
+        handle({ attempt, event, session }) {
+          calls.push(`handle:${attempt}`);
+          operationKeys.push(`agent-message:${event.channelId}:${event.dedupeKey}`);
+          session.set("ordinary", attempt);
+          session.note(`attempt ${attempt}`);
+        },
+        onSuccess({ attempt }) {
+          calls.push(`success:${attempt}`);
+          if (attempt === 1) throw new Error("acknowledgement uncertain");
+        },
+        onFailure({ attempt, error, session }) {
+          calls.push(`failure:${attempt}:${error instanceof Error ? error.message : String(error)}`);
+          session.set("failure-only", true);
+          session.note("failure hook note");
+          throw new Error("failure hook also failed");
+        },
+      });
+    });
+    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+    await test.dispatch("retry", { id: "event", sessionKey: "work" });
+
+    expect(calls).toEqual([
+      "handle:1",
+      "success:1",
+      "failure:1:acknowledgement uncertain",
+      "handle:2",
+      "success:2",
+    ]);
+    expect(operationKeys).toEqual([
+      "agent-message:retry:event",
+      "agent-message:retry:event",
+    ]);
+    expect(await test.sessions.get("work")).toMatchObject({
+      state: { ordinary: 2 },
+    });
+    expect(await test.sessions.notes("work")).toMatchObject([{ message: "attempt 2" }]);
+    expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({
+      status: "processed",
+      attempts: 2,
+      lastError: undefined,
+    });
+  });
+
+  it("keeps the original delivery error when the failure hook throws", async () => {
+    const channel = createChannel("retry");
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        retries: { attempts: 1 },
+        handle() {
+          throw new Error("original failure");
+        },
+        onFailure() {
+          throw new Error("secondary failure");
+        },
+      });
+    });
+    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+    await test.dispatch("retry", { id: "event" });
+
+    const delivery = (await test.events.list())[0]!.deliveries[0]!;
+    expect(delivery.status).toBe("failed");
+    expect(delivery.lastError).toContain("original failure");
+    expect(delivery.lastError).not.toContain("secondary failure");
+  });
+
   it("uses global retry attempts when a client and handler do not override them", async () => {
     const channel = createChannel("retry");
     const client = createClient("client", (builder) => {
@@ -182,6 +256,36 @@ describe("runtime behavior", () => {
       [2, "stable-id", undefined],
     ]);
     expect(await test.sessions.get("work")).toMatchObject({ state: { resource: "stable-id" } });
+  });
+
+  it("keeps ensured values after terminal failure while discarding ordinary changes and notes", async () => {
+    const channel = createChannel("retry");
+    let factoryCalls = 0;
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        retries: { attempts: 1 },
+        async handle({ session }) {
+          await session.ensure("resource", () => {
+            factoryCalls += 1;
+            return "stable-id";
+          });
+          session.set("ordinary", "discard-me");
+          session.note("discard me");
+          session.end({ reason: "discard me" });
+          throw new Error("terminal");
+        },
+      });
+    });
+    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+    await test.dispatch("retry", { id: "event", sessionKey: "work" });
+
+    expect(factoryCalls).toBe(1);
+    expect(await test.sessions.get("work")).toMatchObject({
+      status: "active",
+      state: { resource: "stable-id" },
+    });
+    expect(await test.sessions.notes("work")).toEqual([]);
   });
 
   it("manually retries only failed deliveries and grants one new attempt", async () => {

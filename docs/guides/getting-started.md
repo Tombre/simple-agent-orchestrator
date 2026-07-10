@@ -75,18 +75,20 @@ Replace the handler with your own agent integration:
 
 ```ts
 client.handle(manualChannel, async ({ event, session }) => {
-  let createdNow = false;
   const agentSessionId = await session.ensure("agent.sessionId", async () => {
-    createdNow = true;
-    const created = await createAgentSession({ initialPrompt: String(event.input) });
+    const created = await createAgentSession({
+      idempotencyKey: `agent-session:${session.id}`,
+    });
     return created.id;
   });
 
-  if (!createdNow) await sendToAgent(agentSessionId, String(event.input));
+  await sendToAgent(agentSessionId, String(event.input), {
+    idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+  });
 });
 ```
 
-The `createdNow` check prevents the first event from being sent twice when `initialPrompt` already submits it during session creation.
+Both external operations use stable keys because a later failure can retry the handler. Avoid submitting the first prompt during ensured session creation: an attempt-local `createdNow` flag cannot prevent duplicate first-event delivery after a retry.
 
 ## 7. Add real channels
 

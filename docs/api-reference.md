@@ -55,6 +55,8 @@ type PollDefinition<TRaw> = {
 
 `every` accepts milliseconds as a number or a string such as `"500ms"`, `"30s"`, `"5m"`, or `"1h"`.
 
+Poll order is `fetch`, sequential `map` and durable dispatch, `commit`, then cursor persistence. A failure rolls back cursor mutations but not events already dispatched. `commit` is an ingestion checkpoint and does not wait for handler success; use stable event dedupe keys for replay and acknowledge sources from a retry-safe, designated `onSuccess` hook. There is no event-wide hook that waits for every fan-out delivery.
+
 ## `createManualChannel(id?)`
 
 Creates a channel with no polling behavior. It is useful for CLI dispatch and tests.
@@ -114,6 +116,8 @@ client.handle(channel, {
 });
 ```
 
+Attempt order is `handle`, `onSuccess`, required sandbox cleanup, then final persistence. An error from any step fails the attempt and can rerun `handle`. `onFailure` receives the original error when a handler context exists. Its own error is logged without replacing the original; setup failures before context creation do not invoke it.
+
 ### `client.useEnvironment(environment)`
 
 Attaches an environment to the client.
@@ -161,7 +165,7 @@ session.note(message, data);
 session.end({ reason });
 ```
 
-Ordinary state changes and notes are committed when the delivery succeeds. Values created through `session.ensure` are persisted eagerly so retries reuse them.
+Ordinary handler/hook state changes, notes, and `session.end()` are committed only after the complete delivery attempt succeeds. Failed-attempt changes are discarded. Values created through `session.ensure` and state mutations made during sandbox creation are persisted eagerly so retries reuse them, but external work is not atomic with those writes and can repeat after an uncertain failure.
 
 ## `sessionKey`, `envKey`, `cursorKey`
 
@@ -215,7 +219,11 @@ environment.useSandbox({
 });
 ```
 
-The sandbox is created once per active session and reused across retries. Cleanup runs after a successful handler-driven `session.end()`. This guarantee is process-local; external create and cleanup functions should be idempotent.
+Completed sandbox creation, its state mutations, and its marker are persisted eagerly and reused across normal handler retries and restarts. Cleanup runs after `handle` and `onSuccess` when the handler called `session.end()`, and cleanup failure fails the attempt. If cleanup succeeds but final delivery persistence fails, a retry creates a new sandbox. Sandbox locking is process-local, and marker persistence is not atomic with external work, so hooks must reconcile the complete create-cleanup-recreate lifecycle by stable identity.
+
+## Delivery guarantees
+
+Processing is retryable, not exactly once. Event dedupe prevents duplicate dispatch records; it does not prevent handlers, hooks, resource operations, or source acknowledgement from repeating after a failed attempt. Use stable operation-specific external idempotency keys that do not include `attempt`. See [Failure semantics and idempotency](guides/failure-semantics.md).
 
 ## Stores
 

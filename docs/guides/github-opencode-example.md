@@ -75,7 +75,10 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
 // .simple-agent-orchestrator/environments/opencode-herdr.ts
 import { createEnvironment } from "simple-agent-orchestrator";
 import { startPersistentOpencodeServer } from "../../src/lib/opencode/server";
-import { createHerdrWorkTree, closeHerdrWorkTree } from "../../src/lib/herdr/worktrees";
+import {
+  closeHerdrWorkTreeIdempotently,
+  ensureActiveHerdrWorkTree,
+} from "../../src/lib/herdr/worktrees";
 import { herdrWorktreeId, opencodeServerUrl } from "../keys";
 
 export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (environment) => {
@@ -100,7 +103,8 @@ export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (env
         throw new Error("Expected event.meta.branch");
       }
 
-      const worktreeId = await createHerdrWorkTree({
+      const worktreeId = await ensureActiveHerdrWorkTree({
+        resourceKey: `worktree:${session.id}`,
         rootDirectory: project.root,
         sourceCheckout: "main",
         branch,
@@ -111,7 +115,7 @@ export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (env
 
     async cleanup({ session }) {
       const worktreeId = session.getOptional(herdrWorktreeId);
-      if (worktreeId) await closeHerdrWorkTree(worktreeId);
+      if (worktreeId) await closeHerdrWorkTreeIdempotently(worktreeId);
     },
   });
 });
@@ -138,25 +142,29 @@ export const codingClient = createClient("coding", (client) => {
     async handle({ event, session, environment }) {
       const serverUrl = environment.get(opencodeServerUrl);
 
-      let createdNow = false;
       const agentSessionId = await session.ensure(opencodeSessionId, async () => {
-        createdNow = true;
         const created = await createAgentSession(serverUrl, {
-          initialPrompt: String(event.input),
+          idempotencyKey: `agent-session:${session.id}`,
         });
 
         return created.id;
       });
 
-      if (!createdNow) await sendToAgent(serverUrl, agentSessionId, String(event.input));
+      await sendToAgent(serverUrl, agentSessionId, String(event.input), {
+        idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+      });
     },
 
     async onSuccess({ event }) {
-      await markReviewSeen(event.payload);
+      await markReviewSeen(event.payload, {
+        idempotencyKey: `source-ack:${event.channelId}:${event.dedupeKey}`,
+      });
     },
   });
 });
 ```
+
+The project-owned agent and source functions must honor these keys or reconcile by stable identity. A retry can rerun both `handle` and `onSuccess`; event dedupe alone does not dedupe those external operations.
 
 ## Config
 

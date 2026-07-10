@@ -99,7 +99,7 @@ export const codingClient = createClient("coding", (client) => {
     },
 
     async onSuccess({ event }) {
-      // Mark source item handled only after successful delivery.
+      // Mark the source handled with a stable idempotency key.
     },
   });
 });
@@ -128,7 +128,9 @@ import { sessionKey } from "simple-agent-orchestrator";
 const agentSessionId = sessionKey<string>("opencode.sessionId");
 
 const id = await session.ensure(agentSessionId, async () => {
-  const agentSession = await createAgentSession(serverUrl, prompt);
+  const agentSession = await createAgentSession(serverUrl, {
+    idempotencyKey: `agent-session:${session.id}`,
+  });
   return agentSession.id;
 });
 
@@ -137,7 +139,9 @@ session.note("Sent review to agent", { reviewId: event.payload.id });
 session.end({ reason: "github.pr.merged" });
 ```
 
-Use `session.ensure` when a value must be created once per session. Use an environment sandbox when an external resource also needs cleanup.
+Use `session.ensure` when retries should reuse a persisted value. Its external factory can repeat if creation succeeds before local persistence, so use provider idempotency or reconciliation. Use an environment sandbox when an external resource also needs cleanup; sandbox create and cleanup hooks have the same retry requirement.
+
+Ordinary handler/hook state, notes, and `session.end()` persist only after the complete attempt succeeds. Ensured values and state mutations made during sandbox creation persist eagerly. Cleanup followed by final-persistence failure can require sandbox recreation. Processing is retryable, not exactly once.
 
 ## Environments and sandboxes
 
@@ -167,7 +171,8 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
         throw new Error("Expected event.meta.branch");
       }
 
-      const worktreeId = await createWorktree({
+      const worktreeId = await ensureActiveWorktree({
+        resourceKey: `worktree:${session.id}`,
         rootDirectory: project.root,
         branch,
       });
@@ -176,7 +181,7 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 
     async cleanup({ session }) {
       const worktreeId = session.getOptional<string>("worktree.id");
-      if (worktreeId) await closeWorktree(worktreeId);
+      if (worktreeId) await closeWorktreeIdempotently(worktreeId);
     },
   });
 });

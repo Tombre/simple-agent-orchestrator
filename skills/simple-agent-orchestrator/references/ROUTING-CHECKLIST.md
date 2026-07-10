@@ -13,9 +13,10 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 ## Handler safety
 
 - Each handler works when it is the first event for a session.
-- Persistent external identifiers are created with `session.ensure`; resources that need cleanup use an environment sandbox.
+- Persistent external identifiers are created with `session.ensure`; resources that need cleanup use an environment sandbox. Their external factories use stable idempotency keys or reconciliation.
 - The handler does not require state created by another channel unless it can recreate or recover it.
-- External source acknowledgement happens after successful handling.
+- External source acknowledgement happens in one designated `onSuccess`, its ownership under fan-out is explicit, and it is safe to repeat.
+- Each external handler or hook operation uses a stable idempotency key that does not include `attempt`, or reconciles external state before acting.
 - Untrusted external text is separated from system/developer instructions using the target agent SDK's supported content or escaping mechanism.
 
 ## Session lifecycle
@@ -30,10 +31,12 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - Cleanup is registered through `environment.onUnmount`.
 - Sandbox creation receives `{ event, session, project, environment }`, so branch/repo metadata comes from the triggering event.
 - Sandbox cleanup checks whether the resource exists before closing it.
+- Sandbox lifecycle logic can reconcile create, cleanup, and recreate if final delivery persistence fails after cleanup.
 
 ## Queue and retries
 
 - Dedupe is not treated as successful processing.
+- Processing is not treated as exactly once; handlers, hooks, and resource operations may repeat.
 - Failed deliveries remain visible through `events list`.
 - Retry settings are explicit when the default is not enough.
 - `client.concurrency({ perSession: true })` is used when the target agent/tool cannot safely receive same-session messages concurrently.
@@ -52,9 +55,9 @@ npx simple-agent-orchestrator events list
 
 ### Duplicate external agent sessions
 
-Cause: handler used `session.get` then created the resource manually.
+Cause: external creation had no stable idempotency key, or the handler created the resource without `session.ensure`.
 
-Fix: use `session.ensure` for the durable external identifier.
+Fix: use `session.ensure` for the durable external identifier and make its factory idempotent or reconciling. `session.ensure` cannot atomically couple external creation to local persistence.
 
 ### Review routes to the wrong session
 
@@ -66,7 +69,7 @@ Fix: include all stable namespace parts in `defineKey`.
 
 Cause: source was marked handled before durable processing succeeded.
 
-Fix: move source acknowledgement to `onSuccess`.
+Fix: move source acknowledgement to `onSuccess` and make it safe to repeat.
 
 ### Config loads from the wrong package
 

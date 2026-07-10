@@ -22,6 +22,8 @@ User code owns:
 - how source APIs are called
 - how prompts are rendered
 - how agents are invoked
+- how external effects are made idempotent or reconciled
+- when and how source items are acknowledged
 - whether the agent queues messages
 - how tools are approved
 - how project-specific resources behave
@@ -42,7 +44,13 @@ Future events with the same key reuse the same active session.
 
 The runtime dedupes events when they are dispatched. A duplicate event is not enqueued twice.
 
-A delivery is only marked processed after the client handler succeeds.
+A delivery is only marked processed after the handler, success hook, required sandbox cleanup, and final persistence succeed.
+
+## Retryable, not exactly once
+
+Local delivery state cannot be committed atomically with source acknowledgement, agent calls, or other external effects. A failed attempt may therefore repeat work that completed externally. Integrations own stable external idempotency keys or reconciliation, and acknowledgement belongs after successful handling.
+
+Event dedupe is not an exactly-once processing guarantee. Abrupt crashes can currently strand `processing` deliveries because stale-claim recovery is not implemented.
 
 ## Prefer small composable primitives
 

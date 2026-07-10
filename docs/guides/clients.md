@@ -50,20 +50,30 @@ client.handle(githubReviewsChannel, {
   retries: { attempts: 5 },
 
   async handle({ event, session }) {
-    await sendToAgent(session.key, String(event.input));
+    await sendToAgent(session.key, String(event.input), {
+      idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+    });
   },
 
   async onSuccess({ event }) {
-    await markReviewSeen(event.payload);
+    await markReviewSeen(event.payload, {
+      idempotencyKey: `source-ack:${event.channelId}:${event.dedupeKey}`,
+    });
   },
 
-  async onFailure({ event, error }) {
-    console.error("Failed", event.id, error);
+  async onFailure({ event, error, logger }) {
+    logger.error("Failed delivery", { eventId: event.id, error: sanitizeError(error) });
   },
 });
 ```
 
 Retry defaults are resolved in this order: handler options, `client.retries(...)`, global config `retries`, then three attempts. Automatic retries run immediately without backoff. Manual retry accepts only a failed delivery and grants one additional attempt.
+
+The order is `handle`, `onSuccess`, required sandbox cleanup, then final success persistence. An error from any step fails the attempt and can rerun `handle`. `onFailure` receives the original error when a handler context exists; if it throws, its error is logged without replacing the original. Setup failures before the context exists do not call `onFailure`.
+
+External effects in all hooks must be retry-safe. `onSuccess` is the correct place for source acknowledgement because handling has completed, but acknowledgement can still repeat if cleanup or persistence later fails. See [Failure semantics and idempotency](failure-semantics.md).
+
+Hooks are per handler delivery. If an event fans out, designate an acknowledgement-owning handler only when its success represents the required source outcome; there is no event-wide hook that waits for every delivery. Errors and default logs are plaintext, so sanitize provider errors that may contain credentials or sensitive payloads before throwing or logging them.
 
 ## Concurrency
 

@@ -141,19 +141,19 @@ export const codingClient = createClient("coding", (client) => {
 
     async handle({ event, session, environment }) {
       const serverUrl = environment.get(opencodeServerUrl);
-      let createdNow = false;
       const agentSessionId = await session.ensure(opencodeSessionId, async () => {
-        createdNow = true;
         const agentSession = await createAgentSession(serverUrl, {
-          initialPrompt: String(event.input),
+          idempotencyKey: `agent-session:${session.id}`,
         });
         return agentSession.id;
       });
-      if (!createdNow) await sendToAgent(serverUrl, agentSessionId, event.input);
+      await sendToAgent(serverUrl, agentSessionId, event.input, {
+        idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+      });
     },
 
     async onSuccess({ event }) {
-      // Mark source item handled here, after successful delivery.
+      // Mark the source handled here with a stable idempotency key.
     },
   });
 });
@@ -164,7 +164,7 @@ export const codingClient = createClient("coding", (client) => {
 ```ts
 import { createEnvironment, envKey } from "simple-agent-orchestrator";
 import { startPersistentOpencodeServer } from "../../src/lib/opencode";
-import { createWorktree, closeWorktree } from "../../src/lib/worktrees";
+import { closeWorktreeIdempotently, ensureActiveWorktree } from "../../src/lib/worktrees";
 
 export const opencodeServerUrl = envKey<string>("opencode.serverUrl");
 
@@ -189,7 +189,8 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
         throw new Error("Expected event.meta.branch");
       }
 
-      const worktreeId = await createWorktree({
+      const worktreeId = await ensureActiveWorktree({
+        resourceKey: `worktree:${session.id}`,
         rootDirectory: project.root,
         sourceCheckout: "main",
         branch,
@@ -199,7 +200,7 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 
     async cleanup({ session }) {
       const worktreeId = session.getOptional<string>("worktree.id");
-      if (worktreeId) await closeWorktree(worktreeId);
+      if (worktreeId) await closeWorktreeIdempotently(worktreeId);
     },
   });
 });
