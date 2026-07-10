@@ -184,16 +184,21 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 
   environment.useSandbox({
     async create({ event, session, project }) {
+      const branch = event.meta?.branch;
+      if (typeof branch !== "string" || branch.trim() === "") {
+        throw new Error("Expected event.meta.branch");
+      }
+
       const worktreeId = await createWorktree({
         rootDirectory: project.root,
         sourceCheckout: "main",
-        branch: String(event.meta.branch),
+        branch,
       });
       session.set("worktree.id", worktreeId);
     },
 
     async cleanup({ session }) {
-      const worktreeId = session.get<string>("worktree.id");
+      const worktreeId = session.getOptional<string>("worktree.id");
       if (worktreeId) await closeWorktree(worktreeId);
     },
   });

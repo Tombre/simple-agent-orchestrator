@@ -46,9 +46,14 @@ A sandbox is a session-scoped resource managed by an environment.
 export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (environment) => {
   environment.useSandbox({
     async create({ session, event }) {
+      const branch = event.meta?.branch;
+      if (typeof branch !== "string" || branch.trim() === "") {
+        throw new Error("Expected event.meta.branch");
+      }
+
       const worktreeId = await createHerdrWorkTree({
         sourceCheckout: "main",
-        branch: String(event.meta?.branch),
+        branch,
         rootDirectory: "/",
       });
 

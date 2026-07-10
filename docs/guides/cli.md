@@ -26,6 +26,8 @@ npx simple-agent-orchestrator start
 
 Starts pollers and client workers.
 
+When using `jsonFileStore`, this must be the only mutating orchestrator process. Do not run CLI `dispatch`, retry, or session-end commands concurrently with it.
+
 Options:
 
 ```bash
@@ -52,6 +54,8 @@ npx simple-agent-orchestrator dispatch manual \
   --session demo \
   --input "Hello"
 ```
+
+This command dispatches the event, drains matching deliveries in the same one-shot runtime, and exits. Run it only while a long-running JSON-store runtime is stopped.
 
 Additional options:
 

@@ -24,15 +24,7 @@ npx simple-agent-orchestrator doctor
 
 `doctor` loads your config, initializes the store, validates identifiers, and prints the discovered channels and clients. It does not run environment hooks, pollers, or handlers.
 
-## 4. Start the runtime
-
-```bash
-npx simple-agent-orchestrator start
-```
-
-The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root.
-
-## 5. Dispatch a manual event
+## 4. Dispatch a manual event
 
 The default template includes a manual channel and an echo client.
 
@@ -43,7 +35,7 @@ npx simple-agent-orchestrator dispatch manual \
   --input "Hello agent runtime"
 ```
 
-Then inspect the session:
+The `dispatch` command loads the config, processes the event in a one-shot runtime, and exits. Then inspect the session:
 
 ```bash
 npx simple-agent-orchestrator sessions show demo
@@ -60,6 +52,16 @@ You should see session state like:
   }
 }
 ```
+
+## 5. Start the runtime
+
+After the manual smoke test, start the long-running runtime for polls and project-owned dispatch integrations:
+
+```bash
+npx simple-agent-orchestrator start
+```
+
+The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root. The default JSON store supports one mutating orchestrator process, so do not run CLI `dispatch`, retry, or session-end commands in another process while `start` is running.
 
 ## 6. Replace the echo client
 

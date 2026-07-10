@@ -55,12 +55,6 @@ Check the setup:
 npx simple-agent-orchestrator doctor
 ```
 
-Start the runtime:
-
-```bash
-npx simple-agent-orchestrator start
-```
-
 Send a manual event:
 
 ```bash
@@ -81,6 +75,14 @@ Show a session:
 ```bash
 npx simple-agent-orchestrator sessions show test-session
 ```
+
+The `dispatch` command processes the event in a one-shot runtime and exits. After this smoke test, start the long-running runtime for polls and project-owned dispatch integrations:
+
+```bash
+npx simple-agent-orchestrator start
+```
+
+The default JSON store supports one mutating orchestrator process. Do not run CLI `dispatch`, retry, or session-end commands in another process while `start` is running.
 
 ## Project-local config
 

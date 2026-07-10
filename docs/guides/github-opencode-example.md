@@ -95,10 +95,15 @@ export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (env
 
   environment.useSandbox({
     async create({ session, event, project }) {
+      const branch = event.meta?.branch;
+      if (typeof branch !== "string" || branch.trim() === "") {
+        throw new Error("Expected event.meta.branch");
+      }
+
       const worktreeId = await createHerdrWorkTree({
         rootDirectory: project.root,
         sourceCheckout: "main",
-        branch: String(event.meta?.branch),
+        branch,
       });
 
       session.set(herdrWorktreeId, worktreeId);

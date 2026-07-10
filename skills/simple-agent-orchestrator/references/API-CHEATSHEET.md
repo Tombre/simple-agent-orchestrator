@@ -162,15 +162,20 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 
   environment.useSandbox({
     async create({ event, session, project }) {
+      const branch = event.meta?.branch;
+      if (typeof branch !== "string" || branch.trim() === "") {
+        throw new Error("Expected event.meta.branch");
+      }
+
       const worktreeId = await createWorktree({
         rootDirectory: project.root,
-        branch: String(event.meta.branch),
+        branch,
       });
       session.set("worktree.id", worktreeId);
     },
 
     async cleanup({ session }) {
-      const worktreeId = session.get<string>("worktree.id");
+      const worktreeId = session.getOptional<string>("worktree.id");
       if (worktreeId) await closeWorktree(worktreeId);
     },
   });
@@ -201,4 +206,4 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-Use `memoryStore()` in tests. Use a stronger Store adapter for multi-process production.
+Use `memoryStore()` in tests. A custom durable store can improve persistence, but the runtime remains single-process because worker, session, poll, and sandbox coordination is process-local.
