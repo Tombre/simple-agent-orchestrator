@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createChannel, createClient } from "../src/index.js";
+import { MAX_RETRY_DELAY_MS } from "../src/utils/time.js";
 import { findConfigFile, findProjectRoot, loadProjectConfig } from "../src/runtime/project.js";
 import { createRuntime } from "./helpers.js";
 
@@ -26,6 +27,26 @@ describe("configuration validation", () => {
     });
     await expect(createRuntime({ channels: [channel], clients: [duplicateHandlers] }).then((runtime) => runtime.init())).rejects.toThrow(
       "Duplicate handler id for client client: same",
+    );
+  });
+
+  it("rejects invalid retry delays before runtime work starts", async () => {
+    const channel = createChannel("retry");
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, { retries: { delay: "later" }, handle() {} });
+    });
+
+    await expect(createRuntime({ channels: [channel], clients: [client] }).then((runtime) => runtime.init())).rejects.toThrow(
+      "Invalid duration string: later",
+    );
+    await expect(createRuntime({ retries: { delay: -1 } }).then((runtime) => runtime.init())).rejects.toThrow(
+      "Invalid duration: -1",
+    );
+    await expect(createRuntime({ retries: { delay: MAX_RETRY_DELAY_MS + 1 } }).then((runtime) => runtime.init())).rejects.toThrow(
+      "exceeds the supported range",
+    );
+    await expect(createRuntime({ retries: { delay: `${MAX_RETRY_DELAY_MS}.1ms` } }).then((runtime) => runtime.init())).rejects.toThrow(
+      "exceeds the supported range",
     );
   });
 

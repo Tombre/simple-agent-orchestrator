@@ -32,7 +32,7 @@ const session = await test.sessions.get("session-1");
 expect(session?.state.count).toBe(1);
 ```
 
-The test runtime uses the memory store and drains deliveries immediately after dispatch.
+The test runtime uses the memory store and drains currently eligible deliveries after dispatch. It does not wait for a configured future retry time; inspect `nextAttemptAt`, advance the stored/test clock as appropriate, and call `test.runtime.drain()` again when testing delayed retries.
 
 Test failure paths as well as successful persistence. In particular, verify that ordinary state and notes from a failed attempt disappear, ensured values remain, and repeated external calls receive the same idempotency key. A dedupe test alone does not prove external processing is exactly once.
 

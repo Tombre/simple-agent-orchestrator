@@ -126,6 +126,27 @@ describe("CLI", () => {
     expect(await readFile(stateFile, "utf8")).toBe(malformed);
   });
 
+  it("shows retry budgets and delayed eligibility in event inspection", async () => {
+    const { root, stateFile } = await createFixture();
+    await runCli("dispatch", "manual", "--root", root, "--id", "failure", "--input", "fail");
+    const state = JSON.parse(await readFile(stateFile, "utf8")) as {
+      deliveries: { status: string; maxAttempts: number; retryDelayMs: number; nextAttemptAt?: string }[];
+    };
+    const nextAttemptAt = new Date(Date.now() + 60_000).toISOString();
+    Object.assign(state.deliveries[0]!, {
+      status: "pending",
+      maxAttempts: 2,
+      retryDelayMs: 60_000,
+      nextAttemptAt,
+    });
+    await writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    const output = await runCli("events", "list", "--root", root);
+
+    expect(output).toContain("1/2");
+    expect(output).toContain(nextAttemptAt);
+  });
+
   it("rejects offline mutations before writing while allowing inspection during an active runtime", async () => {
     const { root, stateFile } = await createFixture();
     await runCli("dispatch", "manual", "--root", root, "--id", "success", "--session", "work-1", "--input", "hello");

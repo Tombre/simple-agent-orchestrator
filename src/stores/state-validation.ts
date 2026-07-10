@@ -5,8 +5,9 @@ import type {
   StoredEvent,
   StoredSession,
 } from "../core/types.js";
+import { isSupportedRetryDelay } from "../utils/time.js";
 
-export const CURRENT_STATE_VERSION = 2 as const;
+export const CURRENT_STATE_VERSION = 3 as const;
 export const MINIMUM_STATE_VERSION = 1 as const;
 const MAX_JSON_NESTING_DEPTH = 100;
 
@@ -98,6 +99,11 @@ function requireInteger(value: unknown, path: string, minimum: number, source: s
   }
 }
 
+function requireTimestamp(value: unknown, path: string, source: string): asserts value is string {
+  requireString(value, path, source);
+  if (!Number.isFinite(Date.parse(value))) failure("invalid-state", source, `${path} must be a valid timestamp.`);
+}
+
 function requireJsonValue(
   value: unknown,
   path: string,
@@ -174,13 +180,17 @@ function validateEvent(value: unknown, index: number, source: string): asserts v
   if (value.meta !== undefined) requireJsonRecord(value.meta, `${path}.meta`, source);
 }
 
-function validateDelivery(value: unknown, index: number, source: string): asserts value is StoredDelivery {
+function validateDelivery(value: unknown, index: number, source: string, historical = false): asserts value is StoredDelivery {
   const path = `state.deliveries[${index}]`;
   requireRecord(value, path, source);
   requireFields(
     value,
-    ["id", "eventId", "channelId", "clientId", "handlerId", "status", "attempts", "maxAttempts", "createdAt", "updatedAt"],
-    ["startedAt", "processedAt", "lastError", "sessionId"],
+    [
+      "id", "eventId", "channelId", "clientId", "handlerId", "status", "attempts", "maxAttempts",
+      ...(historical ? [] : ["retryDelayMs"]),
+      "createdAt", "updatedAt",
+    ],
+    ["startedAt", "processedAt", "lastError", "sessionId", ...(historical ? [] : ["nextAttemptAt"])],
     path,
     source,
   );
@@ -192,6 +202,12 @@ function validateDelivery(value: unknown, index: number, source: string): assert
   }
   requireInteger(value.attempts, `${path}.attempts`, 0, source);
   requireInteger(value.maxAttempts, `${path}.maxAttempts`, 1, source);
+  if (!historical) {
+    requireInteger(value.retryDelayMs, `${path}.retryDelayMs`, 0, source);
+    if (!isSupportedRetryDelay(value.retryDelayMs)) {
+      failure("invalid-state", source, `${path}.retryDelayMs exceeds the supported range.`);
+    }
+  }
   if (value.attempts > value.maxAttempts) {
     failure("invalid-state", source, `${path}.attempts cannot exceed ${path}.maxAttempts.`);
   }
@@ -206,6 +222,15 @@ function validateDelivery(value: unknown, index: number, source: string): assert
   }
   for (const field of ["startedAt", "processedAt", "lastError", "sessionId"] as const) {
     optionalString(value, field, path, source);
+  }
+  if (!historical && value.nextAttemptAt !== undefined) {
+    requireTimestamp(value.nextAttemptAt, `${path}.nextAttemptAt`, source);
+    if (value.status !== "pending") {
+      failure("invalid-state", source, `${path}.nextAttemptAt is only valid for pending deliveries.`);
+    }
+    if (value.attempts === 0 || value.retryDelayMs === 0) {
+      failure("invalid-state", source, `${path}.nextAttemptAt requires a delayed retry attempt.`);
+    }
   }
 }
 
@@ -308,14 +333,20 @@ export function validateAndMigrateState(value: unknown, source = "state"): Orche
   requireArray(value.notes, "state.notes", source);
   value.sessions.forEach((session, index) => validateSession(session, index, source));
   value.events.forEach((event, index) => validateEvent(event, index, source));
-  value.deliveries.forEach((delivery, index) => validateDelivery(delivery, index, source));
+  const deliveries = version < CURRENT_STATE_VERSION
+    ? value.deliveries.map((delivery, index) => {
+        validateDelivery(delivery, index, source, true);
+        return { ...delivery, retryDelayMs: 0 };
+      })
+    : value.deliveries;
+  deliveries.forEach((delivery, index) => validateDelivery(delivery, index, source));
   value.notes.forEach((note, index) => validateNote(note, index, source));
   requireRecord(value.cursors, "state.cursors", source);
   for (const [cursorId, cursor] of Object.entries(value.cursors)) {
     requireJsonRecord(cursor, `state.cursors.${cursorId}`, source);
   }
 
-  const state = { ...value, version: CURRENT_STATE_VERSION } as unknown as OrchestratorState;
+  const state = { ...value, version: CURRENT_STATE_VERSION, deliveries } as unknown as OrchestratorState;
   validateRelationships(state, source);
   return state;
 }

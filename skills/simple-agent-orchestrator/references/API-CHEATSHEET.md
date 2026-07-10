@@ -89,7 +89,7 @@ import { createClient } from "simple-agent-orchestrator";
 export const codingClient = createClient("coding", (client) => {
   client.useEnvironment(opencodeEnvironment);
   client.concurrency({ workers: 2, perSession: true });
-  client.retries({ attempts: 3 });
+  client.retries({ attempts: 3, delay: "5s" });
 
   client.handle(githubReviewsChannel, {
     id: "coding.githubReviews",
@@ -104,6 +104,8 @@ export const codingClient = createClient("coding", (client) => {
   });
 });
 ```
+
+Retry `attempts` and fixed `delay` resolve independently from handler options, client defaults, global config, then built-ins (`3` and `0`). Numbers are milliseconds; strings accept `ms`, `s`, `m`, and `h`. Positive fractions round up to one millisecond; the maximum is `2_147_483_647` ms (about 24.9 days). Delayed retries stay durably pending with `nextAttemptAt`. Normal workers wait for eligibility, while drains return without waiting; manual retry and interrupted-attempt recovery are immediate.
 
 Handler context:
 
@@ -213,6 +215,6 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 2 is current; valid version 1 state is upgraded in memory and persisted by the next successful write, while invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
+Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 3 is current; valid version 1 and 2 state is upgraded in memory with immediate retry defaults and persisted by the next successful write, while invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
 
 The JSON store rejects a second active runtime or offline operation for the same state file and reclaims ownership left by a dead PID. Atomic first-run initialization and runtime ownership require a local filesystem with atomic hard-link support and fail explicitly when unavailable. CLI `dispatch`, `sessions end`, and `events retry` acquire ownership and fail before writing while `start` is active; inspection commands remain available. Direct library mutations require an explicit `runtime.runOffline(...)` scope. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.

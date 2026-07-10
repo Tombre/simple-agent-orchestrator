@@ -116,8 +116,10 @@ export interface StoredDelivery {
   status: DeliveryStatus;
   attempts: number;
   maxAttempts: number;
+  retryDelayMs: number;
   createdAt: string;
   updatedAt: string;
+  nextAttemptAt?: string | undefined;
   startedAt?: string | undefined;
   processedAt?: string | undefined;
   lastError?: string | undefined;
@@ -133,7 +135,7 @@ export interface SessionNote {
 }
 
 export interface OrchestratorState {
-  version: 2;
+  version: 3;
   sessions: StoredSession[];
   events: StoredEvent[];
   deliveries: StoredDelivery[];
@@ -150,6 +152,7 @@ export interface Logger {
 
 export interface RetryOptions {
   attempts?: number;
+  delay?: number | string;
 }
 
 export interface ConcurrencyOptions {

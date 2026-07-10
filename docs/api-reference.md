@@ -25,7 +25,14 @@ type OrchestratorConfig = {
   logger?: Logger;
   retries?: RetryOptions;
 };
+
+type RetryOptions = {
+  attempts?: number;
+  delay?: number | string;
+};
 ```
+
+`attempts` counts the first attempt and defaults to `3`. `delay` is a fixed wait between failed automatic attempts; it accepts milliseconds or the same `ms`, `s`, `m`, and `h` strings as poll intervals and defaults to `0`. Positive fractional values round up to one whole millisecond. The maximum is `2_147_483_647` ms (about 24.9 days).
 
 ## `createChannel(id, setup?)`
 
@@ -93,6 +100,7 @@ Creates a delivery consumer.
 
 ```ts
 const client = createClient("coding", (client) => {
+  client.retries({ attempts: 3, delay: "5s" });
   client.handle(githubReviewsChannel, handleReview);
 });
 ```
@@ -109,7 +117,7 @@ client.handle(channel, async ({ event, session }) => {
 
 ```ts
 client.handle(channel, {
-  retries: { attempts: 5 },
+  retries: { attempts: 5, delay: "30s" },
   async handle(ctx) {},
   async onSuccess(ctx) {},
   async onFailure({ error }) {},
@@ -117,6 +125,8 @@ client.handle(channel, {
 ```
 
 Attempt order is `handle`, `onSuccess`, required sandbox cleanup, then final persistence. An error from any step fails the attempt and can rerun `handle`. `onFailure` receives the original error when a handler context exists. Its own error is logged without replacing the original; setup failures before context creation do not invoke it.
+
+Retry fields resolve independently in handler, client, global-config, then built-in order. The first attempt is immediate. A positive delay is captured on each delivery and stores the next eligibility time after a failed nonterminal attempt. Delayed work remains `pending`; normal workers process it after eligibility, including across restarts. `drain()` and `start({ drain: true })` process only currently eligible work and do not wait. Manual retry and interrupted-attempt recovery are immediately eligible.
 
 ### `client.useEnvironment(environment)`
 
@@ -225,6 +235,8 @@ Completed sandbox creation, its state mutations, and its marker are persisted ea
 
 Processing is retryable, not exactly once. Event dedupe prevents duplicate dispatch records; it does not prevent handlers, hooks, resource operations, or source acknowledgement from repeating after a failed attempt. Use stable operation-specific external idempotency keys that do not include `attempt`. See [Failure semantics and idempotency](guides/failure-semantics.md).
 
+`StoredDelivery.retryDelayMs` records the resolved fixed delay. A pending delivery with `nextAttemptAt` is delayed until that durable timestamp; `listEvents()` and `events list` expose it for inspection.
+
 ## Stores
 
 ### `memoryStore(initial?)`
@@ -239,7 +251,7 @@ Persistent JSON-file store.
 jsonFileStore(project.statePath("state.json"));
 ```
 
-The current state version is `CURRENT_STATE_VERSION` (`2`), and `MINIMUM_STATE_VERSION` is `1`. JSON reads and writes validate the complete snapshot, including entity shapes, statuses, retry counters, unique IDs, references, cursor records, and JSON-safe durable values up to 100 nested levels. A valid version 1 snapshot is deterministically migrated in memory; read-only inspection leaves the file unchanged, while the next successful write persists version 2. Missing files are initialized with a current empty snapshot. Invalid JSON, invalid state, versions older than 1, and versions newer than 2 throw `StateValidationError` without replacing the file. Its `code` is `invalid-json`, `invalid-state`, or `unsupported-version`.
+The current state version is `CURRENT_STATE_VERSION` (`3`), and `MINIMUM_STATE_VERSION` is `1`. JSON reads and writes validate the complete snapshot, including entity shapes, statuses, retry counters and eligibility, unique IDs, references, cursor records, and JSON-safe durable values up to 100 nested levels. Valid version 1 and 2 snapshots are deterministically migrated in memory with `retryDelayMs: 0`; read-only inspection leaves the file unchanged, while the next successful write persists version 3. Missing files are initialized with a current empty snapshot. Invalid JSON, invalid state, versions older than 1, and versions newer than 3 throw `StateValidationError` without replacing the file. Its `code` is `invalid-json`, `invalid-state`, or `unsupported-version`.
 
 `validateAndMigrateState(value, source?)` is available for custom stores that decode untrusted persisted data. It returns a validated current `OrchestratorState` or throws `StateValidationError`. Custom `Store.read()` implementations are responsible for returning a valid current snapshot.
 
@@ -271,6 +283,8 @@ await runtime.start();
 ```
 
 Each runtime instance has one lifecycle. `start()` may be called once; duplicate starts, a start after direct draining, and restart after `stop()` or failed startup are rejected. A direct `drain()` claims the runtime for draining and may be repeated sequentially until `stop()`, but overlapping drains are rejected. `stop()` rejects while startup or a drain is in progress, shares cleanup across concurrent calls, and is otherwise idempotent. Create a fresh runtime rather than attempting to restart a stopped instance.
+
+A drain stops when no delivery is currently eligible. It never sleeps for a future `nextAttemptAt`; delayed work remains durable for a later drain or for workers started by normal `start()`.
 
 Runtime initialization reads state before attaching channels or starting work. Invalid state therefore rejects startup before polls, environment hooks, recovery, or handlers run. If startup otherwise fails after mounting resources or creating pollers, the runtime aborts in-flight work, clears intervals, unmounts environments, and releases store ownership before rejecting. Environments are unmounted in reverse mount order, their hooks run in reverse registration order, and cleanup continues after a hook fails. A later `stop()` retries only failed unmount hooks. When startup and shutdown both fail, the runtime throws an `AggregateError` containing both failures.
 
@@ -324,3 +338,5 @@ await test.dispatch("manual", { id: "1", sessionKey: "demo", input: "hello" });
 const session = await test.sessions.get("demo");
 const notes = await test.sessions.notes("demo");
 ```
+
+The test harness drains currently eligible work after dispatch. With a positive retry delay, inspect the pending delivery and invoke `test.runtime.drain()` again after advancing its eligibility; the harness does not wait for future retry times.

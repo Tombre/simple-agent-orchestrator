@@ -22,7 +22,7 @@ import { memoryStore, type Store } from "../stores/index.js";
 import { StoreMutex } from "../stores/store.js";
 import { newId } from "../utils/id.js";
 import { consoleLogger } from "../utils/logger.js";
-import { nowIso, parseDuration } from "../utils/time.js";
+import { isSupportedRetryDelay, MAX_DATE_TIMESTAMP, nowIso, parseDuration } from "../utils/time.js";
 import { acquireRuntimeOwnership, type RuntimeOwnership } from "./ownership.js";
 
 export interface RuntimeOptions {
@@ -46,18 +46,27 @@ interface ClaimedDelivery {
   client: ClientDefinition;
 }
 
+function parseRetryDelay(value: number | string): number {
+  const duration = parseDuration(value);
+  const normalized = duration > 0 ? Math.ceil(duration) : 0;
+  if (!isSupportedRetryDelay(normalized)) {
+    throw new Error(`Invalid retry delay: ${String(value)} exceeds the supported range`);
+  }
+  return normalized;
+}
+
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(new Error("Aborted"));
   return new Promise((resolveDelay, reject) => {
-    const timer = setTimeout(resolveDelay, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(new Error("Aborted"));
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolveDelay();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -315,6 +324,7 @@ export class OrchestratorRuntime {
             status: "pending",
             attempts: 0,
             maxAttempts: Math.max(1, handler.retries.attempts ?? this.options.config.retries?.attempts ?? 3),
+            retryDelayMs: parseRetryDelay(handler.retries.delay ?? this.options.config.retries?.delay ?? 0),
             createdAt: nowIso(),
             updatedAt: nowIso(),
           });
@@ -378,6 +388,7 @@ export class OrchestratorRuntime {
       delivery.maxAttempts = Math.max(delivery.maxAttempts, delivery.attempts + 1);
       delivery.lastError = undefined;
       delivery.processedAt = undefined;
+      delivery.nextAttemptAt = undefined;
       delivery.updatedAt = nowIso();
       await this.store.write(state);
       return true;
@@ -438,6 +449,7 @@ export class OrchestratorRuntime {
         delivery.status = "pending";
         delivery.maxAttempts = Math.max(delivery.maxAttempts, delivery.attempts + 1);
         delivery.lastError = `Interrupted during attempt ${delivery.attempts}; recovered before processing resumed. Handler and external effects may run again.`;
+        delivery.nextAttemptAt = undefined;
         delivery.updatedAt = recoveredAt;
       }
       await this.store.write(state);
@@ -573,6 +585,7 @@ export class OrchestratorRuntime {
       for (const delivery of state.deliveries) {
         if (delivery.clientId !== client.id) continue;
         if (delivery.status !== "pending") continue;
+        if (delivery.nextAttemptAt !== undefined && Date.parse(delivery.nextAttemptAt) > Date.now()) continue;
         const event = state.events.find((candidate) => candidate.id === delivery.eventId);
         if (!event) continue;
         if (client.concurrencyOptions.perSession && this.processingSessionKeys.has(event.sessionKey)) continue;
@@ -581,8 +594,10 @@ export class OrchestratorRuntime {
 
         delivery.status = "processing";
         delivery.attempts += 1;
-        delivery.startedAt = nowIso();
-        delivery.updatedAt = nowIso();
+        delivery.nextAttemptAt = undefined;
+        const claimedAt = nowIso();
+        delivery.startedAt = claimedAt;
+        delivery.updatedAt = claimedAt;
         await this.store.write(state);
         if (client.concurrencyOptions.perSession) this.processingSessionKeys.add(event.sessionKey);
         return { delivery: { ...delivery }, event: { ...event }, handler, client };
@@ -729,6 +744,7 @@ export class OrchestratorRuntime {
         delivery.processedAt = nowIso();
         delivery.updatedAt = nowIso();
         delivery.lastError = undefined;
+        delivery.nextAttemptAt = undefined;
       }
       await this.store.write(state);
     });
@@ -740,9 +756,17 @@ export class OrchestratorRuntime {
       const state = await this.store.read();
       const delivery = state.deliveries.find((candidate) => candidate.id === deliveryId);
       if (delivery) {
-        delivery.status = delivery.attempts >= delivery.maxAttempts ? "failed" : "pending";
+        const failedAt = Date.now();
+        const exhausted = delivery.attempts >= delivery.maxAttempts;
+        delivery.status = exhausted ? "failed" : "pending";
+        if (!exhausted && delivery.retryDelayMs > 0) {
+          const retryAt = Math.min(MAX_DATE_TIMESTAMP, failedAt + delivery.retryDelayMs);
+          delivery.nextAttemptAt = new Date(retryAt).toISOString();
+        } else {
+          delivery.nextAttemptAt = undefined;
+        }
         delivery.lastError = formatError(error);
-        delivery.updatedAt = nowIso();
+        delivery.updatedAt = new Date(failedAt).toISOString();
       }
       await this.store.write(state);
     });
@@ -867,8 +891,13 @@ export class OrchestratorRuntime {
   private validateConfiguration(): void {
     this.assertUnique(this.channels.map(({ id }) => id), "channel");
     this.assertUnique(this.clients.map(({ id }) => id), "client");
+    if (this.options.config.retries?.delay !== undefined) parseRetryDelay(this.options.config.retries.delay);
     for (const client of this.clients) {
       this.assertUnique(client.handlers.map(({ id }) => id), "handler", ` for client ${client.id}`);
+      if (client.retryOptions.delay !== undefined) parseRetryDelay(client.retryOptions.delay);
+      for (const handler of client.handlers) {
+        if (handler.retries.delay !== undefined) parseRetryDelay(handler.retries.delay);
+      }
     }
   }
 

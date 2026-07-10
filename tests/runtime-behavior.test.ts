@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { createChannel, createClient, type OrchestratorEvent } from "../src/index.js";
+import { createChannel, createClient, memoryStore, type OrchestratorEvent } from "../src/index.js";
 import { createTestRuntime } from "../src/testing/index.js";
+import { MAX_RETRY_DELAY_MS } from "../src/utils/time.js";
 
 describe("runtime behavior", () => {
   it("preserves event fields, scopes dedupe by channel, and fans out to every client", async () => {
@@ -224,6 +225,110 @@ describe("runtime behavior", () => {
       "handler-override": 4,
       "global-default": 5,
     });
+  });
+
+  it("resolves retry attempts and delay independently across handler, client, and global defaults", async () => {
+    const channel = createChannel("retry");
+    const client = createClient("client", (builder) => {
+      builder.retries({ attempts: 2, delay: "2s" });
+      builder.handle(channel, { id: "client-default", handle() {} });
+      builder.handle(channel, { id: "handler-delay", retries: { delay: "3s" }, handle() {} });
+      builder.handle(channel, { id: "handler-attempts", retries: { attempts: 4 }, handle() {} });
+    });
+    const globalClient = createClient("global", (builder) => {
+      builder.handle(channel, { id: "global-default", handle() {} });
+    });
+    const test = await createTestRuntime({
+      config: {
+        channels: [channel],
+        clients: [client, globalClient],
+        retries: { attempts: 5, delay: "5s" },
+      },
+    });
+
+    await test.dispatch("retry", { id: "event" });
+
+    const deliveries = (await test.events.list())[0]!.deliveries;
+    expect(Object.fromEntries(deliveries.map(({ handlerId, maxAttempts, retryDelayMs }) => [
+      handlerId,
+      { maxAttempts, retryDelayMs },
+    ]))).toEqual({
+      "client-default": { maxAttempts: 2, retryDelayMs: 2_000 },
+      "handler-delay": { maxAttempts: 2, retryDelayMs: 3_000 },
+      "handler-attempts": { maxAttempts: 4, retryDelayMs: 2_000 },
+      "global-default": { maxAttempts: 5, retryDelayMs: 5_000 },
+    });
+  });
+
+  it("leaves future retries pending until a later drain observes their eligibility", async () => {
+    const channel = createChannel("retry");
+    const store = memoryStore();
+    const attempts: number[] = [];
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        retries: { attempts: 2, delay: "1h" },
+        handle({ attempt }) {
+          attempts.push(attempt);
+          if (attempt === 1) throw new Error("transient");
+        },
+      });
+    });
+    const test = await createTestRuntime({ config: { channels: [channel], clients: [client], store } });
+
+    await test.dispatch("retry", { id: "event" });
+
+    const delayed = (await test.events.list())[0]!.deliveries[0]!;
+    expect(attempts).toEqual([1]);
+    expect(delayed).toMatchObject({ status: "pending", attempts: 1, retryDelayMs: 3_600_000 });
+    expect(Date.parse(delayed.nextAttemptAt!)).toBeGreaterThan(Date.now());
+
+    const state = await store.read();
+    state.deliveries[0]!.nextAttemptAt = new Date(0).toISOString();
+    await store.write(state);
+    await test.runtime.drain();
+
+    expect(attempts).toEqual([1, 2]);
+    expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({
+      status: "processed",
+      attempts: 2,
+      nextAttemptAt: undefined,
+    });
+  });
+
+  it("persists failure eligibility for the maximum supported retry delay", async () => {
+    const channel = createChannel("retry");
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        retries: { attempts: 2, delay: `${MAX_RETRY_DELAY_MS}ms` },
+        handle() {
+          throw new Error("transient");
+        },
+      });
+    });
+    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+    await test.dispatch("retry", { id: "event" });
+
+    const delivery = (await test.events.list())[0]!.deliveries[0]!;
+    expect(delivery).toMatchObject({
+      status: "pending",
+      attempts: 1,
+      retryDelayMs: MAX_RETRY_DELAY_MS,
+    });
+    expect(Date.parse(delivery.nextAttemptAt!) - Date.parse(delivery.updatedAt)).toBe(MAX_RETRY_DELAY_MS);
+  });
+
+  it("rounds positive fractional retry delays up to one millisecond", async () => {
+    const channel = createChannel("retry");
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, { id: "number", retries: { delay: 0.1 }, handle() {} });
+      builder.handle(channel, { id: "string", retries: { delay: "0.5ms" }, handle() {} });
+    });
+    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+
+    await test.dispatch("retry", { id: "event" });
+
+    expect((await test.events.list())[0]!.deliveries.map(({ retryDelayMs }) => retryDelayMs)).toEqual([1, 1]);
   });
 
   it("persists ensured values but rolls back ordinary state after a failed attempt", async () => {

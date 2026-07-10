@@ -10,6 +10,7 @@ import {
 } from "../src/index.js";
 import { emptyState } from "../src/stores/store.js";
 import { initializeJsonStateFile } from "../src/stores/json-file.js";
+import { MAX_RETRY_DELAY_MS } from "../src/utils/time.js";
 
 describe("stores", () => {
   it("isolates reads and writes in memory", async () => {
@@ -90,22 +91,72 @@ describe("stores", () => {
     expect(await readFile(path, "utf8")).toBe(raw);
   });
 
-  it("deterministically upgrades a valid version 1 fixture without changing durable data", async () => {
+  it("deterministically upgrades historical fixtures with immediate retry defaults", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-store-"));
+    const fixturePath = join(import.meta.dirname, "fixtures", "state", "version-1.json");
+    const fixture = JSON.parse(await readFile(fixturePath, "utf8")) as Record<string, unknown>;
+    const historicalDeliveries = fixture.deliveries as Record<string, unknown>[];
+
+    for (const version of [1, 2]) {
+      const path = join(root, `state-v${version}.json`);
+      const historical = { ...fixture, version };
+      const raw = JSON.stringify(historical, null, 2);
+      await writeFile(path, raw, "utf8");
+
+      const migrated = await jsonFileStore(path).read();
+
+      expect(migrated).toEqual({
+        ...historical,
+        version: CURRENT_STATE_VERSION,
+        deliveries: historicalDeliveries.map((delivery) => ({
+          ...delivery,
+          retryDelayMs: 0,
+        })),
+      });
+      expect(await jsonFileStore(path).read()).toEqual(migrated);
+      expect(await readFile(path, "utf8")).toBe(raw);
+
+      await jsonFileStore(path).write(migrated);
+      expect((JSON.parse(await readFile(path, "utf8")) as { version: number }).version).toBe(CURRENT_STATE_VERSION);
+    }
+  });
+
+  it.each([
+    ["negative retry delay", { retryDelayMs: -1 }, "retryDelayMs must be an integer"],
+    ["fractional retry delay", { retryDelayMs: 0.5 }, "retryDelayMs must be an integer"],
+    ["retry delay outside the supported range", { retryDelayMs: MAX_RETRY_DELAY_MS + 1 }, "exceeds the supported range"],
+    ["invalid eligibility timestamp", { retryDelayMs: 1, nextAttemptAt: "later" }, "nextAttemptAt must be a valid timestamp"],
+    ["eligibility on terminal work", { status: "failed", attempts: 2, retryDelayMs: 1, nextAttemptAt: new Date(0).toISOString() }, "only valid for pending"],
+  ])("rejects %s", async (_name, overrides, message) => {
     const root = await mkdtemp(join(tmpdir(), "sao-store-"));
     const path = join(root, "state.json");
-    const fixturePath = join(import.meta.dirname, "fixtures", "state", "version-1.json");
-    const raw = await readFile(fixturePath, "utf8");
-    const versionOne = JSON.parse(raw) as Record<string, unknown>;
-    await writeFile(path, raw, "utf8");
+    const state = {
+      ...emptyState(),
+      events: [{
+        id: "event",
+        channelId: "manual",
+        sourceId: "source",
+        dedupeKey: "manual:source",
+        sessionKey: "session",
+        receivedAt: "now",
+      }],
+      deliveries: [{
+        id: "delivery",
+        eventId: "event",
+        channelId: "manual",
+        clientId: "client",
+        handlerId: "handler",
+        status: "pending",
+        attempts: 1,
+        maxAttempts: 2,
+        createdAt: "now",
+        updatedAt: "now",
+        ...overrides,
+      }],
+    };
 
-    const migrated = await jsonFileStore(path).read();
-
-    expect(migrated).toEqual({ ...versionOne, version: CURRENT_STATE_VERSION });
-    expect(await jsonFileStore(path).read()).toEqual(migrated);
-    expect(await readFile(path, "utf8")).toBe(raw);
-
-    await jsonFileStore(path).write(migrated);
-    expect((JSON.parse(await readFile(path, "utf8")) as { version: number }).version).toBe(CURRENT_STATE_VERSION);
+    await writeFile(path, JSON.stringify(state), "utf8");
+    await expect(jsonFileStore(path).read()).rejects.toThrow(message);
   });
 
   it.each([
@@ -127,6 +178,7 @@ describe("stores", () => {
           status: "waiting",
           attempts: 0,
           maxAttempts: 1,
+          retryDelayMs: 0,
           createdAt: "now",
           updatedAt: "now",
         }],
@@ -162,6 +214,7 @@ describe("stores", () => {
           status: "pending",
           attempts: 1,
           maxAttempts: 1,
+          retryDelayMs: 0,
           createdAt: "now",
           updatedAt: "now",
         }],
@@ -204,6 +257,7 @@ describe("stores", () => {
           status: "pending",
           attempts: 0,
           maxAttempts: 1,
+          retryDelayMs: 0,
           createdAt: "now",
           updatedAt: "now",
         })),
@@ -232,6 +286,7 @@ describe("stores", () => {
           status: "pending",
           attempts: 0,
           maxAttempts: 1,
+          retryDelayMs: 0,
           createdAt: "now",
           updatedAt: "now",
           sessionId: "session",

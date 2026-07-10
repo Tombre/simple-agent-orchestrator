@@ -208,7 +208,7 @@ describe("resource lifecycle", () => {
     const channel = createChannel("recovery");
     const attempts: number[] = [];
     const client = createClient("client", (builder) => {
-      builder.retries({ attempts: 1 });
+      builder.retries({ attempts: 1, delay: "1h" });
       builder.handle(channel, ({ attempt }) => {
         attempts.push(attempt);
       });
@@ -221,6 +221,7 @@ describe("resource lifecycle", () => {
       status: "processing",
       attempts: 1,
       maxAttempts: 1,
+      retryDelayMs: 3_600_000,
     });
     await interruptedRuntime.stop();
 
@@ -246,7 +247,9 @@ describe("resource lifecycle", () => {
       status: "processed",
       attempts: 2,
       maxAttempts: 2,
+      retryDelayMs: 3_600_000,
     });
+    expect(recoveredDelivery).not.toHaveProperty("nextAttemptAt");
     expect(recoveredDelivery.lastError).toBeUndefined();
     expect(warnings).toEqual([
       {
@@ -309,6 +312,49 @@ describe("resource lifecycle", () => {
       attempts: 3,
       maxAttempts: 3,
     });
+  });
+
+  it("preserves delayed retry eligibility across runtime restarts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-retry-delay-"));
+    const statePath = join(root, "state.json");
+    const channel = createChannel("retry");
+    const attempts: number[] = [];
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        retries: { attempts: 2, delay: "1h" },
+        handle({ attempt }) {
+          attempts.push(attempt);
+          if (attempt === 1) throw new Error("transient");
+        },
+      });
+    });
+    const first = await createRuntime({ channels: [channel], clients: [client], store: jsonFileStore(statePath) });
+    await first.dispatch("retry", { id: "event" });
+    await first.drain();
+    await first.stop();
+
+    const delayed = (await jsonFileStore(statePath).read()).deliveries[0]!;
+    expect(delayed).toMatchObject({ status: "pending", attempts: 1, retryDelayMs: 3_600_000 });
+    expect(Date.parse(delayed.nextAttemptAt!)).toBeGreaterThan(Date.now());
+
+    const secondStore = jsonFileStore(statePath);
+    const second = await createRuntime({ channels: [channel], clients: [client], store: secondStore });
+    await second.drain();
+    expect(attempts).toEqual([1]);
+
+    const dueState = await secondStore.read();
+    dueState.deliveries[0]!.nextAttemptAt = new Date(0).toISOString();
+    await secondStore.write(dueState);
+    await second.drain();
+    await second.stop();
+
+    expect(attempts).toEqual([1, 2]);
+    const processed = (await jsonFileStore(statePath).read()).deliveries[0]!;
+    expect(processed).toMatchObject({
+      status: "processed",
+      attempts: 2,
+    });
+    expect(processed).not.toHaveProperty("nextAttemptAt");
   });
 
   it("recovers through an offline drain and exposes the interrupted attempt while processing", async () => {
@@ -708,6 +754,7 @@ describe("resource lifecycle", () => {
         status: "pending",
         attempts: 1,
         maxAttempts: 1,
+        retryDelayMs: 0,
         createdAt: "now",
         updatedAt: "now",
       }],

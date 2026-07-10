@@ -87,7 +87,7 @@ Show a session:
 npx simple-agent-orchestrator sessions show test-session
 ```
 
-The `dispatch` command processes the event in a one-shot runtime and exits. After this smoke test, start the long-running runtime for polls and project-owned dispatch integrations:
+The `dispatch` command processes currently eligible work in a one-shot runtime and exits. A configured delayed retry remains durably pending for a later drain or long-running runtime. After this smoke test, start the long-running runtime for polls and project-owned dispatch integrations:
 
 ```bash
 npx simple-agent-orchestrator start
@@ -171,6 +171,8 @@ export const githubReviewsChannel = createChannel(
 );
 
 export const codingClient = createClient("coding", (client) => {
+  client.retries({ attempts: 3, delay: "5s" });
+
   client.handle(githubReviewsChannel, async ({ event, session }) => {
     const id = await session.ensure(agentSessionId, async () => {
       const created = await createAgentSession({
@@ -200,7 +202,7 @@ An event is the durable unit of input. Events have a source `id`, optional `dedu
 
 A delivery is a client/handler-specific attempt to process an event. One event can be delivered to multiple clients.
 
-Delivery processing is retryable, not exactly once. A later failure or restart recovery can repeat handlers, hooks, and external effects even though event dispatch was deduped. On startup or drain, the runtime automatically requeues deliveries left `processing` by an interrupted runtime and logs a warning. Integrations must use stable external idempotency keys or reconciliation; see [Failure semantics and idempotency](docs/guides/failure-semantics.md).
+Delivery processing is retryable, not exactly once. Retries are immediate by default; a fixed `delay` can durably postpone automatic retries. A later failure or restart recovery can repeat handlers, hooks, and external effects even though event dispatch was deduped. On startup or drain, the runtime automatically requeues deliveries left `processing` by an interrupted runtime and logs a warning. Integrations must use stable external idempotency keys or reconciliation; see [Failure semantics and idempotency](docs/guides/failure-semantics.md).
 
 ### Client
 
@@ -257,7 +259,7 @@ See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
 
 This generated project is intentionally small and dependency-light. It ships with an in-memory store and a JSON-file store. The public store interface is small so that you can add a SQLite or Postgres adapter later without changing user code.
 
-The JSON-file store strictly validates state before runtime work and writes. State version 2 is current; valid version 1 snapshots are upgraded deterministically in memory and persisted as version 2 by the next successful write. Validation and inspection do not rewrite version 1 files. Malformed, structurally invalid, obsolete, and future versions fail with actionable errors and are not replaced. Run `state validate` for a read-only compatibility check.
+The JSON-file store strictly validates state before runtime work and writes. State version 3 is current; valid version 1 and 2 snapshots are upgraded deterministically in memory with immediate retry defaults and persisted as version 3 by the next successful write. Validation and inspection do not rewrite historical files. Malformed, structurally invalid, obsolete, and future versions fail with actionable errors and are not replaced. Run `state validate` for a read-only compatibility check.
 
 The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Atomic first-run state initialization and runtime ownership require a local hard-link-capable filesystem and fail explicitly when the filesystem cannot provide atomic hard links. After acquiring ownership, startup and drain recover stale `processing` deliveries automatically. The CLI rejects offline mutations while `start` is active, but direct unscoped library writes remain unsafe. Multi-process worker coordination is not implemented.
 

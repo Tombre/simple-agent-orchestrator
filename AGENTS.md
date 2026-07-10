@@ -90,11 +90,12 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Duplicate dispatch returns the original internal event ID and creates no new deliveries.
 - Events fan out across clients and across handlers on one client.
 - Channel and client IDs are globally unique. Handler IDs are unique within a client.
-- Retry precedence is handler override, client default captured at handler registration, config default, then three attempts.
+- Retry fields resolve independently through handler override, client default captured at handler registration, config default, then three attempts and zero delay.
+- Positive fixed retry delays persist on deliveries; delayed work remains `pending` with `nextAttemptAt`, normal workers honor eligibility, and drains do not wait for future work.
 - `handle` runs before `onSuccess`. An error from either fails the attempt.
 - `onFailure` runs when a handler context exists; an error from `onFailure` is logged and does not replace the delivery error.
-- Manual retry applies only to `failed` deliveries and grants one additional attempt.
-- Startup and drain recover persisted `processing` deliveries to `pending`, preserve the interrupted attempt, and grant a replacement attempt if the interruption exhausted the retry budget.
+- Manual retry applies only to `failed` deliveries and grants one immediately eligible additional attempt.
+- Startup and drain recover persisted `processing` deliveries to immediately eligible `pending`, preserve the interrupted attempt, and grant a replacement attempt if the interruption exhausted the retry budget.
 - Ordinary session mutations and notes persist only after a successful attempt.
 - `session.ensure` values persist eagerly and survive a failed attempt.
 - Sandbox creation state persists eagerly so handler retries reuse the same sandbox.
@@ -110,7 +111,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Poll cursor identity is `${channelId}:${pollRegistrationIndex}`; reordering polls can reinterpret persisted cursors.
 - `memoryStore` isolates reads and writes by cloning.
 - `jsonFileStore` validates the full snapshot before runtime work and writes, does not replace invalid state, and writes via temporary file plus rename.
-- State version 2 is current. Structurally valid version 1 snapshots migrate deterministically in memory and persist as version 2 on the next successful write; inspection does not rewrite them.
+- State version 3 is current. Structurally valid version 1 and 2 snapshots migrate deterministically in memory with immediate retry defaults and persist as version 3 on the next successful write; inspection does not rewrite them.
 - Persisted event, session, note, and cursor values must be JSON-safe when using `jsonFileStore`.
 - Dispatch may return `queued` with no matching handlers. Sessions are created only when a delivery is processed.
 
@@ -118,7 +119,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 
 - Treat an `OrchestratorRuntime` as one-shot. Its abort controller remains aborted after `stop()`.
 - Normal `start()` mounts environments, starts pollers, and starts client workers.
-- `start({ drain: true })` polls once, drains pending deliveries, and always stops and unmounts before resolving.
+- `start({ drain: true })` polls once, drains currently eligible deliveries without waiting for delayed work, and always stops and unmounts before resolving.
 - Direct `drain()` mounts environments but does not unmount them; its caller must eventually call `stop()`.
 - Environment instances are scoped by client ID and environment ID. Their values are process-local.
 - Mount hooks run in registration order. Unmount hooks run in reverse order.
@@ -140,7 +141,7 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - There is no distributed worker coordination or distributed per-session lock.
 - Runtime lifecycle calls do not yet have complete duplicate-start or restart guards.
 - Processing is not exactly once, and retries can repeat external side effects.
-- Retries have no delay, backoff, timeout, schedule, or dead-letter queue.
+- Retries support only a fixed delay; there is no backoff, jitter, timeout, arbitrary schedule, or dead-letter queue.
 - Only memory and JSON-file stores ship.
 - There is no retention, compaction, or pruning policy.
 - Sandbox creation has a crash window between external creation and marker persistence.

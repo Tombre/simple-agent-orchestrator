@@ -47,7 +47,7 @@ Use object form when you need retries or success hooks:
 
 ```ts
 client.handle(githubReviewsChannel, {
-  retries: { attempts: 5 },
+  retries: { attempts: 5, delay: "10s" },
 
   async handle({ event, session }) {
     await sendToAgent(session.key, String(event.input), {
@@ -67,7 +67,9 @@ client.handle(githubReviewsChannel, {
 });
 ```
 
-Retry defaults are resolved in this order: handler options, `client.retries(...)`, global config `retries`, then three attempts. Automatic retries run immediately without backoff. Manual retry accepts only a failed delivery and grants one additional attempt. Startup and drain automatically requeue deliveries left `processing`; the interrupted attempt remains counted, with one replacement attempt granted only when the interruption exhausted the configured budget.
+Retry fields are resolved independently in this order: handler options, `client.retries(...)`, global config `retries`, then three attempts and zero delay. `delay` is fixed and accepts milliseconds or strings such as `"500ms"`, `"10s"`, `"5m"`, and `"1h"`. Positive fractions round up to a whole millisecond. The maximum is `2_147_483_647` ms (about 24.9 days). The first attempt is immediate. After a failed nonterminal attempt, a positive delay leaves the delivery durably `pending` with a `nextAttemptAt` timestamp.
+
+Normal workers process delayed retries after they become eligible, including after restart. One-shot and direct drains process only currently eligible work and return without waiting. Manual retry accepts only a failed delivery, grants one immediately eligible attempt, and bypasses delay. Startup and drain also recover deliveries left `processing` immediately; the interrupted attempt remains counted, with one replacement attempt granted only when the interruption exhausted the configured budget. This is a fixed delay, not backoff, jitter, timeout, or general scheduling.
 
 The order is `handle`, `onSuccess`, required sandbox cleanup, then final success persistence. An error from any step fails the attempt and can rerun `handle`. `onFailure` receives the original error when a handler context exists; if it throws, its error is logged without replacing the original. Setup failures before the context exists do not call `onFailure`.
 

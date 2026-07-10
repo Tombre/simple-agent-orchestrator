@@ -24,7 +24,7 @@ Loads the project config, validates persisted state, and prints discovered runti
 npx simple-agent-orchestrator state validate
 ```
 
-Loads the project and validates that the complete persisted snapshot is compatible. It is an inspection command and does not rewrite a valid version 1 file, so it remains available while `start` is active. A missing JSON state file is initialized as an empty current snapshot, consistent with `doctor` and other first-run commands. Invalid JSON, invalid shapes or references, obsolete versions, and future versions exit unsuccessfully with recovery guidance; the invalid file is not replaced.
+Loads the project and validates that the complete persisted snapshot is compatible. It is an inspection command and does not rewrite a valid historical file, so it remains available while `start` is active. A missing JSON state file is initialized as an empty current snapshot, consistent with `doctor` and other first-run commands. Invalid JSON, invalid shapes or references, obsolete versions, and future versions exit unsuccessfully with recovery guidance; the invalid file is not replaced.
 
 ## start
 
@@ -46,7 +46,7 @@ Options:
 --drain
 ```
 
-`--drain` runs polls once, drains pending deliveries, and exits.
+`--drain` runs polls once, processes currently eligible pending deliveries, and exits. It does not wait for future delayed retries.
 
 ## dev
 
@@ -65,7 +65,7 @@ npx simple-agent-orchestrator dispatch manual \
   --input "Hello"
 ```
 
-This offline command acquires runtime ownership, dispatches the event, drains matching deliveries in the same one-shot runtime, and exits. If a long-running JSON-store runtime is active, it fails before dispatching.
+This offline command acquires runtime ownership, dispatches the event, drains currently eligible matching deliveries in the same one-shot runtime, and exits. A configured delayed retry remains pending for a later drain or long-running runtime. If a long-running JSON-store runtime is active, it fails before dispatching.
 
 Additional options:
 
@@ -92,7 +92,7 @@ npx simple-agent-orchestrator events list
 npx simple-agent-orchestrator events retry <delivery-id>
 ```
 
-`list` is an inspection command available while `start` is active. `retry` is an offline mutation that grants one additional attempt to a failed delivery and drains the runtime once. The retry action itself does not requeue pending, processing, or processed deliveries; however, its drain automatically recovers any delivery left `processing` by an interrupted runtime. The complete handler attempt can run again, so external effects and source acknowledgement must use stable idempotency keys or reconciliation.
+`list` is an inspection command available while `start` is active. Its attempts column shows consumed/maximum attempts, and `nextAttemptAt` distinguishes delayed pending work. `retry` is an offline mutation that grants one immediately eligible attempt to a failed delivery and drains the runtime once. The retry action itself does not requeue pending, processing, or processed deliveries; however, its drain automatically recovers any delivery left `processing` by an interrupted runtime. The complete handler attempt can run again, so external effects and source acknowledgement must use stable idempotency keys or reconciliation.
 
 ## print-config
 

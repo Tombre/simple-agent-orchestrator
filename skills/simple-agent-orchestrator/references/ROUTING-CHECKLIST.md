@@ -39,6 +39,8 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - Processing is not treated as exactly once; handlers, hooks, and resource operations may repeat.
 - Failed deliveries remain visible through `events list`.
 - Retry settings are explicit when the default is not enough.
+- Retry delay is explicit when immediate retries could amplify an outage or rate limit.
+- One-shot drains are not expected to wait for delayed pending work.
 - `client.concurrency({ perSession: true })` is used when the target agent/tool cannot safely receive same-session messages concurrently.
 
 ## CLI checks

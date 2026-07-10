@@ -1,5 +1,12 @@
+export const MAX_DATE_TIMESTAMP = 8_640_000_000_000_000;
+export const MAX_RETRY_DELAY_MS = 2_147_483_647;
+
 export function nowIso(): string {
   return new Date().toISOString();
+}
+
+export function isSupportedRetryDelay(durationMs: number): boolean {
+  return Number.isFinite(durationMs) && durationMs >= 0 && durationMs <= MAX_RETRY_DELAY_MS;
 }
 
 export function parseDuration(value: number | string): number {
@@ -18,5 +25,7 @@ export function parseDuration(value: number | string): number {
   const amount = Number(match[1]);
   const unit = match[2]!.toLowerCase();
   const multiplier = unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000;
-  return amount * multiplier;
+  const duration = amount * multiplier;
+  if (!Number.isFinite(duration)) throw new Error(`Invalid duration: ${value}`);
+  return duration;
 }

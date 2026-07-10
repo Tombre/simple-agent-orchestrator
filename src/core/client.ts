@@ -91,7 +91,11 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
       };
     },
     retries(options) {
-      if (options.attempts !== undefined) retryOptions = { attempts: Math.max(1, options.attempts) };
+      retryOptions = {
+        ...retryOptions,
+        ...(options.attempts !== undefined ? { attempts: Math.max(1, options.attempts) } : {}),
+        ...(options.delay !== undefined ? { delay: options.delay } : {}),
+      };
     },
     handle(channel, handlerOrOptions) {
       const options = (typeof handlerOrOptions === "function"
@@ -102,9 +106,11 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
         id: handlerId,
         channelId: channel.id,
         channel,
-        retries: options.retries?.attempts !== undefined
-          ? { attempts: Math.max(1, options.retries.attempts) }
-          : { ...retryOptions },
+        retries: {
+          ...retryOptions,
+          ...(options.retries?.attempts !== undefined ? { attempts: Math.max(1, options.retries.attempts) } : {}),
+          ...(options.retries?.delay !== undefined ? { delay: options.retries.delay } : {}),
+        },
         handle: options.handle as EventHandler,
         onSuccess: options.onSuccess as RegisteredHandler["onSuccess"],
         onFailure: options.onFailure as RegisteredHandler["onFailure"],

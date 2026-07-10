@@ -242,9 +242,10 @@ async function eventsCommand(args: ParsedArgs): Promise<void> {
               deliveryId: delivery.id,
               client: delivery.clientId,
               status: delivery.status,
-              attempts: delivery.attempts,
+              attempts: `${delivery.attempts}/${delivery.maxAttempts}`,
+              nextAttemptAt: delivery.nextAttemptAt ?? "",
             }))
-          : [{ eventId: event.id, sourceId: event.sourceId, channel: event.channelId, sessionKey: event.sessionKey, deliveryId: "", client: "", status: "no-delivery", attempts: 0 }],
+          : [{ eventId: event.id, sourceId: event.sourceId, channel: event.channelId, sessionKey: event.sessionKey, deliveryId: "", client: "", status: "no-delivery", attempts: "0/0", nextAttemptAt: "" }],
       ),
     );
     return;
