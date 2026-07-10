@@ -22,11 +22,16 @@ export interface PollCommitContext<TRaw = unknown> extends PollContext {
 }
 
 export interface PollDefinition<TRaw = unknown> {
+  id?: string;
   every: number | string;
   immediate?: boolean;
   fetch(ctx: PollContext): Promise<TRaw[]> | TRaw[];
   map?(item: TRaw, ctx: PollContext): Promise<DispatchEvent | null | undefined> | DispatchEvent | null | undefined;
   commit?(ctx: PollCommitContext<TRaw>): Promise<void> | void;
+}
+
+export function pollCursorId(channelId: string, poll: PollDefinition, index: number): string {
+  return `${channelId}:${poll.id ?? index}`;
 }
 
 export interface ChannelRuntimeApi {

@@ -110,7 +110,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - `jsonFileStore` permits one active runtime or `runOffline()` scope per state file, releases ownership on `stop()`, and reclaims locks whose owning PID has exited.
 - Poll mapping is sequential. Mapped events are durably dispatched before `commit`.
 - Cursor mutations made during a poll persist only after `fetch`, `map`, dispatch, and `commit` complete.
-- Poll cursor identity is `${channelId}:${pollRegistrationIndex}`; reordering polls can reinterpret persisted cursors.
+- A named poll's cursor identity is `${channelId}:${pollId}` and remains stable when registrations move. An unnamed poll uses `${channelId}:${pollRegistrationIndex}`; reordering unnamed polls can reinterpret persisted cursors.
 - `memoryStore` isolates reads and writes by cloning.
 - `jsonFileStore` validates the full snapshot before runtime work and writes, does not replace invalid state, and writes via temporary file plus rename.
 - State version 3 is current. Structurally valid version 1 and 2 snapshots migrate deterministically in memory with immediate retry defaults and persist as version 3 on the next successful write; inspection does not rewrite them.
@@ -172,7 +172,7 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Keep public exports explicit in `src/index.ts`, `src/runtime/index.ts`, and `src/testing/index.ts`.
 - Follow existing formatting: two spaces, double quotes, semicolons, and trailing commas.
 - There is no lint or formatter command; do not claim lint passed.
-- Keep durable identifiers stable. Changing channel IDs, handler IDs, poll order, keys, or sandbox markers can reinterpret persisted state.
+- Keep durable identifiers stable. Changing channel IDs, handler IDs, poll IDs, unnamed poll order, keys, or sandbox markers can reinterpret persisted state.
 - Keep state mutations and read-modify-write sequences inside the runtime mutex. Read-only snapshot inspection may remain outside it.
 - Do not make ordinary session writes eager; failed attempts intentionally roll them back.
 - Do not make `session.ensure` or sandbox bookkeeping success-only; retries rely on eager persistence.

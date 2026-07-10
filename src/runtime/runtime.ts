@@ -1,7 +1,7 @@
 import { dirname, resolve } from "node:path";
 import { mkdir } from "node:fs/promises";
 import type { ChannelDefinition, PollDefinition } from "../core/channel.js";
-import { CursorImpl } from "../core/channel.js";
+import { CursorImpl, pollCursorId } from "../core/channel.js";
 import type { ClientDefinition, HandlerContext, RegisteredHandler } from "../core/client.js";
 import type { EnvironmentDefinition, EnvironmentInstance, SandboxContext } from "../core/environment.js";
 import { createEmptyEnvironment, EnvironmentInstanceImpl } from "../core/environment.js";
@@ -603,7 +603,7 @@ export class OrchestratorRuntime {
   }
 
   private schedulePoll(channel: ChannelDefinition, poll: PollDefinition, index: number): Promise<void> {
-    const cursorId = `${channel.id}:${index}`;
+    const cursorId = pollCursorId(channel.id, poll, index);
     const existing = this.pollPromises.get(cursorId);
     if (existing) return existing;
     const promise = this.runPoll(channel, poll, index).finally(() => {
@@ -614,7 +614,7 @@ export class OrchestratorRuntime {
   }
 
   private async runPoll(channel: ChannelDefinition, poll: PollDefinition, index: number): Promise<void> {
-    const cursorId = `${channel.id}:${index}`;
+    const cursorId = pollCursorId(channel.id, poll, index);
     const signal = this.abortController.signal;
     if (signal.aborted) return;
 
@@ -1043,9 +1043,16 @@ export class OrchestratorRuntime {
   private validateConfiguration(): void {
     this.assertUnique(this.channels.map(({ id }) => id), "channel");
     this.assertUnique(this.clients.map(({ id }) => id), "client");
+    const pollCursorIds: string[] = [];
     for (const channel of this.channels) {
-      for (const poll of channel.polls) parseDuration(poll.every);
+      const pollIds = channel.polls.map((poll, index) => poll.id ?? String(index));
+      this.assertUnique(pollIds, "poll", ` for channel ${channel.id}`);
+      channel.polls.forEach((poll, index) => {
+        parseDuration(poll.every);
+        pollCursorIds.push(pollCursorId(channel.id, poll, index));
+      });
     }
+    this.assertUnique(pollCursorIds, "poll cursor");
     if (this.options.config.retries?.delay !== undefined) parseRetryDelay(this.options.config.retries.delay);
     if (this.options.config.timeout !== undefined) parseHandlerTimeout(this.options.config.timeout);
     for (const client of this.clients) {

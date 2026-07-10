@@ -36,6 +36,7 @@ export const manualChannel = createManualChannel("manual");
 
 export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
   channel.poll({
+    id: "reviews",
     every: "60s",
 
     async fetch({ cursor }) {
@@ -66,6 +67,8 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
   });
 });
 ```
+
+Use a stable `id` for any poll whose cursor must survive registration reordering. Unnamed polls use their registration index. Duplicate resolved identities fail configuration validation. Changing an ID selects another cursor key rather than migrating state; a never-used key starts empty, while a historical ID restores its existing cursor.
 
 Event fields:
 

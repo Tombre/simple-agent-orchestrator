@@ -28,6 +28,7 @@ import { createChannel } from "simple-agent-orchestrator";
 
 export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
   channel.poll({
+    id: "reviews",
     every: "60s",
 
     async fetch({ cursor }) {
@@ -94,4 +95,8 @@ A delivery is only marked `processed` after the handler, `onSuccess`, required s
 
 Executions of the same poll do not overlap within one runtime process. Mapping is sequential. Mapped events are durably dispatched before `commit` runs, and cursor changes are persisted only after `fetch`, mapping, dispatch, and `commit` complete. Previously dispatched events remain if a later poll step fails, so stable dedupe keys must make refetching safe.
 
-`commit` records ingestion progress; it does not wait for delivery processing and is not source acknowledgement. Keep acknowledgement in a retry-safe, designated client `onSuccess`. Because hooks are per delivery, there is no event-wide acknowledgement hook that waits for every fan-out delivery. Poll cursor identity uses the channel id and poll registration order, so avoid reordering polls after state exists.
+`commit` records ingestion progress; it does not wait for delivery processing and is not source acknowledgement. Keep acknowledgement in a retry-safe, designated client `onSuccess`. Because hooks are per delivery, there is no event-wide acknowledgement hook that waits for every fan-out delivery.
+
+Set `id` when a poll's cursor must survive registration reordering. Named polls use `${channelId}:${id}`; unnamed polls continue to use `${channelId}:${pollRegistrationIndex}`. Duplicate resolved poll IDs and ambiguous final cursor keys are rejected. In a multi-poll channel, name every poll before reorganizing registrations because unnamed neighbors remain positional.
+
+Adding or renaming a descriptive ID selects another cursor key and leaves the old cursor record unchanged; the runtime does not infer migrations. A key that has never existed starts empty, while reusing a historical ID restores its existing cursor, so do not recycle IDs for unrelated polls. To retain existing positional cursors during adoption, assign each poll its current index as a string, such as `id: "0"`, before moving registrations.

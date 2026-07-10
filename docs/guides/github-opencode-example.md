@@ -33,6 +33,7 @@ import { githubPrSession } from "../keys";
 
 export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
   channel.poll({
+    id: "reviews",
     every: "60s",
 
     async fetch({ cursor }) {

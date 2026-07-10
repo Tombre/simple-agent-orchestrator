@@ -30,6 +30,34 @@ describe("configuration validation", () => {
     );
   });
 
+  it("rejects duplicate and ambiguous poll identifiers within a channel", async () => {
+    const duplicatePolls = createChannel("polls", (builder) => {
+      builder.poll({ id: "reviews", every: "1m", fetch: () => [] });
+      builder.poll({ id: "reviews", every: "5m", fetch: () => [] });
+    });
+    await expect(createRuntime({ channels: [duplicatePolls] }).then((runtime) => runtime.init())).rejects.toThrow(
+      "Duplicate poll id for channel polls: reviews",
+    );
+
+    const positionalCollision = createChannel("polls", (builder) => {
+      builder.poll({ id: "1", every: "1m", fetch: () => [] });
+      builder.poll({ every: "5m", fetch: () => [] });
+    });
+    await expect(createRuntime({ channels: [positionalCollision] }).then((runtime) => runtime.init())).rejects.toThrow(
+      "Duplicate poll id for channel polls: 1",
+    );
+
+    const firstAmbiguousChannel = createChannel("polls", (builder) => {
+      builder.poll({ id: "reviews:0", every: "1m", fetch: () => [] });
+    });
+    const secondAmbiguousChannel = createChannel("polls:reviews", (builder) => {
+      builder.poll({ every: "5m", fetch: () => [] });
+    });
+    await expect(
+      createRuntime({ channels: [firstAmbiguousChannel, secondAmbiguousChannel] }).then((runtime) => runtime.init()),
+    ).rejects.toThrow("Duplicate poll cursor id: polls:reviews:0");
+  });
+
   it("rejects invalid retry delays before runtime work starts", async () => {
     const channel = createChannel("retry");
     const client = createClient("client", (builder) => {

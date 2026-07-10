@@ -1330,6 +1330,7 @@ describe("resource lifecycle", () => {
     let maxActive = 0;
     const channel = createChannel("poll", (builder) => {
       builder.poll({
+        id: "non-overlap",
         every: 5,
         async fetch() {
           fetches += 1;
@@ -1396,6 +1397,158 @@ describe("resource lifecycle", () => {
 
     expect(seenPages).toEqual([undefined, 1]);
     expect(dispatchedBeforeCommit).toBe(true);
+  });
+
+  it("keeps a named poll cursor when poll registrations are reordered", async () => {
+    const store = memoryStore();
+    const page = cursorKey<number>("page");
+    const firstChannel = createChannel("poll", (builder) => {
+      builder.poll({ every: "1h", fetch: () => [] });
+      builder.poll({
+        id: "reviews",
+        every: "1h",
+        fetch: () => [],
+        commit({ cursor }) {
+          cursor.set(page, 4);
+        },
+      });
+    });
+    const firstRuntime = await createRuntime({ channels: [firstChannel], store });
+    await firstRuntime.start({ drain: true, prettyStartupLog: false });
+
+    let seenPage: number | undefined;
+    const reorderedChannel = createChannel("poll", (builder) => {
+      builder.poll({
+        id: "reviews",
+        every: "1h",
+        fetch({ cursor }) {
+          seenPage = cursor.get(page);
+          return [];
+        },
+      });
+      builder.poll({ every: "1h", fetch: () => [] });
+    });
+    const secondRuntime = await createRuntime({ channels: [reorderedChannel], store });
+    await secondRuntime.start({ drain: true, prettyStartupLog: false });
+
+    expect(seenPage).toBe(4);
+    expect((await store.read()).cursors["poll:reviews"]).toEqual({ page: 4 });
+  });
+
+  it("adopts positional cursor keys as named identities before reordering polls", async () => {
+    const store = memoryStore();
+    const page = cursorKey<number>("page");
+    const positionalChannel = createChannel("poll", (builder) => {
+      builder.poll({
+        every: "1h",
+        fetch: () => [],
+        commit: ({ cursor }) => cursor.set(page, 1),
+      });
+      builder.poll({
+        every: "1h",
+        fetch: () => [],
+        commit: ({ cursor }) => cursor.set(page, 2),
+      });
+    });
+    const firstRuntime = await createRuntime({ channels: [positionalChannel], store });
+    await firstRuntime.start({ drain: true, prettyStartupLog: false });
+
+    const adoptedPages: (number | undefined)[] = [];
+    const adoptedChannel = createChannel("poll", (builder) => {
+      builder.poll({
+        id: "0",
+        every: "1h",
+        fetch({ cursor }) {
+          adoptedPages.push(cursor.get(page));
+          return [];
+        },
+      });
+      builder.poll({
+        id: "1",
+        every: "1h",
+        fetch({ cursor }) {
+          adoptedPages.push(cursor.get(page));
+          return [];
+        },
+      });
+    });
+    const secondRuntime = await createRuntime({ channels: [adoptedChannel], store });
+    await secondRuntime.start({ drain: true, prettyStartupLog: false });
+
+    const reorderedPages: (number | undefined)[] = [];
+    const reorderedChannel = createChannel("poll", (builder) => {
+      builder.poll({
+        id: "1",
+        every: "1h",
+        fetch({ cursor }) {
+          reorderedPages.push(cursor.get(page));
+          return [];
+        },
+      });
+      builder.poll({
+        id: "0",
+        every: "1h",
+        fetch({ cursor }) {
+          reorderedPages.push(cursor.get(page));
+          return [];
+        },
+      });
+    });
+    const thirdRuntime = await createRuntime({ channels: [reorderedChannel], store });
+    await thirdRuntime.start({ drain: true, prettyStartupLog: false });
+
+    expect(adoptedPages).toEqual([1, 2]);
+    expect(reorderedPages).toEqual([2, 1]);
+  });
+
+  it("keeps historical cursors when a named poll changes identity", async () => {
+    const store = memoryStore();
+    const page = cursorKey<number>("page");
+    const originalChannel = createChannel("poll", (builder) => {
+      builder.poll({
+        id: "reviews",
+        every: "1h",
+        fetch: () => [],
+        commit: ({ cursor }) => cursor.set(page, 4),
+      });
+    });
+    const firstRuntime = await createRuntime({ channels: [originalChannel], store });
+    await firstRuntime.start({ drain: true, prettyStartupLog: false });
+
+    let renamedPage: number | undefined;
+    const renamedChannel = createChannel("poll", (builder) => {
+      builder.poll({
+        id: "issues",
+        every: "1h",
+        fetch({ cursor }) {
+          renamedPage = cursor.get(page);
+          return [];
+        },
+      });
+    });
+    const secondRuntime = await createRuntime({ channels: [renamedChannel], store });
+    await secondRuntime.start({ drain: true, prettyStartupLog: false });
+
+    let restoredPage: number | undefined;
+    const restoredChannel = createChannel("poll", (builder) => {
+      builder.poll({
+        id: "reviews",
+        every: "1h",
+        fetch({ cursor }) {
+          restoredPage = cursor.get(page);
+          return [];
+        },
+      });
+    });
+    const thirdRuntime = await createRuntime({ channels: [restoredChannel], store });
+    await thirdRuntime.start({ drain: true, prettyStartupLog: false });
+
+    expect(renamedPage).toBeUndefined();
+    expect(restoredPage).toBe(4);
+    expect((await store.read()).cursors).toMatchObject({
+      "poll:issues": {},
+      "poll:reviews": { page: 4 },
+    });
   });
 
   it("does not persist cursor changes when commit fails", async () => {

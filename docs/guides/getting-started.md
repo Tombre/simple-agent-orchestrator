@@ -103,6 +103,7 @@ import { fetchReviewCandidates } from "../../src/lib/github/reviews";
 
 export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
   channel.poll({
+    id: "reviews",
     every: "60s",
     fetch: () => fetchReviewCandidates(),
     map: (review) => ({

@@ -44,6 +44,7 @@ Creates an event source.
 ```ts
 const channel = createChannel("github.reviews", (channel) => {
   channel.poll({
+    id: "reviews",
     every: "60s",
     fetch: async () => [],
     map: async (item) => ({ id: item.id }),
@@ -55,6 +56,7 @@ const channel = createChannel("github.reviews", (channel) => {
 
 ```ts
 type PollDefinition<TRaw> = {
+  id?: string;
   every: number | string;
   immediate?: boolean;
   fetch(ctx: PollContext): Promise<TRaw[]> | TRaw[];
@@ -64,6 +66,10 @@ type PollDefinition<TRaw> = {
 ```
 
 `every` accepts milliseconds as a number or a string such as `"500ms"`, `"30s"`, `"5m"`, or `"1h"`.
+
+`id` is an optional durable cursor identity. A named poll uses the cursor key `${channelId}:${id}`, so its cursor survives registration reordering. An unnamed poll keeps the positional key `${channelId}:${pollRegistrationIndex}` for compatibility and concise one-poll channels. Resolved poll IDs must be unique within a channel, and final cursor keys must be unique across the configuration. Name every poll in a multi-poll channel before reorganizing it; mixing named and positional polls can become ambiguous and is rejected when their resolved keys collide.
+
+Adding or renaming a descriptive `id` does not infer a cursor migration: it selects the cursor at the new key, which is empty if that key has never existed, while the old record remains in persisted state. Reusing a historical ID restores that ID's existing cursor, so do not recycle IDs for unrelated polls. To adopt IDs without changing existing keys, first assign each poll its current registration index as a string, such as `id: "0"`; those IDs then remain stable when the polls move.
 
 Poll order is `fetch`, sequential `map` and durable dispatch, `commit`, then cursor persistence. A failure rolls back cursor mutations but not events already dispatched. `commit` is an ingestion checkpoint and does not wait for handler success; use stable event dedupe keys for replay and acknowledge sources from a retry-safe, designated `onSuccess` hook. There is no event-wide hook that waits for every fan-out delivery.
 
