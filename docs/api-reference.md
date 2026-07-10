@@ -266,22 +266,41 @@ const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });
 await runtime.start();
 ```
 
-Useful methods:
+Inspection methods can use the loaded runtime while it is active:
 
 ```ts
-await runtime.dispatch(channelId, event);
-await runtime.drain();
-await runtime.stop();
 await runtime.listSessions();
 await runtime.getSession(idOrKey);
 await runtime.listSessionNotes(idOrKey);
-await runtime.endSession(idOrKey, reason);
 await runtime.listEvents();
-await runtime.retryDelivery(deliveryId);
 await runtime.printConfig();
 ```
 
-`start()` and `drain()` acquire the configured store's runtime lock and hold it until `stop()`; `start({ drain: true })` releases it automatically. A second active runtime fails with the owning PID and start time. A lock whose PID is no longer alive is reclaimed automatically. This is local process-ownership enforcement, not general multi-process store coordination: callers must still avoid separate writes such as `dispatch`, `endSession`, or `retryDelivery` while another runtime is active.
+Use a fresh runtime for an offline mutation:
+
+```ts
+const { runtime: offlineRuntime } = await loadProjectOrchestrator();
+await offlineRuntime.runOffline(async ({ drain }) => {
+  await offlineRuntime.dispatch(channelId, event);
+  // endSession() and retryDelivery() belong in this scope too.
+  await drain();
+});
+```
+
+For a direct drain lifecycle, use another fresh runtime and pair `drain()` with `stop()`:
+
+```ts
+const { runtime: drainRuntime } = await loadProjectOrchestrator();
+try {
+  await drainRuntime.drain();
+} finally {
+  await drainRuntime.stop();
+}
+```
+
+`start()` and `drain()` acquire the configured store's runtime lock and hold it until `stop()`; `start({ drain: true })` releases it automatically. `runOffline(operation)` requires an unused runtime, acquires the same ownership before invoking the callback, then always stops the one-shot runtime and releases ownership. Its callback receives an owned `drain()` function for processing deliveries without opening another lifecycle scope. Use it to scope direct offline calls to `dispatch`, `endSession`, or `retryDelivery`; an active owner causes it to fail before invoking the callback. A lock whose PID is no longer alive is reclaimed automatically.
+
+This is local process-ownership enforcement, not general multi-process store coordination. Mutation methods called outside `start()`, `drain()`, or `runOffline()` do not independently acquire ownership.
 
 ## Testing API
 

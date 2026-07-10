@@ -19,6 +19,8 @@ npx simple-agent-orchestrator dispatch manual \
   --input "Run a local agent task"
 ```
 
+CLI dispatch is an offline one-shot operation. Stop a long-running JSON-store runtime first; the command fails before writing when that runtime owns the state.
+
 ## Polling channel
 
 ```ts

@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { loadProjectOrchestrator } from "../src/runtime/index.js";
 
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -16,6 +17,39 @@ async function runCli(...args: string[]): Promise<string> {
     timeout: 10_000,
   });
   return stdout;
+}
+
+async function runCliResult(...args: string[]): Promise<{ failed: boolean; stdout: string; stderr: string }> {
+  try {
+    return { failed: false, stdout: await runCli(...args), stderr: "" };
+  } catch (error) {
+    const failure = error as { stdout?: string; stderr?: string };
+    return { failed: true, stdout: failure.stdout ?? "", stderr: failure.stderr ?? "" };
+  }
+}
+
+async function createFixture(): Promise<{ root: string; stateFile: string }> {
+  const root = await mkdtemp(join(tmpdir(), "sao-cli-"));
+  const configFile = join(root, ".simple-agent-orchestrator", "orchestrator.ts");
+  await mkdir(dirname(configFile), { recursive: true });
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "fixture", type: "module" }), "utf8");
+  const sourceImport = pathToFileURL(join(repositoryRoot, "src", "index.ts")).href;
+  await writeFile(
+    configFile,
+    `import { createManualChannel, createClient, defineConfig } from ${JSON.stringify(sourceImport)};
+const manual = createManualChannel("manual");
+const client = createClient("echo", (builder) => {
+  builder.handle(manual, { retries: { attempts: 1 }, handle({ event, session }) {
+    if (event.input === "fail") throw new Error("fixture failure");
+    session.set("lastInput", event.input);
+    session.note("Echoed input", { input: event.input });
+  }});
+});
+export default defineConfig({ channels: [manual], clients: [client] });
+`,
+    "utf8",
+  );
+  return { root, stateFile: join(root, ".simple-agent-orchestrator", "state", "state.json") };
 }
 
 describe("CLI", () => {
@@ -46,25 +80,7 @@ describe("CLI", () => {
   });
 
   it("persists a dispatch across CLI processes and supports inspection and ending", async () => {
-    const root = await mkdtemp(join(tmpdir(), "sao-cli-"));
-    const configFile = join(root, ".simple-agent-orchestrator", "orchestrator.ts");
-    await mkdir(dirname(configFile), { recursive: true });
-    await writeFile(join(root, "package.json"), JSON.stringify({ name: "fixture", type: "module" }), "utf8");
-    const sourceImport = pathToFileURL(join(repositoryRoot, "src", "index.ts")).href;
-    await writeFile(
-      configFile,
-      `import { createManualChannel, createClient, defineConfig } from ${JSON.stringify(sourceImport)};
-const manual = createManualChannel("manual");
-const client = createClient("echo", (builder) => {
-  builder.handle(manual, ({ event, session }) => {
-    session.set("lastInput", event.input);
-    session.note("Echoed input", { input: event.input });
-  });
-});
-export default defineConfig({ channels: [manual], clients: [client] });
-`,
-      "utf8",
-    );
+    const { root } = await createFixture();
 
     expect(await runCli("doctor", "--root", root)).toContain("Doctor completed.");
     const dispatch = await runCli(
@@ -89,5 +105,57 @@ export default defineConfig({ channels: [manual], clients: [client] });
     expect(await runCli("events", "list", "--root", root)).toContain("processed");
     expect(await runCli("sessions", "end", "work-1", "--root", root, "--reason", "operator")).toContain("ended");
     expect(await runCli("sessions", "show", "work-1", "--root", root)).toContain('"endReason": "operator"');
+  });
+
+  it("rejects offline mutations before writing while allowing inspection during an active runtime", async () => {
+    const { root, stateFile } = await createFixture();
+    await runCli("dispatch", "manual", "--root", root, "--id", "success", "--session", "work-1", "--input", "hello");
+    await runCli("dispatch", "manual", "--root", root, "--id", "failure", "--session", "work-2", "--input", "fail");
+    const seededState = JSON.parse(await readFile(stateFile, "utf8")) as {
+      deliveries: { id: string; status: string }[];
+    };
+    const failedDelivery = seededState.deliveries.find(({ status }) => status === "failed");
+    expect(failedDelivery).toBeDefined();
+
+    const { runtime } = await loadProjectOrchestrator({ root });
+    await runtime.start({ prettyStartupLog: false });
+    try {
+      expect(await runCli("doctor", "--root", root)).toContain("Doctor completed.");
+      expect(await runCli("print-config", "--root", root)).toContain('"events": 2');
+      expect(await runCli("sessions", "list", "--root", root)).toContain("work-1");
+      expect(await runCli("sessions", "show", "work-1", "--root", root)).toContain('"lastInput": "hello"');
+      expect(await runCli("events", "list", "--root", root)).toContain("failed");
+
+      const failures = await Promise.all([
+        runCliResult("dispatch", "manual", "--root", root, "--id", "blocked", "--session", "blocked", "--input", "blocked"),
+        runCliResult("sessions", "end", "work-1", "--root", root),
+        runCliResult("events", "retry", failedDelivery!.id, "--root", root),
+      ]);
+      for (const failure of failures) {
+        expect(failure.failed).toBe(true);
+        expect(failure.stderr).toMatch(new RegExp(`active orchestrator runtime.*PID ${process.pid}`, "i"));
+      }
+      expect(JSON.parse(await readFile(stateFile, "utf8"))).toEqual(seededState);
+    } finally {
+      await runtime.stop();
+    }
+
+    expect(await runCli("sessions", "end", "work-1", "--root", root)).toContain("ended");
+    expect(await runCli("events", "retry", failedDelivery!.id, "--root", root)).toContain("retried");
+  });
+
+  it("classifies inspection and offline mutation commands in help", async () => {
+    const output = await runCli("help");
+    const inspectionHeading = output.indexOf("Inspection commands (safe while start is active)");
+    const mutationHeading = output.indexOf("Offline mutation commands (require start to be stopped)");
+    expect(inspectionHeading).toBeGreaterThan(-1);
+    expect(mutationHeading).toBeGreaterThan(inspectionHeading);
+    for (const command of ["doctor", "print-config", "sessions list", "sessions show", "events list"]) {
+      expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeGreaterThan(inspectionHeading);
+      expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeLessThan(mutationHeading);
+    }
+    for (const command of ["dispatch", "sessions end", "events retry"]) {
+      expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeGreaterThan(mutationHeading);
+    }
   });
 });

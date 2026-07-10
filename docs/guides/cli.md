@@ -26,7 +26,9 @@ npx simple-agent-orchestrator start
 
 Starts pollers and client workers.
 
-When using `jsonFileStore`, a local ownership lock rejects a second `start`, `dev`, or `--drain` runtime for the same state and reports the active PID and start time. Ownership is released on normal shutdown, and a lock left by a process that exited is reclaimed on the next start. Do not run CLI `dispatch`, retry, or session-end commands concurrently with an active runtime; the ownership lock does not turn the JSON store into a general concurrent-writer store.
+When using `jsonFileStore`, a local ownership lock rejects a second runtime or offline mutation for the same state and reports the active PID and start time. Ownership is released on normal shutdown, and a lock left by a process that exited is reclaimed on the next operation.
+
+`doctor`, `print-config`, `sessions list`, `sessions show`, and `events list` only inspect runtime state and are safe while `start` is active. `dispatch`, `sessions end`, and `events retry` are offline mutations: they fail before writing unless the long-running runtime is stopped. This does not make direct library writes or arbitrary JSON-store writers safe.
 
 Options:
 
@@ -55,7 +57,7 @@ npx simple-agent-orchestrator dispatch manual \
   --input "Hello"
 ```
 
-This command dispatches the event, drains matching deliveries in the same one-shot runtime, and exits. Run it only while a long-running JSON-store runtime is stopped.
+This offline command acquires runtime ownership, dispatches the event, drains matching deliveries in the same one-shot runtime, and exits. If a long-running JSON-store runtime is active, it fails before dispatching.
 
 Additional options:
 
@@ -73,7 +75,7 @@ npx simple-agent-orchestrator sessions show <id-or-key>
 npx simple-agent-orchestrator sessions end <id-or-key> --reason manual
 ```
 
-`show` includes persisted session notes. `end` records the session as ended but does not invoke sandbox cleanup hooks.
+`list` and `show` are inspection commands available while `start` is active; `show` includes persisted session notes. `end` is an offline mutation that records the session as ended but does not invoke sandbox cleanup hooks.
 
 ## events
 
@@ -82,7 +84,7 @@ npx simple-agent-orchestrator events list
 npx simple-agent-orchestrator events retry <delivery-id>
 ```
 
-`retry` grants one additional attempt to a failed delivery and drains the runtime once. Pending, processing, and processed deliveries are not requeued. The complete handler attempt can run again, so external effects and source acknowledgement must use stable idempotency keys or reconciliation.
+`list` is an inspection command available while `start` is active. `retry` is an offline mutation that grants one additional attempt to a failed delivery and drains the runtime once. Pending, processing, and processed deliveries are not requeued. The complete handler attempt can run again, so external effects and source acknowledgement must use stable idempotency keys or reconciliation.
 
 ## print-config
 

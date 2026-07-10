@@ -1,5 +1,5 @@
 export { OrchestratorRuntime } from "./runtime.js";
-export type { RuntimeOptions, StartOptions } from "./runtime.js";
+export type { OfflineOperationContext, RuntimeOptions, StartOptions } from "./runtime.js";
 export {
   createProjectContext,
   findConfigFile,

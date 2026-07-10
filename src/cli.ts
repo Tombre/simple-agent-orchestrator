@@ -50,16 +50,23 @@ function usage(): void {
   console.log(`Simple Agent Orchestrator
 
 Usage:
+  Project setup:
   simple-agent-orchestrator init [--force]
+
+  Runtime commands:
   simple-agent-orchestrator start [--root <path>] [--config <path>] [--drain]
   simple-agent-orchestrator dev [--root <path>] [--config <path>]
+
+  Inspection commands (safe while start is active):
   simple-agent-orchestrator doctor [--root <path>] [--config <path>]
   simple-agent-orchestrator print-config [--root <path>] [--config <path>]
-  simple-agent-orchestrator dispatch <channel> --id <id> --session <sessionKey> --input <text>
   simple-agent-orchestrator sessions list
   simple-agent-orchestrator sessions show <id-or-key>
-  simple-agent-orchestrator sessions end <id-or-key> [--reason <reason>]
   simple-agent-orchestrator events list
+
+  Offline mutation commands (require start to be stopped):
+  simple-agent-orchestrator dispatch <channel> --id <id> --session <sessionKey> --input <text>
+  simple-agent-orchestrator sessions end <id-or-key> [--reason <reason>]
   simple-agent-orchestrator events retry <delivery-id>
 `);
 }
@@ -168,19 +175,18 @@ async function dispatchCommand(args: ParsedArgs): Promise<void> {
   const input = flagString(args.flags, "input");
   const payloadJson = flagString(args.flags, "payload-json");
   const metaJson = flagString(args.flags, "meta-json");
-  const result = await runtime.dispatch(channelId, {
-    id: flagString(args.flags, "id") ?? `manual-${Date.now()}`,
-    type: flagString(args.flags, "type"),
-    sessionKey: flagString(args.flags, "session") ?? flagString(args.flags, "session-key"),
-    input,
-    payload: payloadJson ? JSON.parse(payloadJson) : undefined,
-    meta: metaJson ? JSON.parse(metaJson) : undefined,
+  const result = await runtime.runOffline(async ({ drain }) => {
+    const dispatched = await runtime.dispatch(channelId, {
+      id: flagString(args.flags, "id") ?? `manual-${Date.now()}`,
+      type: flagString(args.flags, "type"),
+      sessionKey: flagString(args.flags, "session") ?? flagString(args.flags, "session-key"),
+      input,
+      payload: payloadJson ? JSON.parse(payloadJson) : undefined,
+      meta: metaJson ? JSON.parse(metaJson) : undefined,
+    });
+    await drain();
+    return dispatched;
   });
-  try {
-    await runtime.drain();
-  } finally {
-    await runtime.stop();
-  }
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -203,7 +209,7 @@ async function sessionsCommand(args: ParsedArgs): Promise<void> {
   if (action === "end") {
     const id = args.positional[2];
     if (!id) throw new Error("Usage: simple-agent-orchestrator sessions end <id-or-key>");
-    const ended = await runtime.endSession(id, flagString(args.flags, "reason") ?? "manual");
+    const ended = await runtime.runOffline(() => runtime.endSession(id, flagString(args.flags, "reason") ?? "manual"));
     console.log(ended ? "ended" : "not found");
     return;
   }
@@ -236,14 +242,13 @@ async function eventsCommand(args: ParsedArgs): Promise<void> {
   if (action === "retry") {
     const id = args.positional[2];
     if (!id) throw new Error("Usage: simple-agent-orchestrator events retry <delivery-id>");
-    const retried = await runtime.retryDelivery(id);
-    if (retried) {
-      try {
-        await runtime.drain();
-      } finally {
-        await runtime.stop();
+    const retried = await runtime.runOffline(async ({ drain }) => {
+      const pending = await runtime.retryDelivery(id);
+      if (pending) {
+        await drain();
       }
-    }
+      return pending;
+    });
     console.log(retried ? "retried" : "not found");
     return;
   }

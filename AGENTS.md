@@ -103,7 +103,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Concurrent deliveries merge mutations to different session-state keys.
 - Concurrent writes to the same state key use completion-order last-write-wins behavior.
 - Executions of the same poll do not overlap within one runtime process.
-- `jsonFileStore` permits one active `start` or `drain` runtime per state file, releases ownership on `stop()`, and reclaims locks whose owning PID has exited.
+- `jsonFileStore` permits one active runtime or `runOffline()` scope per state file, releases ownership on `stop()`, and reclaims locks whose owning PID has exited.
 - Poll mapping is sequential. Mapped events are durably dispatched before `commit`.
 - Cursor mutations made during a poll persist only after `fetch`, `map`, dispatch, and `commit` complete.
 - Poll cursor identity is `${channelId}:${pollRegistrationIndex}`; reordering polls can reinterpret persisted cursors.
@@ -127,13 +127,13 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Sandbox creation and cleanup are serialized per session/environment in one process.
 - Sandbox cleanup runs only after `handle` and `onSuccess` succeed and the handler called `session.end()`.
 - Keep external side effects idempotent because delivery state and external systems are not one transaction.
-- Do not run mutating CLI commands such as dispatch, retry, or session end concurrently with a long-running runtime when using `jsonFileStore`.
+- CLI `dispatch`, `sessions end`, and `events retry` are offline operations that fail before writing while a `jsonFileStore` runtime owns the state. Inspection commands remain available; direct library mutations need an explicit `runtime.runOffline(...)` scope.
 
 ## Accepted Limitations
 
 Do not claim these are solved unless code and regression tests explicitly solve them.
 
-- The JSON store rejects multiple active runtimes but is not safe for general concurrent writers; runtime ownership is not cross-process store locking for offline mutations.
+- The JSON store rejects multiple active runtimes and scopes explicit `runOffline()` operations, but it is not safe for unscoped or arbitrary concurrent writers.
 - JSON-store runtime ownership requires a local filesystem with atomic hard-link support.
 - Persisted state has no schema-validation or migration system. The JSON store currently coerces the read version to `1` instead of rejecting unsupported versions.
 - There is no distributed worker coordination or distributed per-session lock.

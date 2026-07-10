@@ -92,7 +92,7 @@ The `dispatch` command processes the event in a one-shot runtime and exits. Afte
 npx simple-agent-orchestrator start
 ```
 
-The default JSON store supports one mutating orchestrator process. Do not run CLI `dispatch`, retry, or session-end commands in another process while `start` is running.
+The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, and `events retry` are offline operations: they acquire the same ownership lock and fail before writing if `start` is active. Inspection commands remain available while the runtime is running.
 
 ## Project-local config
 
@@ -216,16 +216,21 @@ An environment mounts shared resources for a client, such as local servers, API 
 ## CLI
 
 ```bash
+# Project setup and runtime
 simple-agent-orchestrator init
 simple-agent-orchestrator start
 simple-agent-orchestrator dev
+
+# Inspection (safe while start is active)
 simple-agent-orchestrator doctor
 simple-agent-orchestrator print-config
-simple-agent-orchestrator dispatch <channel> --id <id> --session <sessionKey> --input <text>
 simple-agent-orchestrator sessions list
 simple-agent-orchestrator sessions show <id-or-key>
-simple-agent-orchestrator sessions end <id-or-key>
 simple-agent-orchestrator events list
+
+# Offline mutation (requires start to be stopped)
+simple-agent-orchestrator dispatch <channel> --id <id> --session <sessionKey> --input <text>
+simple-agent-orchestrator sessions end <id-or-key>
 simple-agent-orchestrator events retry <delivery-id>
 ```
 
@@ -250,7 +255,7 @@ See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
 
 This generated project is intentionally small and dependency-light. It ships with an in-memory store and a JSON-file store. The public store interface is small so that you can add a SQLite or Postgres adapter later without changing user code.
 
-The JSON-file store enforces one active `start` or `drain` runtime per state file with a local PID lock and reclaims stale ownership after a process exits. Ownership requires a local hard-link-capable filesystem and fails explicitly when the filesystem cannot provide atomic hard links. This does not make arbitrary concurrent JSON writers safe, so offline mutating commands must not run beside an active runtime. Stale `processing` delivery recovery and multi-process worker coordination are not implemented.
+The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Ownership requires a local hard-link-capable filesystem and fails explicitly when the filesystem cannot provide atomic hard links. The CLI rejects offline mutations while `start` is active, but direct unscoped library writes remain unsafe. Stale `processing` delivery recovery and multi-process worker coordination are not implemented.
 
 The package is ESM-only and requires Node.js 20 or newer.
 

@@ -51,6 +51,8 @@ npx simple-agent-orchestrator sessions list
 npx simple-agent-orchestrator events list
 ```
 
+`dispatch`, `sessions end`, and `events retry` are offline mutations and require the long-running runtime to be stopped. The inspection commands remain available while `start` is active.
+
 ## Common failures
 
 ### Duplicate external agent sessions

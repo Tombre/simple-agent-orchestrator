@@ -35,6 +35,10 @@ export interface StartOptions {
   prettyStartupLog?: boolean;
 }
 
+export interface OfflineOperationContext {
+  drain(): Promise<void>;
+}
+
 interface ClaimedDelivery {
   delivery: StoredDelivery;
   event: StoredEvent;
@@ -84,6 +88,10 @@ export class OrchestratorRuntime {
   private readonly sandboxLocks = new Map<string, Promise<void>>();
   private ownership: RuntimeOwnership | undefined;
   private ownershipPromise: Promise<RuntimeOwnership> | undefined;
+  private runtimeLifecycleClaimed = false;
+  private runtimeLifecycleKind: "start" | "drain" | undefined;
+  private lifecycleTransitions = 0;
+  private offlineOperationActive = false;
   private initialized = false;
 
   constructor(private readonly options: RuntimeOptions) {
@@ -108,35 +116,46 @@ export class OrchestratorRuntime {
   }
 
   async start(options: StartOptions = {}): Promise<void> {
-    await this.ensureRuntimeOwnership();
+    this.claimRuntimeLifecycle("start");
     try {
-      await this.init();
-      if (options.prettyStartupLog ?? true) this.printStartupSummary();
-
-      if (options.drain) {
-        try {
-          await this.runAllPollsOnce();
-          await this.drain();
-        } finally {
-          await this.stop();
-        }
-        return;
-      }
-
-      await this.mountAllEnvironments();
-      this.startPollers();
-      this.startWorkers();
-    } catch (error) {
+      await this.ensureRuntimeOwnership();
       try {
-        await this.releaseRuntimeOwnership();
-      } catch (releaseError) {
-        throw new AggregateError([error, releaseError], "Runtime startup and ownership release failed");
+        await this.init();
+        if (options.prettyStartupLog ?? true) this.printStartupSummary();
+
+        if (options.drain) {
+          try {
+            await this.runAllPollsOnce();
+            await this.drainOwned();
+          } finally {
+            await this.stopInternal();
+          }
+          return;
+        }
+
+        await this.mountAllEnvironments();
+        this.startPollers();
+        this.startWorkers();
+      } catch (error) {
+        try {
+          await this.releaseRuntimeOwnership();
+        } catch (releaseError) {
+          throw new AggregateError([error, releaseError], "Runtime startup and ownership release failed");
+        }
+        throw error;
       }
-      throw error;
+    } finally {
+      this.lifecycleTransitions -= 1;
     }
   }
 
   async stop(): Promise<void> {
+    if (this.offlineOperationActive) throw new Error("Cannot stop a runtime during an active offline operation");
+    if (this.lifecycleTransitions > 0) throw new Error("Cannot stop a runtime while its lifecycle is starting");
+    await this.stopInternal();
+  }
+
+  private async stopInternal(): Promise<void> {
     this.abortController.abort();
     for (const handle of this.intervalHandles) clearInterval(handle);
     this.intervalHandles.length = 0;
@@ -162,7 +181,16 @@ export class OrchestratorRuntime {
   }
 
   async drain(): Promise<void> {
-    await this.ensureRuntimeOwnership();
+    this.claimRuntimeLifecycle("drain");
+    try {
+      await this.ensureRuntimeOwnership();
+      await this.drainOwned();
+    } finally {
+      this.lifecycleTransitions -= 1;
+    }
+  }
+
+  private async drainOwned(): Promise<void> {
     await this.mountAllEnvironments();
     while (true) {
       let processed = false;
@@ -172,6 +200,63 @@ export class OrchestratorRuntime {
       }
       if (!processed) break;
     }
+  }
+
+  async runOffline<T>(operation: (context: OfflineOperationContext) => Promise<T>): Promise<T> {
+    if (this.offlineOperationActive) throw new Error("An offline operation is already active on this runtime");
+    if (this.runtimeLifecycleClaimed || this.abortController.signal.aborted) {
+      throw new Error("runOffline requires an unused one-shot runtime");
+    }
+    this.offlineOperationActive = true;
+    try {
+      await this.ensureRuntimeOwnership();
+    } catch (error) {
+      this.offlineOperationActive = false;
+      throw error;
+    }
+    let result: T | undefined;
+    let operationError: unknown;
+    let operationFailed = false;
+    try {
+      result = await operation({ drain: () => this.drainOwned() });
+    } catch (error) {
+      operationFailed = true;
+      operationError = error;
+    }
+
+    let stopError: unknown;
+    let stopFailed = false;
+    try {
+      await this.stopInternal();
+    } catch (error) {
+      stopFailed = true;
+      stopError = error;
+    } finally {
+      this.offlineOperationActive = false;
+    }
+    if (operationFailed && stopFailed) {
+      throw new AggregateError([operationError, stopError], "Offline operation and runtime shutdown failed");
+    }
+    if (operationFailed) throw operationError;
+    if (stopFailed) throw stopError;
+    return result as T;
+  }
+
+  private claimRuntimeLifecycle(kind: "start" | "drain"): void {
+    if (this.offlineOperationActive) throw new Error("Cannot start or drain during an active offline operation");
+    if (this.abortController.signal.aborted) {
+      throw new Error("This one-shot runtime lifecycle has already been used");
+    }
+    if (this.runtimeLifecycleClaimed) {
+      if (kind === "drain" && this.runtimeLifecycleKind === "drain") {
+        this.lifecycleTransitions += 1;
+        return;
+      }
+      throw new Error("This one-shot runtime lifecycle has already been used");
+    }
+    this.runtimeLifecycleClaimed = true;
+    this.runtimeLifecycleKind = kind;
+    this.lifecycleTransitions = 1;
   }
 
   async dispatch(

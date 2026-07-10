@@ -56,7 +56,7 @@ Simple Agent Orchestrator is an embedded project runtime: events enter through *
    npx simple-agent-orchestrator events list
    ```
 
-   Also run the project’s TypeScript/test commands when available. Done when config loads and the changed route can be smoke-tested or the remaining blocker is named.
+   Run the `dispatch` smoke test only after stopping a long-running JSON-store runtime; it is an offline command and will fail before writing while `start` is active. Inspection commands such as `doctor`, `print-config`, `sessions list`, and `events list` remain safe while `start` is active. Also run the project’s TypeScript/test commands when available. Done when config loads and the changed route can be smoke-tested or the remaining blocker is named.
 
 ## References
 

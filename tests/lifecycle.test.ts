@@ -241,6 +241,80 @@ describe("resource lifecycle", () => {
     await replacement.stop();
   });
 
+  it("releases JSON state ownership after an offline operation fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-ownership-"));
+    const statePath = join(root, "state.json");
+    const runtime = await createRuntime({ store: jsonFileStore(statePath) });
+
+    await expect(
+      runtime.runOffline(async () => {
+        throw new Error("operation failed");
+      }),
+    ).rejects.toThrow("operation failed");
+
+    const replacement = await createRuntime({ store: jsonFileStore(statePath) });
+    await replacement.start({ prettyStartupLog: false });
+    await replacement.stop();
+  });
+
+  it("does not release ownership early for overlapping offline operations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-ownership-"));
+    const statePath = join(root, "state.json");
+    const runtime = await createRuntime({ store: jsonFileStore(statePath) });
+    const started = deferred();
+    const release = deferred();
+    const operation = runtime.runOffline(async () => {
+      started.resolve();
+      await release.promise;
+    });
+    await started.promise;
+
+    await expect(runtime.runOffline(async () => undefined)).rejects.toThrow("already active");
+    await expect(runtime.start({ prettyStartupLog: false })).rejects.toThrow("active offline operation");
+    await expect(runtime.drain()).rejects.toThrow("active offline operation");
+    await expect(runtime.stop()).rejects.toThrow("active offline operation");
+    const contender = await createRuntime({ store: jsonFileStore(statePath) });
+    await expect(contender.drain()).rejects.toThrow(/another active orchestrator runtime/i);
+
+    release.resolve();
+    await operation;
+    await expect(runtime.runOffline(async () => undefined)).rejects.toThrow("unused one-shot runtime");
+    const replacement = await createRuntime({ store: jsonFileStore(statePath) });
+    await replacement.start({ prettyStartupLog: false });
+    await replacement.stop();
+  });
+
+  it("rejects offline operations after a runtime lifecycle has claimed ownership", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-ownership-"));
+    const statePath = join(root, "state.json");
+    const started = await createRuntime({ store: jsonFileStore(statePath) });
+    await started.start({ prettyStartupLog: false });
+    await expect(started.runOffline(async () => undefined)).rejects.toThrow("unused one-shot runtime");
+    await started.stop();
+
+    const drained = await createRuntime({ store: jsonFileStore(statePath) });
+    await drained.drain();
+    await expect(drained.runOffline(async () => undefined)).rejects.toThrow("unused one-shot runtime");
+    await drained.stop();
+  });
+
+  it("preserves falsy offline operation errors and combines shutdown failures", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-ownership-"));
+    const statePath = join(root, "state.json");
+    const runtime = await createRuntime({ store: jsonFileStore(statePath) });
+
+    const error = await runtime
+      .runOffline(async () => {
+        failNextOwnershipRelease(runtime);
+        throw undefined;
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toEqual([undefined, new Error("transient release failure")]);
+    await runtime.stop();
+  });
+
   it("releases JSON state ownership when environment unmounting fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-ownership-"));
     const statePath = join(root, "state.json");

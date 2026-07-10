@@ -61,7 +61,7 @@ After the manual smoke test, start the long-running runtime for polls and projec
 npx simple-agent-orchestrator start
 ```
 
-The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root. The default JSON store supports one mutating orchestrator process, so do not run CLI `dispatch`, retry, or session-end commands in another process while `start` is running.
+The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root. The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, and `events retry` fail before writing while `start` is active; inspection commands such as `sessions show` and `events list` remain available.
 
 ## 6. Replace the echo client
 
