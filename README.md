@@ -1,23 +1,28 @@
 # Simple Agent Orchestrator
 
-Simple Agent Orchestrator is a dependency-light Node.js 20+ TypeScript library and CLI for routing events into durable, retryable agent sessions inside an existing project.
+Simple Agent Orchestrator helps you run event-driven AI agent code inside an existing Node.js project. You write the integration with your agent and source APIs; the package saves incoming events, retries failed handlers, and keeps context for related work.
 
-## Five-minute start
+## Try it in five minutes
 
-Run this from an existing npm project with a valid `package.json`:
+From an existing Node.js 20+ project, install the package and create the starter files:
 
 ```bash
 npm install -D simple-agent-orchestrator
 npx simple-agent-orchestrator init
 npx simple-agent-orchestrator doctor
+```
+
+Now send a sample event through the generated `manual` channel and inspect the result:
+
+```bash
 npx simple-agent-orchestrator dispatch manual --id first-event --session demo --input "Hello"
 npx simple-agent-orchestrator events list
 npx simple-agent-orchestrator sessions list
 ```
 
-`init` discovers the nearest parent package unless `--root` is supplied. It creates only `.simple-agent-orchestrator/`; it does not edit the host `package.json`. Re-running requires `--force`, which overwrites known template files but preserves unknown files.
+`init` finds the nearest Node.js project and adds `.simple-agent-orchestrator/` without editing your `package.json`. `doctor` checks that the generated config and saved data can be loaded. The `dispatch` command then runs the example handler, waits for work that's ready now, and exits.
 
-The generated project is deliberately small:
+Here's what was added:
 
 ```text
 .simple-agent-orchestrator/
@@ -29,50 +34,49 @@ The generated project is deliberately small:
   clients/example.ts
 ```
 
-The example client only logs event and session identifiers. Replace it with project-owned agent code, then run the long-lived runtime:
+The example client only logs the event and session IDs. Replace that handler with your own agent code when you're ready. To leave the orchestrator running so it can poll sources, accept HTTP requests, and process new events, use:
 
 ```bash
 npx simple-agent-orchestrator start
 ```
 
-Ordinary `start` runs pollers, workers, and an HTTP listener on `127.0.0.1:3000`. Use `--no-http` to disable HTTP or `--drain` to poll once, process currently eligible work, and exit.
+`start` tries to open an HTTP server at `127.0.0.1:3000` and logs the address it actually uses. Add `--no-http` if you don't need HTTP, or `--drain` to poll once, process work that's ready, and exit.
 
-## Mental model
+For a complete first run, including a useful handler and an HTTP request, follow [Build your first workflow](docs/guides/getting-started.md).
 
-- A **channel** receives normalized events or polls a source.
-- An **event** is durably ingested and deduplicated by `channelId + dedupeKey`.
-- Each matching client handler gets an independent **delivery** with retries.
-- A **session** preserves state and notes for related events sharing a `sessionKey`.
-- A client **environment** owns process-local resources and an optional session sandbox.
-- The one-process **runtime** coordinates persistence, workers, polls, lifecycle, and optional HTTP.
+## How it fits together
 
-Definitions returned by `createChannel`, `createClient`, and `createEnvironment` are inspectable and readonly-typed, but they are not frozen. Builder callbacks configure mutable definitions. A runtime snapshots registrations when `init()` first runs; changes after that do not affect that runtime. Live runtime reconfiguration is unsupported.
+- A **channel** represents one way events arrive, such as a GitHub poll or a project route.
+- An **event** is one item from that source. It's saved before dispatch returns.
+- A **client** subscribes a handler to a channel.
+- A **delivery** records one handler's attempts to process one event, including retries.
+- A **session** lets related events share state and notes, such as all comments on one pull request.
+- An **environment** gives a client process-local resources and can manage a session-specific sandbox, such as a worktree.
+- The **runtime** runs all of this in one process and can also serve HTTP.
 
-## Critical warnings
+Set up channels, clients, and environments before initializing the runtime. It reads their setup once during `init()`, so code that changes them later won't reconfigure that runtime; create and start a new runtime instead.
 
-- Processing is retryable, not exactly once. Handlers, hooks, sandbox operations, and external effects can repeat. Use stable external idempotency keys or reconciliation.
-- The default JSON store supports one active mutating runtime or offline operation per state file. Stop `start` before CLI `dispatch`, `sessions end`, `events retry`, or `state prune --apply`.
-- JSON state, event content, session state, notes, errors, and ordinary project/default logs are plaintext and are not automatically redacted. Do not persist or log credentials or sensitive source content without an explicit policy.
-- Built-in operational HTTP summaries omit event bodies, session state, notes, and errors. That does not constrain project middleware, custom routes, handlers, or logging. HTTP has no built-in authentication, provider signature verification, CORS, rate limiting, or TLS.
-- `POST /webhooks/:channelId` confirms durable ingestion, not successful processing. Add authentication and source verification before exposure.
-- Handler timeouts and shutdown are cooperative. Project code must pass `signal` to cancellation-aware operations.
-
-## Common tasks
+## Where to go next
 
 - [Documentation index](docs/index.md)
-- [Getting started](docs/guides/getting-started.md)
-- [Project integration](docs/guides/project-integration.md)
-- [Channels and dispatch](docs/guides/channels.md)
-- [Clients, retries, and timeouts](docs/guides/clients.md)
-- [Sessions and state](docs/guides/sessions-state.md)
-- [Environments and sandboxes](docs/guides/environments-sandboxes.md)
-- [Testing](docs/guides/testing.md)
-- [CLI](docs/guides/cli.md)
-- [Failure semantics and idempotency](docs/guides/failure-semantics.md)
+- [Build your first workflow](docs/guides/getting-started.md)
+- [Follow one event through the core concepts](docs/concepts.md)
+- [Receive events with channels](docs/guides/channels.md)
+- [Process events with clients](docs/guides/clients.md)
+- [Keep context with sessions](docs/guides/sessions-state.md)
+- [Set up environments and sandboxes](docs/guides/environments-sandboxes.md)
+- [Test your integration](docs/guides/testing.md)
+- [Use the CLI](docs/guides/cli.md)
 - [API reference](docs/api-reference.md)
-- [Design principles](docs/design-principles.md)
 
-The package is ESM-only and requires Node.js 20 or newer. It ships public package subpaths `.`, `./runtime`, and `./testing`.
+## Before running it in production
+
+- **Make outside actions safe to repeat.** A handler can run again after an error, timeout, or restart. The [retry guide](docs/guides/failure-semantics.md) shows how to avoid duplicate effects.
+- **Secure HTTP in your application.** The package doesn't add authentication, provider signature checks, rate limiting, or TLS. See [project integration](docs/guides/project-integration.md#add-provider-specific-http-routes).
+- **Treat files and logs as plaintext.** Event data, session state, notes, and errors may contain sensitive information. See [local saved data](docs/guides/project-integration.md#handle-local-saved-data-carefully).
+- **Use one process per JSON state file.** The [CLI guide](docs/guides/cli.md#work-safely-with-the-json-state-file) explains which commands can run beside `start`.
+
+The package requires Node.js 20 or newer and uses ESM. Most code imports from `simple-agent-orchestrator`; lower-level runtime and testing helpers are available from `simple-agent-orchestrator/runtime` and `simple-agent-orchestrator/testing`.
 
 ## License
 

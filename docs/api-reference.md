@@ -1,24 +1,111 @@
 # API reference
 
-This reference covers the supported package subpaths: `simple-agent-orchestrator`, `simple-agent-orchestrator/runtime`, and `simple-agent-orchestrator/testing`. Project-local TypeScript examples use explicit `.ts` extensions.
+The package requires Node.js 20 or newer and is ESM-only.
 
-## Export inventory
+| Import path | Use it for |
+| --- | --- |
+| `simple-agent-orchestrator` | Config, channels, clients, sessions, environments, stores, keys, and utilities |
+| `simple-agent-orchestrator/runtime` | Runtime creation and lifecycle, project loading, inspection, and maintenance |
+| `simple-agent-orchestrator/testing` | In-memory integration tests |
 
-The root subpath exports config types/helpers; channel, client, environment, session, event, key, logger, retry, state, and stored-record types; `HandlerTimeoutError`; memory/JSON stores and state validation; `env`; and `parseDuration`.
+Internal package paths are not public APIs.
 
-The runtime subpath exports `OrchestratorRuntime`, `RuntimeOptions`, `StartOptions`, `OfflineOperationContext`, retention plan types, `createRuntime`, project/config discovery and loading helpers, `CreateRuntimeOptions`, and `LoadProjectOptions`.
+## Contents
 
-The testing subpath exports `createTestRuntime`, `TestRuntime`, `TestRuntimeOptions`, `TestEventRecord`, and `memoryStore`. Internal modules are not public package subpaths.
+- [Root exports](#root-exports)
+- [Configuration](#configuration)
+- [HTTP server](#http-server)
+- [Channels and events](#channels-and-events)
+- [Clients and handlers](#clients-and-handlers)
+- [Sessions](#sessions)
+- [Environments and sandboxes](#environments-and-sandboxes)
+- [Keys and utilities](#keys-and-utilities)
+- [Stores and state](#stores-and-state)
+- [Runtime API](#runtime-api)
+- [Project loading](#project-loading)
+- [Testing API](#testing-api)
 
-## Definition contract
+## Quick API links
 
-`createChannel`, `createClient`, and `createEnvironment` invoke their builder callbacks immediately. The builders configure mutable definition data. Returned definitions are readonly-typed and remain inspectable for composition and diagnostics, but neither the definitions nor their arrays are frozen.
+| Area | APIs |
+| --- | --- |
+| Config | [`defineConfig`](#defineconfigfactory), [`OrchestratorConfig`](#orchestratorconfig), [`RetryOptions`](#retryoptions), [`HttpConfig`](#httpconfig) |
+| Channels | [`createChannel`](#createchannelid-setup), [`createManualChannel`](#createmanualchannelid), [`channel.poll`](#channelpolldefinition), [`Cursor`](#cursor) |
+| Events | [`DispatchEvent`](#dispatchevent), [`DispatchResult`](#dispatchresult), [dispatch methods](#dispatch-methods) |
+| Clients | [`createClient`](#createclientid-setup), [`ClientBuilder`](#clientbuilder), [`client.handle`](#clienthandlechannel-options), [`HandlerContext`](#handlercontext), [`HandlerTimeoutError`](#handlertimeouterror) |
+| Sessions and resources | [`Session`](#session), [`createEnvironment`](#createenvironmentid-setup), [`EnvironmentInstance`](#environmentinstance), [`SandboxDefinition`](#sandboxdefinition) |
+| Keys and utilities | [Typed state keys](#sessionkey-envkey-and-cursorkey), [`defineKey`](#definekeynamespace-options), [`parseDuration`](#parsedurationvalue), [`env`](#env) |
+| Stores | [`Store`](#store), [`memoryStore`](#memorystoreinitial), [`jsonFileStore`](#jsonfilestorepath-and-filestorepath), [state validation](#state-validation), [saved records](#saved-records) |
+| Runtime | [`createRuntime`](#createruntimeconfig-options), [`OrchestratorRuntime`](#new-orchestratorruntimeoptions), [start and stop](#start-and-stop-a-runtime), [`runOffline`](#runofflineoperation), [state retention](#state-retention) |
+| Projects and tests | [`ProjectContext`](#projectcontext), [project loading](#discovery-and-loading-functions), [`createTestRuntime`](#createtestruntimeconfig-options), [`TestRuntime`](#testruntime) |
 
-`OrchestratorRuntime.init()` snapshots configuration and registrations. Mutations completed before initialization are included. Changes to config arrays, polls, handlers, environments, retry defaults, or HTTP config after initialization do not affect that runtime. Live runtime reconfiguration is unsupported; construct a fresh runtime for a changed configuration.
+## Root exports
 
-## `defineConfig(factory)`
+Import these APIs from `simple-agent-orchestrator`.
 
-Defines a project-local orchestrator config.
+### Functions and classes
+
+| Export | Purpose |
+| --- | --- |
+| `defineConfig` | Defines project configuration. |
+| `createChannel` | Creates a channel that can register polls. |
+| `createManualChannel` | Creates a channel with no polls. |
+| `createClient` | Creates a client and its handlers. |
+| `createEnvironment` | Defines client process resources and an optional session sandbox. |
+| `HandlerTimeoutError` | Identifies a cooperative handler timeout. |
+| `StateValidationError` | Reports invalid saved state or an unsupported state version. |
+| `CURRENT_STATE_VERSION` | Current saved-state format version. |
+| `MINIMUM_STATE_VERSION` | Oldest state version accepted for migration. |
+| `defineKey` | Builds stable namespaced string keys. |
+| `sessionKey` | Creates a typed session-state key. |
+| `envKey` | Creates a typed environment-value key. |
+| `cursorKey` | Creates a typed cursor key. |
+| `memoryStore` | Creates an isolated in-memory store. |
+| `jsonFileStore` | Creates a JSON-file store. |
+| `fileStore` | Alias for `jsonFileStore`. |
+| `validateAndMigrateState` | Checks decoded state and upgrades supported older versions. |
+| `parseDuration` | Converts a duration value to milliseconds. |
+| `env` | Reads and validates process environment variables. |
+
+### Exported types
+
+| Domain | Types |
+| --- | --- |
+| Config | `DefineConfigContext`, `ConfigFactory`, `HttpConfig`, `HttpDispatch`, `HttpRegistrationContext`, `HttpRegistrationHook`, `OrchestratorConfig` |
+| Channels | `ChannelBuilder`, `ChannelDefinition`, `ChannelRuntimeApi`, `Cursor`, `PollCommitContext`, `PollContext`, `PollDefinition` |
+| Clients | `ClientBuilder`, `ClientDefinition`, `EventHandler`, `HandlerContext`, `HandleOptions` |
+| Environments | `EnvironmentBuilder`, `EnvironmentDefinition`, `EnvironmentHookContext`, `EnvironmentInstance`, `SandboxContext`, `SandboxDefinition` |
+| Events and state | `ConcurrencyOptions`, `DispatchEvent`, `DispatchResult`, `JsonRecord`, `JsonValue`, `OrchestratorEvent`, `OrchestratorState`, `ProjectContext`, `RetryOptions`, `SessionNote`, `StoredDelivery`, `StoredEvent`, `StoredSession` |
+| Keys and logging | `KeyBuilder`, `KeyLike`, `Logger`, `StateKey` |
+| Sessions | `Session`, `SessionEndOptions` |
+| Stores | `StateValidationErrorCode`, `Store` |
+
+## When definitions are read
+
+Builder callbacks run during `createChannel`, `createClient`, and `createEnvironment`. Returned definitions are readonly-typed and inspectable, but not frozen.
+
+`runtime.init()` snapshots the configured definitions. Later changes do not affect that runtime; create a new runtime to apply them.
+
+## Configuration
+
+### `defineConfig(factory)`
+
+Returns the config object or factory unchanged. Use it as the typed default export of a config file.
+
+```ts
+declare function defineConfig(factory: ConfigFactory): ConfigFactory;
+
+type ConfigFactory =
+  | OrchestratorConfig
+  | ((context: DefineConfigContext) =>
+      OrchestratorConfig | Promise<OrchestratorConfig>);
+
+interface DefineConfigContext {
+  project: ProjectContext;
+}
+```
+
+Example:
 
 ```ts
 export default defineConfig(({ project }) => ({
@@ -28,10 +115,10 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-### Config fields
+### `OrchestratorConfig`
 
 ```ts
-type OrchestratorConfig = {
+interface OrchestratorConfig {
   name?: string;
   store?: Store;
   channels?: readonly ChannelDefinition[];
@@ -40,117 +127,199 @@ type OrchestratorConfig = {
   retries?: RetryOptions;
   timeout?: number | string;
   http?: HttpConfig;
-};
-
-type RetryOptions = {
-  attempts?: number;
-  delay?: number | string;
-};
+}
 ```
 
-`attempts` counts the first attempt and defaults to `3`. `delay` is a fixed wait between failed automatic attempts; it accepts milliseconds or the same `ms`, `s`, `m`, and `h` strings as poll intervals and defaults to `0`. Positive fractional values round up to one whole millisecond. The maximum is `2_147_483_647` ms (about 24.9 days).
+| Field | Default | Description |
+| --- | --- | --- |
+| `name` | `undefined` | Optional configuration name. |
+| `store` | Depends on the construction API | Store for events, deliveries, sessions, notes, and cursors. |
+| `channels` | `[]` | Globally unique channel definitions. |
+| `clients` | `[]` | Globally unique client definitions. |
+| `logger` | Console logger | Logger used by the runtime. |
+| `retries` | Three attempts, zero delay | Global retry defaults. |
+| `timeout` | `0` | Global handler timeout. Zero disables it. |
+| `http` | Enabled by `start()` | Built-in server and project route configuration. |
 
-`timeout` is the default cooperative deadline for each delivery attempt. It uses the same duration format, rounding, and maximum; `0` disables it. It does not apply to polls or environment mount/unmount hooks.
-
-`defineConfig` is an identity helper. It accepts an `OrchestratorConfig` object or a synchronous/asynchronous factory receiving `{ project: ProjectContext }` and returns that value for project loaders, `createRuntime`, or `createTestRuntime` to resolve.
-
-### HTTP config
+### `RetryOptions`
 
 ```ts
-type HttpConfig = {
+interface RetryOptions {
+  attempts?: number;
+  delay?: number | string;
+}
+```
+
+`attempts` includes the first attempt and is clamped to at least one. `delay` is fixed; there is no backoff or jitter.
+
+Duration values accept milliseconds as numbers or strings using `ms`, `s`, `m`, or `h`. Positive retry delays and timeouts are rounded up to a whole millisecond and cannot exceed `2_147_483_647` ms.
+
+## HTTP server
+
+### `HttpConfig`
+
+```ts
+interface HttpConfig {
   enabled?: boolean;
   hostname?: string;
   port?: number;
-  middleware?: (context: HttpRegistrationContext) => void | Promise<void>;
-  routes?: (context: HttpRegistrationContext) => void | Promise<void>;
-};
+  middleware?: HttpRegistrationHook;
+  routes?: HttpRegistrationHook;
+}
 
-type HttpRegistrationContext = {
+type HttpRegistrationHook =
+  (context: HttpRegistrationContext) => void | Promise<void>;
+
+interface HttpRegistrationContext {
   app: Hono;
   project: ProjectContext;
   logger: Logger;
   signal: AbortSignal;
-  dispatch(channelId: string, event: DispatchEvent): Promise<{
-    status: "queued" | "duplicate";
-    eventId: string;
-  }>;
-};
+  dispatch: HttpDispatch;
+}
+
+type HttpDispatch = (
+  channelId: string,
+  event: DispatchEvent,
+) => Promise<DispatchResult>;
 ```
 
-Ordinary `start()` binds a Hono listener by default. The default is `127.0.0.1:3000`; the port resolves from `SAO_HTTP_PORT`, then `http.port`, then `3000`. Ports must be base-10 integers from `1` through `65535`. On `EADDRINUSE`, startup tries at most nine subsequent ports without probing and never wraps; all other listen errors fail immediately. The final URL and requested/actual ports are logged.
+`runtime.start()` starts HTTP by default. Disable it with config `http.enabled: false` or start option `{ http: false }`. The hostname defaults to `127.0.0.1`. Port precedence is `SAO_HTTP_PORT`, `http.port`, then `3000`.
 
-The awaited `middleware` hook runs before built-ins and the awaited `routes` hook runs afterward. Both are trusted project config. `GET /health` returns `{ "status": "ok" }` after ordinary runtime startup completes. `/health`, `/webhooks/*`, and `/api/v1/*` are reserved. The server does not provide authentication, authorization, signature verification, CORS, rate limiting, TLS, or exposure policy. A non-loopback bind logs a warning, but loopback is not an authentication boundary. Unauthenticated dispatch can trigger project side effects and unbounded durable state growth.
+If the selected port is in use, startup tries up to the next nine ports without going past `65535`. The runtime logs the bound address.
 
-The built-in webhook and operational handlers have the validation and response contracts below. Project middleware and custom handlers are ordinary trusted Hono code and are not constrained from reading, logging, or returning request/event content. JSON state and default/project logs are plaintext and are not automatically redacted.
+`middleware` runs before built-in routes; `routes` runs after them. Startup awaits both hooks. Their `signal` aborts during runtime shutdown.
 
-`POST /webhooks/:channelId` accepts a normalized event with `Content-Type: application/json` and a maximum encoded body size of 1 MiB. The body is an object with required non-whitespace `id`; optional `type`, `dedupeKey`, and `sessionKey` strings; optional JSON-safe `input` and `payload`; optional JSON object `meta`; and optional valid date string `occurredAt`. Unknown fields, primitives, arrays, malformed JSON, non-finite numbers, more than 100 levels of nesting, identifiers over 512 characters, and types over 256 characters are rejected. A new durable dispatch returns `202 { "status": "queued", "eventId": "..." }`; a duplicate returns `200 { "status": "duplicate", "eventId": "..." }` with the original internal ID. This confirms durable ingestion only and does not wait for handlers or promise exactly-once processing.
+The server provides no authentication, authorization, provider signature verification, CORS, rate limiting, or TLS.
 
-Webhook errors use `{ "error": { "code": "...", "message": "..." } }`: `400 invalid_request`, `404 unknown_channel`, `413 payload_too_large`, `415 unsupported_media_type`, or `500 internal_error`. Internal failures do not expose runtime messages or stack traces.
+### Built-in routes
 
-`GET /api/v1/status` returns `uptimeMs`, the actual bound `http.hostname` and `http.port`, event and session totals, and delivery totals for `pending`, `processing`, `processed`, and `failed`. `GET /api/v1/events?limit=N` returns `{ events, hasMore }`; each summary contains the internal and source IDs, channel, dedupe key, session key, optional type and occurrence time, receive time, and aggregate delivery counts. It omits input, payload, metadata, errors, and individual deliveries. `GET /api/v1/sessions?limit=N` returns `{ sessions, hasMore }` with IDs, keys, statuses, and lifecycle timestamps, omitting state, notes, and end reasons. Lists sort descending by `receivedAt` or `updatedAt`, then descending ID. The default limit is 25, the maximum is 100, and a missing limit is the only default; repeated, empty, non-integer, non-positive, or oversized values return `400 invalid_limit`.
+| Method and path | Response |
+| --- | --- |
+| `GET /health` | Runtime health. |
+| `POST /webhooks/:channelId` | Normalized event dispatch result. |
+| `GET /api/v1/status` | Runtime, event, session, and delivery totals. |
+| `GET /api/v1/events?limit=N` | Bounded event summaries. |
+| `GET /api/v1/sessions?limit=N` | Bounded session summaries. |
 
-## `createChannel(id, setup?)`
+`/health`, `/webhooks/*`, and `/api/v1/*` are reserved.
 
-Creates an event source.
+The webhook requires `Content-Type: application/json` and a body of at most 1 MiB. Only `DispatchEvent` fields are accepted. `id` must be non-empty; values must be JSON-safe; nesting is limited to 100 levels; identifiers to 512 characters; and `type` to 256 characters.
+
+| Result | Status |
+| --- | --- |
+| New event saved | `202` with `{ status: "queued", eventId }` |
+| Duplicate event | `200` with `{ status: "duplicate", eventId }` |
+| Invalid request | `400 invalid_request` |
+| Unknown channel | `404 unknown_channel` |
+| Body too large | `413 payload_too_large` |
+| Wrong media type | `415 unsupported_media_type` |
+| Internal error | `500 internal_error` |
+
+Operational lists default to 25 records. `limit` accepts 1 through 100. Responses omit event bodies, metadata, session state, notes, delivery errors, and individual deliveries.
+
+## Channels and events
+
+### `createChannel(id, setup?)`
+
+Creates a channel with optional polls.
 
 ```ts
-const channel = createChannel("github.reviews", (channel) => {
-  channel.poll({
-    id: "reviews",
-    every: "60s",
-    fetch: async () => [],
-    map: async (item) => ({ id: item.id }),
-  });
-});
+declare function createChannel(
+  id: string,
+  setup?: (channel: ChannelBuilder) => void,
+): ChannelDefinition;
+
+interface ChannelBuilder {
+  poll<TRaw = unknown>(definition: PollDefinition<TRaw>): void;
+}
+
+interface ChannelDefinition {
+  readonly id: string;
+  readonly polls: readonly PollDefinition[];
+  readonly dispatch: (event: DispatchEvent) => Promise<DispatchResult>;
+}
+```
+
+Channel IDs must be globally unique.
+
+### `createManualChannel(id?)`
+
+Creates a channel with no polls. The default ID is `manual`.
+
+```ts
+declare function createManualChannel(id?: string): ChannelDefinition;
 ```
 
 ### `channel.poll(definition)`
 
+Registers a poll on the channel.
+
 ```ts
-type PollDefinition<TRaw> = {
-  id?: string;
-  every: number | string;
-  immediate?: boolean;
-  fetch(ctx: PollContext): Promise<TRaw[]> | TRaw[];
-  map?(item: TRaw, ctx: PollContext): Promise<DispatchEvent | null | undefined> | DispatchEvent | null | undefined;
-  commit?(ctx: PollCommitContext<TRaw>): Promise<void> | void;
-};
+interface PollDefinition<TRaw = unknown> {
+  readonly id?: string;
+  readonly every: number | string;
+  readonly immediate?: boolean;
+  readonly fetch: (context: PollContext) => Promise<TRaw[]> | TRaw[];
+  readonly map?: (
+    item: TRaw,
+    context: PollContext,
+  ) => Promise<DispatchEvent | null | undefined>
+    | DispatchEvent
+    | null
+    | undefined;
+  readonly commit?: (
+    context: PollCommitContext<TRaw>,
+  ) => Promise<void> | void;
+}
 ```
 
-`every` accepts milliseconds as a number or a string such as `"500ms"`, `"30s"`, `"5m"`, or `"1h"`.
-
-`id` is an optional durable cursor identity. A named poll uses the cursor key `${channelId}:${id}`, so its cursor survives registration reordering. An unnamed poll keeps the positional key `${channelId}:${pollRegistrationIndex}` for compatibility and concise one-poll channels. Resolved poll IDs must be unique within a channel, and final cursor keys must be unique across the configuration. Name every poll in a multi-poll channel before reorganizing it; mixing named and positional polls can become ambiguous and is rejected when their resolved keys collide.
-
-Adding or renaming a descriptive `id` does not infer a cursor migration: it selects the cursor at the new key, which is empty if that key has never existed, while the old record remains in persisted state. Reusing a historical ID restores that ID's existing cursor, so do not recycle IDs for unrelated polls. To adopt IDs without changing existing keys, first assign each poll its current registration index as a string, such as `id: "0"`; those IDs then remain stable when the polls move.
-
-Poll order is `fetch`, sequential `map` and durable dispatch, `commit`, then cursor persistence. A failure rolls back cursor mutations but not events already dispatched. `commit` is an ingestion checkpoint and does not wait for handler success; use stable event dedupe keys for replay and acknowledge sources from a retry-safe, designated `onSuccess` hook. There is no event-wide hook that waits for every fan-out delivery.
-
-## `createManualChannel(id?)`
-
-Creates a channel with no polling behavior. It is useful for CLI dispatch and tests.
+`immediate` defaults to `true`. `every` accepts the package duration format.
 
 ```ts
-const manualChannel = createManualChannel("manual");
+interface PollContext {
+  channel: ChannelRuntimeApi;
+  cursor: Cursor;
+  project: ProjectContext;
+  logger: Logger;
+  signal: AbortSignal;
+}
+
+interface PollCommitContext<TRaw = unknown> extends PollContext {
+  items: TRaw[];
+  events: DispatchEvent[];
+}
 ```
 
-## Channel dispatch
+A poll runs `fetch`, maps each item sequentially, saves mapped events, runs `commit`, then saves cursor changes. On failure, cursor changes are discarded; events already saved remain in the store.
 
-Every `ChannelDefinition` includes `dispatch(event): Promise<DispatchResult>`. A runtime binds each registered definition when `init()` succeeds and unbinds it on `stop()`.
+A named poll uses cursor ID `${channelId}:${pollId}`. An unnamed poll uses `${channelId}:${registrationIndex}`. Renaming a named poll or reordering unnamed polls can select different saved cursor data; cursors are not migrated.
+
+Executions of the same poll do not overlap within one runtime process.
+
+### `Cursor`
+
+Reads and changes one poll's cursor values. All methods are synchronous.
 
 ```ts
-await manualChannel.dispatch({ id: "source-1" });
-await runtime.dispatch(manualChannel, { id: "source-2" });
-await runtime.dispatch("manual", { id: "source-3" });
+interface Cursor {
+  get<T = unknown>(key: KeyLike<T>): T | undefined;
+  set<T = unknown>(key: KeyLike<T>, value: T): void;
+  delete(key: KeyLike): void;
+  entries(): Record<string, unknown>;
+}
 ```
 
-`channel.dispatch` throws when the channel is not bound to an initialized runtime. It also throws when the same channel object is bound to multiple initialized runtimes, because it cannot select a destination. Use `runtime.dispatch(...)` to select explicitly. Object runtime dispatch requires the exact registered channel object; a lookalike definition with the same ID is unknown. String runtime dispatch resolves the registered global channel ID.
+Cursor changes are saved only after `fetch`, `map`, event dispatch, and `commit` succeed.
 
-All dispatch forms persist the event and matching deliveries before resolving. `queued` can have zero matching handlers. A duplicate creates no new deliveries and returns the original internal event ID.
-
-## `DispatchEvent`
+### `DispatchEvent`
 
 ```ts
-type DispatchEvent<TPayload = unknown, TInput = unknown, TMeta = Record<string, unknown>> = {
+interface DispatchEvent<
+  TPayload = unknown,
+  TInput = unknown,
+  TMeta extends Record<string, unknown> = Record<string, unknown>,
+> {
   id: string;
   type?: string;
   dedupeKey?: string;
@@ -159,81 +328,108 @@ type DispatchEvent<TPayload = unknown, TInput = unknown, TMeta = Record<string, 
   payload?: TPayload;
   meta?: TMeta;
   occurredAt?: Date | string;
-};
+}
 ```
 
-- `id` is required and should be stable for the source event.
-- `dedupeKey` defaults to `id`.
-- `sessionKey` defaults to `channelId:id`.
-- `input` is intended for agent-facing content.
-- `payload` is structured source data.
-- `meta` is lightweight metadata used for routing or resource setup.
+`dedupeKey` defaults to `id`. `sessionKey` defaults to `${channelId}:${id}`. Dedupe is scoped to channel ID and dedupe key.
 
-The normalized webhook transport is stricter than this in-process type: it accepts only JSON values, requires `occurredAt` to be a string, and applies the validation and size limits documented under HTTP config.
-
-## `createClient(id, setup)`
-
-Creates a delivery consumer.
+### `DispatchResult`
 
 ```ts
-const client = createClient("coding", (client) => {
-  client.retries({ attempts: 3, delay: "5s" });
-  client.timeout("10m");
-  client.handle(githubReviewsChannel, handleReview);
-});
+interface DispatchResult {
+  status: "queued" | "duplicate";
+  eventId: string;
+}
 ```
+
+`eventId` is the stored event's internal ID. `queued` does not imply that a handler matched. A duplicate creates no deliveries and returns the original event ID.
+
+### Dispatch methods
+
+```ts
+await channel.dispatch(event);
+await runtime.dispatch(channel, event);
+await runtime.dispatch(channelId, event);
+```
+
+Dispatch resolves after the event and all matching deliveries are saved to the store.
+
+`channel.dispatch` requires that exact channel definition to be bound to exactly one initialized runtime. `runtime.dispatch(channel, event)` requires the exact registered definition. `runtime.dispatch(channelId, event)` looks up the channel by ID.
+
+These methods do not acquire JSON-store ownership by themselves. Use them on a runtime that already owns the store through `start()` or `drain()`. For one-off persistent changes, use `runOffline()`. Unscoped direct calls are appropriate with isolated state such as `memoryStore()`.
+
+## Clients and handlers
+
+### `createClient(id, setup)`
+
+Creates a consumer and registers channel handlers.
+
+```ts
+declare function createClient(
+  id: string,
+  setup: (client: ClientBuilder) => void,
+): ClientDefinition;
+```
+
+Client IDs must be globally unique.
+
+### `ClientBuilder`
+
+```ts
+interface ClientBuilder {
+  useEnvironment(environment: EnvironmentDefinition): void;
+  concurrency(options: ConcurrencyOptions): void;
+  retries(options: RetryOptions): void;
+  timeout(value: number | string): void;
+  handle(channel: ChannelDefinition, handler: EventHandler | HandleOptions): void;
+}
+```
+
+`useEnvironment` sets one environment. A later call replaces it.
+
+A handler captures the client's retry and timeout defaults when `handle` is called. Precedence is handler, client, config, then package default.
 
 ### `client.handle(channel, handler)`
 
 ```ts
-client.handle(channel, async ({ event, session }) => {
-  session.set("lastEvent", event.id);
-});
+type EventHandler =
+  (context: HandlerContext) => Promise<void> | void;
 ```
 
 ### `client.handle(channel, options)`
 
 ```ts
-client.handle(channel, {
-  retries: { attempts: 5, delay: "30s" },
-  timeout: "2m",
-  async handle(ctx) {},
-  async onSuccess(ctx) {},
-  async onFailure({ error }) {},
-});
+interface HandleOptions<
+  TPayload = unknown,
+  TInput = unknown,
+  TMeta extends Record<string, unknown> = Record<string, unknown>,
+> {
+  readonly id?: string;
+  readonly retries?: RetryOptions;
+  readonly timeout?: number | string;
+  readonly handle: EventHandler<TPayload, TInput, TMeta>;
+  readonly onSuccess?: EventHandler<TPayload, TInput, TMeta>;
+  readonly onFailure?: (
+    context: HandlerContext<TPayload, TInput, TMeta> & { error: unknown },
+  ) => Promise<void> | void;
+}
 ```
 
-Attempt order is `handle`, `onSuccess`, required sandbox cleanup, then final persistence. An error from any step fails the attempt and can rerun `handle`. `onFailure` receives the original error when a handler context exists. Its own error is logged without replacing the original; setup failures before context creation do not invoke it.
+Default handler IDs use `${clientId}:${channelId}:${registrationIndex}` with a one-based index. Handler IDs must be unique within a client.
 
-Retry fields resolve independently in handler, client, global-config, then built-in order. The first attempt is immediate. A positive delay is captured on each delivery and stores the next eligibility time after a failed nonterminal attempt. Delayed work remains `pending`; normal workers process it after eligibility, including across restarts. `drain()` and `start({ drain: true })` process only currently eligible work and do not wait. Manual retry and interrupted-attempt recovery are immediately eligible.
+Each attempt creates the sandbox if needed, runs `handle`, runs `onSuccess`, cleans up the sandbox if the session ended, then saves the result. An error after context creation calls `onFailure`. Errors from `onFailure` are logged and do not replace the attempt error.
 
-Timeout resolves from the handler option, the client default captured when the handler is registered, global config, then `0` (disabled). The deadline covers sandbox creation, `handle`, `onSuccess`, and required sandbox cleanup. It aborts `HandlerContext.signal` and sandbox signals with an exported `HandlerTimeoutError`, waits for the current cooperative operation to settle, records that error, and applies ordinary retry rules. If runtime shutdown aborts first, the later deadline is cancelled and shutdown retains its existing semantics. `onFailure` receives the timeout error and already-aborted signal when a handler context exists; it is not itself deadline-bounded.
+Processing is retryable, not exactly once. `handle`, `onSuccess`, cleanup, and external effects can repeat. Keep external effects idempotent.
 
-Timeout cancellation is cooperative, not forced. Code that ignores `signal` can continue blocking indefinitely, and timed-out external operations may already have produced side effects. Pass `signal` to project-owned APIs and keep their effects retry-safe. A handler that catches cancellation and returns is still recorded as timed out.
-
-### `HandlerTimeoutError`
-
-Exported error with a numeric `timeoutMs` property. Use `error instanceof HandlerTimeoutError` in `onFailure` when timeout-specific reporting is needed. Its name and message are retained in the delivery's `lastError`.
-
-### `client.useEnvironment(environment)`
-
-Attaches an environment to the client.
+### `HandlerContext`
 
 ```ts
-client.useEnvironment(opencodeEnvironment);
-```
-
-### `client.concurrency(options)`
-
-```ts
-client.concurrency({ workers: 4, perSession: true });
-```
-
-## `HandlerContext`
-
-```ts
-type HandlerContext = {
-  event: OrchestratorEvent;
+interface HandlerContext<
+  TPayload = unknown,
+  TInput = unknown,
+  TMeta extends Record<string, unknown> = Record<string, unknown>,
+> {
+  event: OrchestratorEvent<TPayload, TInput, TMeta>;
   session: Session;
   environment: EnvironmentInstance;
   client: ClientDefinition;
@@ -241,303 +437,582 @@ type HandlerContext = {
   logger: Logger;
   attempt: number;
   signal: AbortSignal;
+}
+```
+
+`environment` and `signal` are always present. Without a configured environment, the client receives an empty environment with ID `default`.
+
+### `OrchestratorEvent`
+
+The event passed to handlers. It adds the channel ID, resolved dedupe and session keys, and receive time to `DispatchEvent`:
+
+```ts
+interface OrchestratorEvent extends DispatchEvent {
+  channelId: string;
+  dedupeKey: string;
+  sessionKey: string;
+  receivedAt: string;
+  occurredAt?: string;
+}
+```
+
+### `client.concurrency(options)`
+
+```ts
+interface ConcurrencyOptions {
+  workers?: number;
+  perSession?: boolean;
+}
+```
+
+Defaults: `workers: 1` and `perSession: false`. `workers` is clamped to at least one. `perSession: true` serializes that client's same-session deliveries within one runtime process.
+
+### `HandlerTimeoutError`
+
+```ts
+declare class HandlerTimeoutError extends Error {
+  readonly timeoutMs: number;
+}
+```
+
+On timeout, the runtime aborts the attempt's `signal` with this error. Timeout is cooperative: code that ignores the signal is not forcibly stopped. The timeout covers sandbox creation, `handle`, `onSuccess`, and sandbox cleanup.
+
+## Sessions
+
+### `Session`
+
+```ts
+interface Session {
+  readonly id: string;
+  readonly key: string;
+  readonly status: StoredSession["status"];
+
+  get<T = unknown>(key: KeyLike<T>): T;
+  getOptional<T = unknown>(key: KeyLike<T>): T | undefined;
+  set<T = unknown>(key: KeyLike<T>, value: T): void;
+  has(key: KeyLike): boolean;
+  delete(key: KeyLike): void;
+
+  ensure<T = unknown>(
+    key: KeyLike<T>,
+    factory: () => Promise<T> | T,
+  ): Promise<T>;
+
+  note(message: string, data?: unknown): void;
+  end(options?: SessionEndOptions): void;
+}
+
+interface SessionEndOptions {
+  reason?: string;
+}
+```
+
+`get` throws when the key is absent. `getOptional` returns `undefined`.
+
+`set`, `delete`, `note`, and `end` changes are saved only when the attempt succeeds. `ensure` saves its result immediately for reuse by retries.
+
+Ended sessions remain in the store. A later delivery with the same key creates a new active session.
+
+Concurrent deliveries merge changes to different state keys. For the same key, the last attempt to complete wins. A concurrent handler cannot undo `end()`.
+
+**Lookup caution:** Runtime and CLI inspection accept a session ID or key. If a key has historical and active records, lookup by key can return an older record. Use the session ID to select a specific record.
+
+## Environments and sandboxes
+
+### `createEnvironment(id, setup)`
+
+Creates process-local values for a client and an optional session sandbox.
+
+```ts
+declare function createEnvironment(
+  id: string,
+  setup: (environment: EnvironmentBuilder) => void,
+): EnvironmentDefinition;
+```
+
+### `EnvironmentBuilder`
+
+```ts
+interface EnvironmentBuilder {
+  onMount(hook: (context: EnvironmentHookContext) => Promise<void> | void): void;
+  onUnmount(hook: (context: EnvironmentHookContext) => Promise<void> | void): void;
+  useSandbox(sandbox: SandboxDefinition): void;
+}
+```
+
+A later `useSandbox` call replaces the previous sandbox definition.
+
+```ts
+interface EnvironmentHookContext {
+  environment: EnvironmentInstance;
+  project: ProjectContext;
+  logger: Logger;
+  signal: AbortSignal;
+}
+```
+
+Mount hooks run in registration order. Environments unmount in reverse mount order, and their hooks run in reverse registration order.
+
+### `EnvironmentInstance`
+
+Holds process-local values for one client. Values are not saved to the store.
+
+```ts
+interface EnvironmentInstance {
+  readonly id: string;
+  get<T = unknown>(key: KeyLike<T>): T;
+  getOptional<T = unknown>(key: KeyLike<T>): T | undefined;
+  set<T = unknown>(key: KeyLike<T>, value: T): void;
+  has(key: KeyLike): boolean;
+  delete(key: KeyLike): void;
+}
+```
+
+`get` throws when absent. Instances are scoped by client ID and environment ID.
+
+### `SandboxDefinition`
+
+```ts
+interface SandboxDefinition {
+  readonly create: (context: SandboxContext) => Promise<void> | void;
+  readonly cleanup?: (context: SandboxContext) => Promise<void> | void;
+}
+
+interface SandboxContext extends EnvironmentHookContext {
+  session: Session;
+  event: DispatchEvent;
+}
+```
+
+After `create` succeeds, its session changes and sandbox marker are saved immediately. `cleanup` runs after `handle` and `onSuccess` when the handler ends the session. A cleanup error fails the attempt.
+
+Sandbox locking is limited to one runtime process. `endSession` does not run cleanup. Stopping the runtime does not clean every active sandbox.
+
+## Keys and utilities
+
+### `sessionKey`, `envKey`, and `cursorKey`
+
+Create typed state keys.
+
+```ts
+interface StateKey<T = unknown> {
+  readonly name: string;
+  readonly scope: "session" | "environment" | "cursor";
+  readonly __type?: T;
+}
+
+declare function sessionKey<T = unknown>(name: string): StateKey<T>;
+declare function envKey<T = unknown>(name: string): StateKey<T>;
+declare function cursorKey<T = unknown>(name: string): StateKey<T>;
+```
+
+Accessors also accept plain strings through `KeyLike<T> = StateKey<T> | string`.
+
+### `defineKey(namespace, options?)`
+
+Returns a builder for deterministic, URI-encoded string keys.
+
+```ts
+declare function defineKey<
+  TParts extends Record<string, string | number | boolean>,
+>(
+  namespace: string,
+  options?: { parts?: readonly (keyof TParts)[] },
+): KeyBuilder<TParts>;
+```
+
+When `parts` is omitted, part names are sorted. Output uses `namespace:key=value:key=value`.
+
+```ts
+const pullRequest = defineKey<{ owner: string; number: number }>(
+  "github.pr",
+  { parts: ["owner", "number"] },
+);
+
+pullRequest({ owner: "acme", number: 42 });
+// github.pr:owner=acme:number=42
+```
+
+### `parseDuration(value)`
+
+```ts
+declare function parseDuration(value: number | string): number;
+```
+
+Returns milliseconds. Strings accept decimal values with `ms`, `s`, `m`, or `h`. Negative, non-finite, and unsupported values throw.
+
+### `env`
+
+```ts
+declare const env: {
+  required(name: string): string;
+  optional(name: string, fallback?: string): string | undefined;
+  number(name: string, fallback?: number): number;
+  duration(name: string, fallback: number | string): number;
+  getRequiredNames(): string[];
 };
 ```
 
-`signal` is aborted by either runtime shutdown or the configured attempt timeout. Pass it through to cancellation-aware project operations.
+`required` treats an empty value as missing. `number` validates numeric input. `duration` uses `parseDuration`. Required names are tracked for `doctor` output.
 
-## `Session`
+## Stores and state
 
-```ts
-session.id;
-session.key;
-session.status;
+### `Store`
 
-session.get(key);
-session.getOptional(key);
-session.set(key, value);
-session.has(key);
-session.delete(key);
-
-await session.ensure(key, factory);
-session.note(message, data);
-session.end({ reason });
-```
-
-Ordinary handler/hook state changes, notes, and `session.end()` are committed only after the complete delivery attempt succeeds. Failed-attempt changes are discarded. Values created through `session.ensure` and state mutations made during sandbox creation are persisted eagerly so retries reuse them, but external work is not atomic with those writes and can repeat after an uncertain failure.
-
-## `sessionKey`, `envKey`, `cursorKey`
-
-Typed state keys.
+A store reads and writes the complete runtime state.
 
 ```ts
-const agentSessionId = sessionKey<string>("agent.sessionId");
-const serverUrl = envKey<string>("opencode.serverUrl");
-const cursor = cursorKey<string>("lastUpdatedAt");
-```
-
-## `defineKey(namespace, options?)`
-
-Builds stable namespaced keys for session or dedupe ids.
-
-```ts
-const githubPr = defineKey<{ owner: string; repo: string; number: number }>(
-  "github.pr",
-  { parts: ["owner", "repo", "number"] },
-);
-
-const sessionKey = githubPr({ owner: "acme", repo: "api", number: 42 });
-```
-
-Output:
-
-```text
-github.pr:owner=acme:repo=api:number=42
-```
-
-## `createEnvironment(id, setup)`
-
-Creates a client environment.
-
-```ts
-const environment = createEnvironment("opencode", (environment) => {
-  environment.onMount(async ({ environment }) => {
-    environment.set("serverUrl", "http://localhost:1234");
-  });
-
-  environment.onUnmount(async () => {});
-});
-```
-
-### `environment.useSandbox(definition)`
-
-```ts
-environment.useSandbox({
-  async create({ session, event }) {},
-  async cleanup({ session }) {},
-});
-```
-
-Completed sandbox creation, its state mutations, and its marker are persisted eagerly and reused across normal handler retries and restarts. Cleanup runs after `handle` and `onSuccess` when the handler called `session.end()`, and cleanup failure fails the attempt. If cleanup succeeds but final delivery persistence fails, a retry creates a new sandbox. Sandbox locking is process-local, and marker persistence is not atomic with external work, so hooks must reconcile the complete create-cleanup-recreate lifecycle by stable identity.
-
-## Delivery guarantees
-
-Processing is retryable, not exactly once. Event dedupe prevents duplicate dispatch records; it does not prevent handlers, hooks, resource operations, or source acknowledgement from repeating after a failed attempt. Use stable operation-specific external idempotency keys that do not include `attempt`. See [Failure semantics and idempotency](guides/failure-semantics.md).
-
-A webhook `202` is returned after event and matching-delivery persistence, before delivery processing. A `200 duplicate` identifies the original event; neither response reports processing success.
-
-`StoredDelivery.retryDelayMs` records the resolved fixed delay. A pending delivery with `nextAttemptAt` is delayed until that durable timestamp; `listEvents()` and `events list` expose it for inspection.
-
-## Stores
-
-### `memoryStore(initial?)`
-
-In-memory store for tests and examples.
-
-### `jsonFileStore(path)` / `fileStore(path)`
-
-Persistent JSON-file store.
-
-```ts
-jsonFileStore(project.statePath("state.json"));
-```
-
-The current state version is `CURRENT_STATE_VERSION` (`3`), and `MINIMUM_STATE_VERSION` is `1`. JSON reads and writes validate the complete snapshot, including entity shapes, statuses, retry counters and eligibility, unique IDs, references, cursor records, and JSON-safe durable values up to 100 nested levels. Valid version 1 and 2 snapshots are deterministically migrated in memory with `retryDelayMs: 0`; read-only inspection leaves the file unchanged, while the next successful write persists version 3. Missing files are initialized with a current empty snapshot. Invalid JSON, invalid state, versions older than 1, and versions newer than 3 throw `StateValidationError` without replacing the file. Its `code` is `invalid-json`, `invalid-state`, or `unsupported-version`.
-
-`validateAndMigrateState(value, source?)` is available for custom stores that decode untrusted persisted data. It returns a validated current `OrchestratorState` or throws `StateValidationError`. Custom `Store.read()` implementations are responsible for returning a valid current snapshot.
-
-The store interface is:
-
-```ts
-type Store = {
+interface Store {
   readonly name: string;
   readonly runtimeLockPath?: string;
   init(): Promise<void>;
   read(): Promise<OrchestratorState>;
   write(state: OrchestratorState): Promise<void>;
-};
+}
 ```
 
-`runtimeLockPath` opts a store into local single-active-runtime enforcement. `jsonFileStore` sets it automatically beside the state file. Custom stores should set it when they rely on the runtime's process-local coordination. A store may omit it when each runtime has isolated state or when the store independently rejects additional active runtimes; the snapshot `Store` interface does not make coordinated multi-runtime execution safe.
+When `runtimeLockPath` is present, the runtime prevents a second local process from owning that store. The lock does not coordinate processes on different machines.
 
-Atomic missing-state initialization and local ownership records use hard links and therefore require a local hard-link-capable filesystem. Unsupported filesystems fail initialization or startup with an explicit error rather than risking replacement or running without ownership enforcement.
+### `memoryStore(initial?)`
+
+```ts
+declare function memoryStore(initial?: Partial<OrchestratorState>): Store;
+```
+
+Creates an isolated in-memory store. Reads and writes clone values.
+
+### `jsonFileStore(path)` and `fileStore(path)`
+
+```ts
+declare function jsonFileStore(filePath: string): Store;
+const fileStore = jsonFileStore;
+```
+
+Creates and validates a JSON state file. Each write uses a temporary file and rename. Initial file creation and runtime locking require a local filesystem with atomic hard-link support.
+
+Only one runtime or `runOffline()` scope can change a JSON state file at a time. Unscoped concurrent writers are not supported.
+
+Saved event, session, note, and cursor values must be JSON-safe. The state file is plaintext and is not automatically redacted.
+
+### State validation
+
+```ts
+const CURRENT_STATE_VERSION = 3;
+const MINIMUM_STATE_VERSION = 1;
+
+declare function validateAndMigrateState(
+  value: unknown,
+  source?: string,
+): OrchestratorState;
+
+declare class StateValidationError extends Error {
+  readonly code: StateValidationErrorCode;
+}
+
+type StateValidationErrorCode =
+  | "invalid-json"
+  | "invalid-state"
+  | "unsupported-version";
+```
+
+Valid version 1 and 2 state is migrated in memory to version 3. Inspection does not rewrite the file. The next successful write saves version 3.
+
+### Saved records
+
+```ts
+interface OrchestratorState {
+  version: 3;
+  sessions: StoredSession[];
+  events: StoredEvent[];
+  deliveries: StoredDelivery[];
+  notes: SessionNote[];
+  cursors: Record<string, Record<string, unknown>>;
+}
+```
+
+`StoredSession` contains ID, key, status, state, and creation, update, and end timestamps. Status is `active`, `ended`, `failed`, or `paused`.
+
+`StoredEvent` contains internal `id`, source `sourceId`, channel ID, dedupe and session keys, body fields, and occurrence and receive timestamps.
+
+`StoredDelivery` contains event, client, and handler IDs; status; attempt counts; retry delay; next time it can run; last error; and session ID. Status is `pending`, `processing`, `processed`, or `failed`.
+
+`SessionNote` contains its ID, session ID, message, optional data, and creation time.
 
 ## Runtime API
 
-Import from `simple-agent-orchestrator/runtime`.
+Import runtime APIs from `simple-agent-orchestrator/runtime`.
+
+### Runtime exports
+
+| Values | Types |
+| --- | --- |
+| `OrchestratorRuntime`, `createRuntime`, `createProjectContext`, `findConfigFile`, `findProjectRoot`, `loadConfigFile`, `loadProjectConfig`, `loadProjectOrchestrator` | `RuntimeOptions`, `StartOptions`, `OfflineOperationContext`, `StatePruneBlockedSessionReason`, `StatePruneOptions`, `StatePrunePlan`, `CreateRuntimeOptions`, `LoadProjectOptions` |
 
 ### `createRuntime(config, options?)`
 
-```ts
-import { createRuntime } from "simple-agent-orchestrator/runtime";
+Creates an uninitialized runtime.
 
-const runtime = await createRuntime(
-  ({ project }) => ({
-    name: String(project.packageJson.name ?? "orchestrator"),
-    channels: [manualChannel],
-    clients: [exampleClient],
-  }),
-  { root: process.cwd() },
-);
+```ts
+declare function createRuntime(
+  factory: ConfigFactory,
+  options?: CreateRuntimeOptions,
+): Promise<OrchestratorRuntime>;
 ```
 
-`config` is an object or synchronous/asynchronous config factory. Options either supply `{ project: ProjectContext }` or project discovery fields `{ cwd?: string, root?: string }`; combining `project` with `cwd` or `root` is rejected. When config omits `store`, `createRuntime` uses `jsonFileStore(project.statePath("state.json"))`. It resolves config and constructs the runtime but does not start it or call `init()`.
+Options accept either `project` or the project discovery fields `cwd` and `root`. If config omits `store`, `createRuntime` uses `jsonFileStore(project.statePath("state.json"))`.
 
-### Project loading
+### `new OrchestratorRuntime(options)`
 
-```ts
-import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
-
-const { runtime } = await loadProjectOrchestrator({ root: process.cwd() });
-await runtime.start();
-// Or disable only this start's listener:
-// await runtime.start({ http: false });
-```
-
-`findProjectRoot`, `createProjectContext`, `findConfigFile`, `loadConfigFile`, `loadProjectConfig`, and `loadProjectOrchestrator` are also exported for tooling. `LoadProjectOptions` accepts `cwd`, `root`, and `config`. TypeScript config loading uses `tsx` and executes trusted project code without type-checking it.
-
-### Low-level constructor and initialization
+Constructs a runtime from a project context and resolved config.
 
 ```ts
-import { OrchestratorRuntime } from "simple-agent-orchestrator/runtime";
+interface RuntimeOptions {
+  project: ProjectContext;
+  config: OrchestratorConfig;
+}
 
 const runtime = new OrchestratorRuntime({ project, config });
 await runtime.init();
 ```
 
-The constructor plus explicit `init()` is the low-level API for callers that already own project/config/store assembly. Unlike `createRuntime`, an omitted store here uses the runtime's in-memory default. `init()` compiles and validates the configuration, initializes and reads the store, snapshots definitions, and binds channels. Public runtime methods initialize lazily when needed. Prefer `createRuntime(config, options)` for programmatic persistent use and project loaders for CLI-style config discovery.
+If config omits `store`, the constructor uses `memoryStore()`. `createRuntime` uses the project JSON store instead.
 
-Each runtime instance has one lifecycle. `start()` may be called once; duplicate starts, a start after direct draining, and restart after `stop()` or failed startup are rejected. A direct `drain()` claims the runtime for draining and may be repeated sequentially until `stop()`, but overlapping drains are rejected. `stop()` rejects while startup or a drain is in progress, shares cleanup across concurrent calls, and is otherwise idempotent. Dispatch and administrative mutation methods reject after stop; inspection remains available. Create a fresh runtime rather than attempting to restart a stopped instance.
-
-A drain stops when no delivery is currently eligible. It never sleeps for a future `nextAttemptAt`; delayed work remains durable for a later drain or for workers started by normal `start()`.
-
-Runtime initialization reads state before attaching channels or starting work. Invalid state therefore rejects startup before polls, environment hooks, recovery, HTTP setup, or handlers run. Ordinary startup acquires ownership, validates state, recovers interrupted deliveries, mounts environments, sets up and binds HTTP, then starts pollers and workers. Route setup or listener failure therefore rolls back without starting orchestration side effects. Failed startup closes HTTP, aborts in-flight work, clears intervals, unmounts environments, and releases store ownership before rejecting. Environments are unmounted in reverse mount order, their hooks run in reverse registration order, and cleanup continues after a hook fails. A later `stop()` retries only unresolved cleanup. When startup and shutdown both fail, the runtime throws an `AggregateError` containing both failures.
-
-Shutdown first stops HTTP acceptance and closes idle connections, then waits for accepted webhook, custom request, dispatch, administrative mutation, and worker work before unmounting environments and releasing ownership. HTTP-close, environment, and ownership failures are aggregated, and repeated or concurrent `stop()` calls retain the existing deterministic retry behavior.
-
-Inspection methods can use the loaded runtime while it is active:
+### Start and stop a runtime
 
 ```ts
-await runtime.listSessions();
-await runtime.getSession(idOrKey);
-await runtime.listSessionNotes(idOrKey);
-await runtime.listEvents();
-await runtime.printConfig();
-await runtime.previewStatePrune({ before: "2026-01-01T00:00:00Z" });
-```
+interface StartOptions {
+  drain?: boolean;
+  prettyStartupLog?: boolean;
+  http?: boolean;
+}
 
-The complete public method surface is:
-
-```ts
 await runtime.init();
-await runtime.start({ drain: false, prettyStartupLog: true, http: false });
-await runtime.stop();
+await runtime.start(options);
 await runtime.drain();
-await runtime.runOffline(operation);
-await runtime.dispatch(channelDefinitionOrId, event);
-await runtime.listSessions();
-await runtime.getSession(idOrKey);
-await runtime.listSessionNotes(idOrKey);
-await runtime.endSession(idOrKey, reason);
-await runtime.listEvents(); // Array<{ event, deliveries }>
-await runtime.previewStatePrune(options);
-await runtime.pruneState(options);
-await runtime.retryDelivery(deliveryId);
-await runtime.printConfig();
-runtime.project;
+await runtime.stop();
 ```
 
-Mutation methods return booleans when absence/inapplicability is a normal library result: `endSession` is false only when no session matches; `retryDelivery` is false unless a failed delivery matches. CLI commands layer stricter missing/inapplicable errors over these methods.
+- `init()` validates and snapshots config, initializes the store, and binds channels.
+- `start()` mounts environments, starts HTTP, pollers, and workers, and holds the store lock until `stop()`.
+- `start({ drain: true })` polls once, processes work that can run now, stops, and releases the store lock.
+- `drain()` processes work that can run now without starting HTTP or unmounting environments. Call `stop()` afterward.
+- `stop()` stops new HTTP requests and closes idle connections, waits for accepted requests and active work, unmounts environments, and releases the store lock.
 
-These in-process methods and CLI inspection can expose complete stored records. The operational HTTP API is separately bounded and sanitized.
+A runtime is one-shot. Create a new instance after stop or failed startup. Sequential `drain()` calls are supported; overlapping calls reject. Drains do not wait for future retry times.
 
-`previewStatePrune(options)` returns a `StatePrunePlan` without writing. `before` is a `Date` or an ISO 8601 timestamp with a timezone. Only processed deliveries whose `processedAt` is strictly before the cutoff are selected. Ended sessions whose `endedAt` is before the cutoff are selected only when no retained delivery references them and no durable `__sao.sandbox.*.created` marker is true; their notes are selected with them. Pending, processing, and failed deliveries, active/paused/failed sessions, cursors, missing or invalid historical timestamps, and sessions with active sandbox markers are preserved.
+Startup and drain return saved `processing` deliveries to `pending`. The interrupted attempt remains counted; if it exhausted the retry limit, recovery grants one replacement attempt.
 
-Events are the dedupe ledger and are retained by default. Set `dropDedupe: true` to select events whose `receivedAt` is before the cutoff and which have no retained delivery. Removing them allows the same `channelId + dedupeKey` to dispatch again. The plan reports exact `deliveryIds`, `sessionIds`, `noteIds`, and `eventIds`, otherwise-eligible events preserved by default in `dedupeProtectedEventIds`, and ended sessions blocked by a retained delivery or sandbox marker.
-
-Use a fresh runtime for an offline mutation:
-
-```ts
-const { runtime: offlineRuntime } = await loadProjectOrchestrator();
-await offlineRuntime.runOffline(async ({ dispatch, drain, endSession }) => {
-  await dispatch(channelId, event);
-  await drain();
-  await endSession("completed-work", "operator");
-});
-```
-
-`pruneState(options)` recomputes and applies the same plan under the runtime mutex. Use it inside `runOffline()` so persistent stores also hold runtime ownership; a prior preview is advisory and may become stale. No write occurs when the plan selects nothing. Back up persistent state before applying retention, especially with `dropDedupe`.
-
-For a direct drain lifecycle, use another fresh runtime and pair `drain()` with `stop()`:
+### Runtime dispatch and inspection
 
 ```ts
-const { runtime: drainRuntime } = await loadProjectOrchestrator();
-try {
-  await drainRuntime.drain();
-} finally {
-  await drainRuntime.stop();
+declare class OrchestratorRuntime {
+  readonly project: ProjectContext;
+  dispatch(
+    channel: ChannelDefinition | string,
+    event: DispatchEvent,
+  ): Promise<DispatchResult>;
+  listSessions(): Promise<StoredSession[]>;
+  getSession(idOrKey: string): Promise<StoredSession | undefined>;
+  listSessionNotes(idOrKey: string): Promise<SessionNote[]>;
+  listEvents(): Promise<Array<{
+    event: StoredEvent;
+    deliveries: StoredDelivery[];
+  }>>;
+  printConfig(): Promise<Record<string, unknown>>;
 }
 ```
 
-`start()` and `drain()` acquire the configured store's runtime lock and hold it until `stop()`; `start({ drain: true })` releases it automatically even when polling, mounting, or processing fails. After ownership is acquired, every processing lifecycle automatically requeues persisted `processing` deliveries and warns with their IDs and interrupted attempt numbers. Recovery preserves the consumed attempt and grants one replacement attempt only when needed to make an interruption at the retry limit eligible again. The complete handler attempt may repeat, including uncertain external effects.
+Store-backed inspection works after stop. Mutation methods reject after stop.
 
-HTTP starts only for ordinary `start()`. It does not start for `start({ drain: true })`, direct `drain()`, `runOffline()`, project/config loading, inspection commands, or `createTestRuntime()` initialization.
-
-`runOffline(operation)` requires an unused runtime, acquires the same ownership before invoking the callback, then always stops the one-shot runtime and releases ownership. It accepts synchronous or asynchronous callbacks and returns their value. An active owner or initialization failure prevents callback invocation. Context operations started by the callback are settled before ownership is released, even if the callback does not return their promises. Calls started after the callback settles reject, so do not retain the context.
+### Administrative mutations
 
 ```ts
-type OfflineOperationContext = {
-  dispatch(channel: ChannelDefinition | string, event: DispatchEvent): Promise<DispatchResult>;
+declare class OrchestratorRuntime {
+  endSession(idOrKey: string, reason?: string): Promise<boolean>;
+  retryDelivery(deliveryId: string): Promise<boolean>;
+}
+```
+
+`endSession` returns `false` if no session matches. It does not run sandbox cleanup.
+
+`retryDelivery` returns `false` unless the delivery exists with status `failed`. On success, it grants one additional attempt that can run now.
+
+For a JSON-file store, call administrative mutations inside `runOffline()` while no active runtime owns the file.
+
+### `runOffline(operation)`
+
+Runs mutations while holding the store lock, without background workers or HTTP. The one-shot runtime stops when the operation finishes.
+
+```ts
+await runtime.runOffline(async ({ dispatch, drain, endSession }) => {
+  await dispatch("manual", { id: "one" });
+  await drain();
+  await endSession("demo", "operator");
+});
+```
+
+```ts
+interface OfflineOperationContext {
+  dispatch(
+    channel: ChannelDefinition | string,
+    event: DispatchEvent,
+  ): Promise<DispatchResult>;
   drain(): Promise<void>;
   endSession(idOrKey: string, reason?: string): Promise<boolean>;
   retryDelivery(deliveryId: string): Promise<boolean>;
   pruneState(options: StatePruneOptions): Promise<StatePrunePlan>;
-};
+}
 ```
 
-The owned `drain()` processes eligible deliveries and performs interrupted-delivery recovery. `endSession` returns false when absent. `retryDelivery` returns false unless the delivery exists and is failed. `pruneState` recomputes and applies its plan under the mutex. Mutation-only scopes do not recover interrupted deliveries unless they call `drain()`.
+The runtime waits for every context operation started before callback settlement, including unreturned promises. Context calls started after callback settlement reject.
 
-This is local process-ownership enforcement, not general multi-process store coordination. Mutation methods called outside `start()`, `drain()`, or `runOffline()` do not independently acquire ownership.
+### State retention
+
+```ts
+interface StatePruneOptions {
+  before: Date | string;
+  dropDedupe?: boolean;
+}
+
+declare class OrchestratorRuntime {
+  previewStatePrune(options: StatePruneOptions): Promise<StatePrunePlan>;
+  pruneState(options: StatePruneOptions): Promise<StatePrunePlan>;
+}
+```
+
+Pruning selects processed deliveries strictly older than `before`. It selects old ended sessions and notes only when no retained delivery or active sandbox refers to them.
+
+Events remain as dedupe records unless `dropDedupe` is `true`. Removing an event allows the same channel ID and dedupe key to be accepted again.
+
+`StatePrunePlan` reports selected delivery, session, note, and event IDs; dedupe-protected events; and sessions blocked by `active-sandbox` or `retained-delivery`.
+
+For persistent stores, call `pruneState` inside `runOffline`. Preview and back up the state before applying the plan.
+
+## Project loading
+
+### `ProjectContext`
+
+```ts
+interface ProjectContext {
+  root: string;
+  orchestratorDir: string;
+  packageJson: Record<string, unknown>;
+  resolve(...parts: string[]): string;
+  fromRoot(...parts: string[]): string;
+  fromOrchestrator(...parts: string[]): string;
+  statePath(...parts: string[]): string;
+  cachePath(...parts: string[]): string;
+}
+```
+
+### Discovery and loading functions
+
+```ts
+declare function findProjectRoot(options?: {
+  cwd?: string;
+  root?: string;
+  config?: string;
+}): Promise<string>;
+
+declare function createProjectContext(root: string): Promise<ProjectContext>;
+
+declare function findConfigFile(
+  project: ProjectContext,
+  explicitConfig?: string,
+): Promise<string>;
+
+declare function loadConfigFile(
+  configFile: string,
+  project: ProjectContext,
+): Promise<OrchestratorConfig>;
+
+declare function loadProjectConfig(options?: LoadProjectOptions): Promise<{
+  project: ProjectContext;
+  configFile: string;
+  config: OrchestratorConfig;
+}>;
+
+declare function loadProjectOrchestrator(options?: LoadProjectOptions): Promise<{
+  project: ProjectContext;
+  configFile: string;
+  runtime: OrchestratorRuntime;
+}>;
+```
+
+`LoadProjectOptions` accepts `cwd`, `root`, and `config`.
+
+Config search checks `.simple-agent-orchestrator/orchestrator.ts`, `.mts`, `.cts`, `.js`, `.mjs`, and `.cjs`, in that order. If none exists, it checks `simpleAgentOrchestrator.config` in `package.json`. TypeScript config runs through `tsx` without type-checking.
+
+Config loading temporarily sets `process.cwd()` to the project root. Do not concurrently load configs for different roots if their code reads the working directory.
 
 ## Testing API
 
-Import from `simple-agent-orchestrator/testing`.
+Import test APIs from `simple-agent-orchestrator/testing`.
+
+### Testing exports
 
 ```ts
-import { createTestRuntime } from "simple-agent-orchestrator/testing";
-
-const test = await createTestRuntime(
-  { channels: [manualChannel], clients: [exampleClient] },
-  { root: process.cwd() },
-);
-await test.dispatch("manual", { id: "1", sessionKey: "demo", input: "hello" });
-const session = await test.sessions.get("demo");
-const notes = await test.sessions.notes("demo");
-await test.stop();
+import {
+  createTestRuntime,
+  memoryStore,
+  type TestEventRecord,
+  type TestRuntime,
+  type TestRuntimeOptions,
+} from "simple-agent-orchestrator/testing";
 ```
 
-`createTestRuntime(config, options?)` accepts the same config object/factory forms as `createRuntime`. Options select either `root` or `project` (not both) and may override `store`, `logger`, and `http`. Defaults are a new isolated memory store, silent logger, and disabled HTTP, overriding values in config. Explicit test options win. The harness resolves config and calls `runtime.init()` but starts no HTTP, polls, or workers.
+### `createTestRuntime(config, options?)`
 
-The returned `TestRuntime` exposes:
+Creates an initialized runtime with isolated in-memory state. It does not start pollers, workers, or HTTP.
 
 ```ts
-test.runtime; // public OrchestratorRuntime escape hatch
-test.project;
-test.store;
-await test.dispatch(channelOrId, event, { drain: false }); // drain defaults true
-await test.drain();
-await test.stop();
-await test.readState();
-await test.sessions.list();
-await test.sessions.get(idOrKey);
-await test.sessions.notes(idOrKey);
-await test.events.list();
-await test.events.get(internalEventId);
-await test.deliveries.list();
-await test.deliveries.get(deliveryId);
-await test.deliveries.retry(deliveryId, { drain: false }); // drain defaults true
+declare function createTestRuntime(
+  factory: ConfigFactory,
+  options?: TestRuntimeOptions,
+): Promise<TestRuntime>;
 ```
 
-Event helpers expose `TestEventRecord` values shaped as `{ event: StoredEvent, deliveries: StoredDelivery[] }`. The nested event's `id` is internal and `sourceId` is the source ID. Delivery helpers expose the same stored delivery type directly. `readState()` exposes the configured store's complete snapshot; the default memory store clones it. Mutation helpers reject after `stop()`, while store-backed inspection remains possible. The harness processes only currently eligible work and never waits for a future `nextAttemptAt`. Use `test.runtime` only when lifecycle or runtime behavior is not represented by the focused helpers, and always clean it up.
+Options accept either `root` or `project`, plus `store`, `logger`, and `http` overrides. Defaults are a new memory store, silent logger, and disabled HTTP; these override config values.
 
-`memoryStore` is re-exported from the testing subpath for explicit test-store setup.
+### `TestRuntime`
+
+```ts
+interface TestRuntime {
+  readonly runtime: OrchestratorRuntime;
+  readonly project: ProjectContext;
+  readonly store: Store;
+
+  dispatch(
+    channel: ChannelDefinition | string,
+    event: DispatchEvent,
+    options?: { drain?: boolean },
+  ): Promise<DispatchResult>;
+
+  drain(): Promise<void>;
+  stop(): Promise<void>;
+  readState(): Promise<OrchestratorState>;
+
+  sessions: {
+    list(): Promise<StoredSession[]>;
+    get(idOrKey: string): Promise<StoredSession | undefined>;
+    notes(idOrKey: string): Promise<SessionNote[]>;
+  };
+
+  events: {
+    list(): Promise<TestEventRecord[]>;
+    get(eventId: string): Promise<TestEventRecord | undefined>;
+  };
+
+  deliveries: {
+    list(): Promise<StoredDelivery[]>;
+    get(id: string): Promise<StoredDelivery | undefined>;
+    retry(id: string, options?: { drain?: boolean }): Promise<boolean>;
+  };
+}
+```
+
+`dispatch` and `deliveries.retry` call `drain()` by default. Pass `{ drain: false }` to leave work pending.
+
+`events.get` accepts the internal event ID. `TestEventRecord` is `{ event: StoredEvent, deliveries: StoredDelivery[] }`; the dispatched source ID is `event.sourceId`.
+
+Mutating helpers reject after stop. Store-backed inspection remains available.

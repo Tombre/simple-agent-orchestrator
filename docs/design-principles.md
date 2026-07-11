@@ -1,66 +1,78 @@
 # Design principles
 
-## Embedded, not external
+Simple Agent Orchestrator is intentionally a small, one-process tool that you add to an existing project. These principles explain where it helps and where your application stays in charge.
 
-The orchestrator should be installed into an existing TypeScript project and use that project’s own code. It should not force users to move integrations into a separate service.
+## Add it to the project you already have
 
-## Durable plumbing, not an agent framework
+Install the orchestrator alongside the agent code, API clients, and business rules you already own. You shouldn't have to move those integrations into a new service or adopt a workflow language just to process events reliably.
 
-The framework owns boring but important stateful plumbing:
+The dependency points in one direction: files under `.simple-agent-orchestrator/` can call your project code. Your application code doesn't need to import its project-specific orchestrator setup.
 
-- event ingestion
-- normalized webhook ingestion, bounded operational summaries, and project-level HTTP extension hooks
-- dedupe
-- delivery attempts
-- session resolution
-- session state
-- persisted-state validation and compatible upgrades
-- environment lifecycle
-- sandbox cleanup
-- CLI inspection
-- explicit operator-controlled state retention
+## Let the package handle the repeated bookkeeping
 
-User code owns:
+The package handles the plumbing around your handlers:
 
-- how source APIs are called
-- provider payload conversion, HTTP authentication, source signature verification, CORS, rate limiting, TLS, and exposure policy
-- how prompts are rendered
-- how agents are invoked
-- how external effects are made idempotent or reconciled
-- when and how source items are acknowledged
-- whether the agent queues messages
-- how tools are approved
-- how project-specific resources behave
+- accepting events from project calls, CLI commands, polls, and the package's HTTP event route
+- saving events before reporting that they've been queued
+- ignoring events you've already accepted, based on the channel and deduplication key
+- creating a separate processing record for each matching handler
+- tracking attempts, fixed-delay retries, and cooperative timeouts
+- finding or creating a session so related events can share context
+- saving ordinary session updates and notes after successful work, while letting `session.ensure` save retry-safe setup earlier
+- remembering poll positions
+- starting and stopping client environments
+- tracking session sandboxes and running configured cleanup after a successful handler ends its session
+- checking stored data and upgrading supported older formats
+- providing small, read-only HTTP status summaries
+- inspecting, retrying, ending, and pruning work through explicit runtime or CLI actions
 
-## Sessions are the unit of continuity
+These are general mechanics. They don't require the package to know which AI provider you use or what your source payload looks like.
 
-A session is the durable mapping between external events and ongoing work.
+## Keep application decisions in application code
 
-The framework should make this easy:
+Your project decides:
+
+- how to call GitHub, Slack, or any other source API
+- how to verify and translate provider-specific webhook payloads
+- how to authenticate HTTP requests and provide CORS, rate limiting, TLS, and public routing
+- how to build prompts and invoke an agent
+- which tools an agent may use and how approvals work
+- how to make outside actions safe to repeat
+- when to acknowledge an item back to its source
+- whether an agent should queue or combine messages
+- how project-specific resources, such as repositories and worktrees, should behave
+
+This split keeps the package useful without turning it into an agent SDK, provider integration, authorization layer, or hosted queue.
+
+## Use sessions for a real unit of work
+
+A session gives related events one shared place for context. For example, every comment and review update for a pull request can use the same key:
 
 ```ts
 sessionKey: `github:${repo}:pr:${number}`
 ```
 
-Future events with the same key reuse the same active session.
+Future events with the same key reuse the active session. Once a handler ends it, the session remains in history and a later event with that key starts a new active one.
 
-## Event dedupe is not processing success
+## Treat queued and completed as different things
 
-The runtime dedupes events when they are dispatched. A duplicate event is not enqueued twice.
+Dispatch checks whether the same channel and deduplication key were already accepted. A duplicate returns the original internal event ID and creates no new deliveries.
 
-For normalized HTTP ingress, `202 queued` means the event and matching deliveries are durable, not that processing succeeded. `200 duplicate` returns the original internal event ID and likewise says nothing about delivery success.
+For `POST /webhooks/:channelId`, `202 queued` means the event and matching deliveries were saved. It doesn't mean a handler finished. `200 duplicate` means the event was already present and returns its original internal ID.
 
-A delivery is only marked processed after the handler, success hook, required sandbox cleanup, and final persistence succeed.
+A delivery becomes `processed` only after the handler, `onSuccess`, any required sandbox cleanup, and saving the successful result all complete.
 
-## Retryable, not exactly once
+## Assume outside actions may repeat
 
-Local delivery state cannot be committed atomically with source acknowledgement, agent calls, or other external effects. A failed attempt may therefore repeat work that completed externally. Integrations own stable external idempotency keys or reconciliation, and acknowledgement belongs after successful handling.
+The orchestrator can't atomically combine its local save with an API call, agent action, or source acknowledgement. If the process stops between those steps, a retry may repeat the outside action. Use stable idempotency keys or check the outside system before acting again.
 
-Event dedupe is not an exactly-once processing guarantee. After an abrupt exit, the next startup or drain requeues deliveries left `processing`; because the interrupted attempt may already have completed external work, recovery can repeat effects.
+Deduplication prevents the same source event from being accepted twice. It doesn't promise that a handler runs only once. After an abrupt exit, unfinished deliveries run again on the next startup or drain.
 
-## Prefer small composable primitives
+Timeouts work the same way: the runtime sends an `AbortSignal` and waits for your code to stop. It can't terminate JavaScript or undo an action that already reached another system.
 
-Important primitives:
+## Prefer a small set of understandable tools
+
+The main building blocks are deliberately few:
 
 - `createChannel`
 - `createClient`
@@ -71,25 +83,23 @@ Important primitives:
 - stores
 - runtime/CLI inspection
 
-Avoid large abstractions until repeated real-world integrations prove they are necessary.
+Larger abstractions belong here only when several real integrations show that they're needed. Retry delays, for example, only determine when a failed delivery can try again. They aren't a scheduler, arbitrary timer system, or backoff strategy.
 
-Channel, client, and environment builders configure inspectable definitions rather than live services. Definitions are readonly-typed for consumers but deliberately not frozen, so projects can compose them before initialization. A runtime snapshots them at `init()` and does not support live reconfiguration; changed composition belongs in a fresh runtime.
+Channel, client, and environment builders set them up before startup. `init()` reads that setup once, so later changes require a new runtime.
 
-Channel definitions may dispatch directly when exactly one initialized runtime is bound. Explicit `runtime.dispatch(channelOrId, event)` remains the unambiguous primitive when several runtimes or definition identity matter.
+`channel.dispatch(...)` is convenient when one initialized runtime uses that channel. Use `runtime.dispatch(...)` when your code may have several runtimes or needs to choose one directly.
 
-State retention is an explicit preview-and-apply operation, not a background compaction service. It preserves operational work and dedupe by default; surrendering old dedupe history requires a separate operator choice.
+Old history is removed only when you ask. Pruning starts with a preview, preserves active work, and keeps event deduplication records unless you explicitly choose to remove them.
 
-A fixed durable retry eligibility timestamp is delivery plumbing, not a general scheduling API. Backoff strategies, arbitrary timers, and workflow schedules remain outside the runtime until demonstrated integration needs justify them.
+## Run one process for each local state file
 
-A fixed cooperative delivery-attempt deadline is also local reliability plumbing, not process isolation. The runtime communicates cancellation through `AbortSignal` and waits for project code to settle; it does not claim to terminate JavaScript or roll back external side effects.
+Workers, session updates, polls, and resource locks are managed only inside one runtime process. The JSON store uses a local lock file and rejects a second active runtime. It can reclaim a stale lock after the process that held it exits, but the file isn't a shared queue for several running processes.
 
-## One active local runtime
+Send HTTP events to the runtime that's using the JSON state file so accepting the event and processing it happen in that same process.
 
-Worker claims, session merging, polling, and resource locks coordinate within one process. Stores that depend on those guarantees should identify a project-local runtime lock so a second active runtime fails early instead of appearing to provide unsupported distributed coordination. Stale local ownership may be reclaimed after its process exits; this is not a lease, consensus mechanism, or replacement for a multi-process-safe store.
+The same server exposes small, read-only status endpoints. They leave out event bodies, session state, notes, poll positions, errors, file paths, and administrative actions. Your project still provides authentication, provider verification, TLS, rate limiting, and any public-facing routing or security.
 
-Normalized webhook ingress that mutates the default JSON store belongs on the same runtime-owned HTTP server, not in a second process or a client-scoped environment. This keeps dispatch, workers, the mutex, and store ownership together without turning the runtime into a hosted web platform. The same listener exposes only bounded read-only operational summaries; it does not expose event bodies, session state, notes, cursors, errors, resources, paths, or administrative mutations. The framework owns the webhook's 1 MiB validation limit and operational list bounds. Project code still owns every security, provider-specific, edge, and exposure concern.
-
-## Keep paths project-aware
+## Resolve paths from the project
 
 Handlers and config receive `project` so code can use:
 
@@ -99,4 +109,4 @@ project.fromOrchestrator("prompts/review.md")
 project.statePath("state.json")
 ```
 
-This keeps the framework pleasant inside large existing repositories.
+These helpers let integration code find project files without depending on the directory where someone happened to run the command.

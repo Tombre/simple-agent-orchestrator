@@ -1,28 +1,21 @@
-# Channels
+# Receive events with channels
 
-Channels are event sources. They can poll APIs or receive normalized webhook, manual CLI, or project-route dispatches on the runtime-owned Hono server.
+You want your app to react when something happens: a pull request changes, a command arrives, or a scheduled check finds new work. A channel names that source and gives every event from it the same entry point.
 
-Ordinary startup provides `POST /webhooks/:channelId`. For example, with the generated `manual` channel:
+Start with a manual channel. You can send it an event from the CLI now, then add HTTP or polling when you need it.
 
-```bash
-curl -i -X POST http://127.0.0.1:3000/webhooks/manual \
-  -H 'Content-Type: application/json' \
-  -d '{"id":"manual-1","type":"manual.message","sessionKey":"demo","input":"Run a local agent task","occurredAt":"2026-07-10T10:30:00Z"}'
-```
+## Send your first event
 
-The route accepts at most 1 MiB of strict JSON. `id` is required and non-whitespace; `type`, `dedupeKey`, `sessionKey`, `input`, `payload`, `meta`, and `occurredAt` are optional. Values must be JSON-safe with at most 100 levels; `meta` must be an object and `occurredAt` a valid date string. A new durable event returns `202 queued`; a duplicate returns `200 duplicate` with the original internal event ID. Unknown channels return `404`. Neither success waits for handlers.
-
-The HTTP config's `routes({ app, dispatch })` hook remains available for provider-specific conversion and acknowledgement protocols. Add project middleware for authentication, source signature verification, and rate limiting before exposing ingress. The runtime does not bundle provider formats or signatures.
-
-## Manual channel
+Create a channel with a globally unique ID:
 
 ```ts
+// .simple-agent-orchestrator/channels/manual.ts
 import { createManualChannel } from "simple-agent-orchestrator";
 
 export const manualChannel = createManualChannel("manual");
 ```
 
-Dispatch from the CLI:
+Register it in `orchestrator.ts`, then send an event:
 
 ```bash
 npx simple-agent-orchestrator dispatch manual \
@@ -31,109 +24,185 @@ npx simple-agent-orchestrator dispatch manual \
   --input "Run a local agent task"
 ```
 
-CLI dispatch is an offline one-shot operation. Stop a long-running JSON-store runtime first; the command fails before writing when that runtime owns the state.
+The channel identifies where the event came from. The event's `id` identifies what happened at that source. Dispatch saves the event before returning.
 
-## Programmatic dispatch
+When a client subscribes to this channel, dispatch also creates a **delivery** for its handler. A delivery is the saved record of one handler's work on one event, including attempts and the final result. An event can be accepted even when no handlers subscribe, so `queued` means "saved," not "processed successfully."
 
-Every channel definition has a first-class `dispatch(event)` method:
+The CLI command changes saved project data without starting workers. If your project uses the JSON file store and a running runtime is already changing that file, stop it first; otherwise, the command fails without writing.
+
+## Shape source data into an event
+
+Only `id` is required. A useful event often looks like this:
 
 ```ts
-const result = await manualChannel.dispatch({ id: "manual-2" });
+{
+  id: "review-123",
+  type: "github.review.updated",
+  dedupeKey: "review-123:2026-07-10T10:30:00Z",
+  sessionKey: "github:acme/api:pr:42",
+  input: "Please address this review comment",
+  payload: rawReview,
+  meta: { branch: "fix-login" },
+  occurredAt: "2026-07-10T10:30:00Z",
+}
 ```
 
-Initialization binds a registered channel object to its runtime. `channel.dispatch` succeeds only while exactly one initialized, non-stopped runtime is bound to that exact definition. It throws when no runtime is bound and when the same channel object is bound to multiple initialized runtimes, because the destination would be ambiguous.
+| Field | What to put there |
+| --- | --- |
+| `id` | The source's stable ID for this event. |
+| `type` | The kind of event, when handlers need to distinguish kinds. |
+| `dedupeKey` | A stable key for one source update. It defaults to `id`. |
+| `sessionKey` | A stable key shared by events that should continue the same work. It defaults to `${channelId}:${id}`. |
+| `input` | Text or other direct input for your handler or agent. |
+| `payload` | Structured source data the handler needs. |
+| `meta` | Small routing details, such as a branch or repository name. |
+| `occurredAt` | When the event happened at the source. |
 
-Use explicit runtime dispatch whenever runtime selection matters:
+The runtime checks duplicates using the channel ID together with `dedupeKey`. If `review-123` can change several times, use a version or update timestamp in the key. Otherwise, later updates will be treated as copies of the first one.
+
+Choose `sessionKey` separately. For example, several review updates can have different dedupe keys but share one pull-request session. A **session** is the saved context reused by related deliveries while that session is active.
+
+## Send events from your application
+
+If the runtime is already running and uses this exact `manualChannel` object, you can dispatch through the channel:
+
+```ts
+const result = await manualChannel.dispatch({
+  id: "manual-2",
+  sessionKey: "demo",
+});
+```
+
+If you already have the runtime, call it directly:
 
 ```ts
 await runtime.dispatch(manualChannel, { id: "manual-3" });
 await runtime.dispatch("manual", { id: "manual-4" });
 ```
 
-Object dispatch requires the exact registered definition, not another channel with the same ID. String dispatch resolves a registered channel by ID. All forms initialize the runtime if needed and return `{ status: "queued" | "duplicate", eventId }` after persistence.
+Passing the channel object requires that exact object to be registered. Passing `"manual"` asks the runtime to find its registered channel by ID. This is the safer choice when your code might create or manage more than one runtime.
 
-## Polling channel
+Every call returns after the event and all matching deliveries have been saved:
 
 ```ts
-import { createChannel } from "simple-agent-orchestrator";
+type DispatchResult = {
+  status: "queued" | "duplicate";
+  eventId: string;
+};
+```
 
-export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
+`eventId` is the runtime's internal stored ID, not your source `id`. A duplicate returns the original internal ID and creates no new deliveries.
+
+Saved events also remember which dedupe keys have already been accepted. Removing old processed deliveries doesn't remove that memory by default. If you explicitly prune an old event with `state prune --drop-dedupe`, the same channel and dedupe key can be accepted and processed again.
+
+Dispatch calls that change state reject after the runtime stops. Create and initialize a new runtime before sending more events.
+
+If you're loading a fresh runtime for a one-off change to the JSON store, wrap the work in `runOffline()`. That acquires the state-file lock for the whole operation:
+
+```ts
+await runtime.runOffline(async ({ dispatch, drain }) => {
+  await dispatch("manual", { id: "manual-5" });
+  await drain();
+});
+```
+
+Calling `runtime.dispatch(...)` on a runtime that is only initialized does not acquire that lock by itself. Direct calls are fine with the memory store or a runtime that already owns its store through `start()` or `drain()`.
+
+## Accept event-shaped JSON over HTTP
+
+Ordinary `start()` provides `POST /webhooks/:channelId`:
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/webhooks/manual \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"manual-5","sessionKey":"demo","input":"Run this task"}'
+```
+
+A new event returns `202`; a duplicate returns `200`. Both responses mean dispatch finished saving its records. They don't mean a handler has finished.
+
+This route expects JSON already shaped like `DispatchEvent`, not GitHub, Stripe, or another provider's original body. If a provider sends a different shape, add a project route that verifies the signature, checks who may send events, and then calls `dispatch`. If you use the built-in route directly, add authentication in project middleware. See [add provider-specific HTTP routes](project-integration.md#add-provider-specific-http-routes).
+
+The built-in route requires `Content-Type: application/json`, accepts at most 1 MiB and 100 nested levels, and rejects unknown fields or invalid values. Identifiers can be at most 512 characters, and `type` can be at most 256. See [built-in HTTP routes](../api-reference.md#built-in-routes) for every request rule and response.
+
+## Check a source on a schedule
+
+Suppose you want to check a review API every minute. A **cursor** is the poll's saved checkpoint, such as the latest update timestamp it has seen. It lets the next run continue from the right place after a restart.
+
+Add a poll to a channel and update its cursor only after the fetched events are saved:
+
+```ts
+// .simple-agent-orchestrator/channels/reviews.ts
+import { createChannel, cursorKey } from "simple-agent-orchestrator";
+import { fetchReviews } from "../../src/github.ts";
+
+const lastUpdatedAt = cursorKey<string>("lastUpdatedAt");
+
+export const reviewsChannel = createChannel("github.reviews", (channel) => {
   channel.poll({
     id: "reviews",
     every: "60s",
 
-    async fetch({ cursor }) {
-      return fetchRecentReviewCandidates({
-        since: cursor.get<string>("lastUpdatedAt"),
+    async fetch({ cursor, signal }) {
+      return fetchReviews({
+        since: cursor.get(lastUpdatedAt),
+        signal,
       });
     },
 
-    async map(review) {
+    map(review) {
       return {
         id: review.id,
-        dedupeKey: `github.review:${review.id}:${review.updatedAt}`,
-        sessionKey: `github:${review.repo}:pr:${review.prNumber}`,
-        input: review.toMarkdown(),
+        dedupeKey: `${review.id}:${review.updatedAt}`,
+        sessionKey: `github:${review.repository}:pr:${review.pullRequest}`,
+        input: review.body,
         payload: review,
-        meta: {
-          branch: review.branch,
-          prNumber: review.prNumber,
-        },
       };
     },
 
-    async commit({ cursor, items }) {
+    commit({ cursor, items }) {
       const latest = items.map((item) => item.updatedAt).sort().at(-1);
-      if (latest) cursor.set("lastUpdatedAt", latest);
+      if (latest) cursor.set(lastUpdatedAt, latest);
     },
   });
 });
 ```
 
-## Event shape
+Each run follows this order:
 
-A channel maps source data into a dispatch event:
+1. `fetch` returns source items.
+2. `map` converts each item, one at a time and in order, into an event. Return `null` or `undefined` to skip one.
+3. The runtime saves every mapped event and creates matching deliveries.
+4. `commit` performs any checkpoint work you add.
+5. Cursor changes are saved.
 
-```ts
-{
-  id: "review-123",
-  dedupeKey: "github.review:review-123:2026-07-07T00:00:00Z",
-  sessionKey: "github:acme/api:pr:42",
-  input: "Markdown sent to the agent",
-  payload: rawReview,
-  meta: {
-    branch: "fix-login"
-  }
-}
-```
+If `fetch`, `map`, dispatch, or `commit` fails, cursor changes from that run are discarded. Events saved before the failure stay saved. Use stable dedupe keys so the next run safely recognizes those events instead of creating more deliveries.
 
-Fields:
+Keep external work in `commit` safe to repeat. For example, an API checkpoint can succeed just before saving the local cursor fails. The next poll then runs `commit` again.
 
-| Field | Purpose |
-| --- | --- |
-| `id` | Source event id. Required. |
-| `type` | Optional event type. |
-| `dedupeKey` | Optional event uniqueness key. Defaults to `id`. |
-| `sessionKey` | Optional durable session mapping key. Defaults to `channelId:id`. |
-| `input` | Agent-facing input. |
-| `payload` | Structured source payload. |
-| `meta` | Lightweight routing/resource metadata. |
-| `occurredAt` | Optional source occurrence date. |
+One runtime won't execute the same poll twice at once. That protection doesn't coordinate separate processes, so run only one polling runtime for a source unless the source API provides its own coordination. Pass `signal` to API calls so shutdown can cancel a request that's still running.
 
-## Dedupe behavior
+Polls run immediately by default and then repeat at `every`. Set `immediate: false` if the first run should wait for the interval.
 
-Events are deduped by `channelId + dedupeKey`. A duplicate dispatch is not enqueued again, but the original event remains available in the store.
+## Keep each poll's checkpoint attached to it
 
-Event records are also the durable dedupe ledger. State pruning retains them by default even after processed delivery history is removed. Explicitly applying `state prune --drop-dedupe` removes eligible old events with no retained deliveries; the same source identity can then dispatch and run again.
+Give every poll an `id`, especially when a channel has more than one. A named poll saves its cursor under `${channelId}:${pollId}`, so moving its registration doesn't change which checkpoint it reads.
 
-A delivery is only marked `processed` after the handler, `onSuccess`, required sandbox cleanup, and final persistence succeed. Dedupe does not prevent a failed delivery attempt or its external effects from repeating.
+If you change the poll ID, it starts with the values stored under the new ID; the old values aren't moved automatically. Reusing an older ID also reuses its older cursor, so don't recycle IDs for unrelated polls.
 
-Executions of the same poll do not overlap within one runtime process. Mapping is sequential. Mapped events are durably dispatched before `commit` runs, and cursor changes are persisted only after `fetch`, mapping, dispatch, and `commit` complete. Previously dispatched events remain if a later poll step fails, so stable dedupe keys must make refetching safe.
+An unnamed poll uses `${channelId}:${pollRegistrationIndex}`. If you reorder unnamed polls, they can read each other's old cursor values. Add stable IDs before you reorder them.
 
-`commit` records ingestion progress; it does not wait for delivery processing and is not source acknowledgement. Keep acknowledgement in a retry-safe, designated client `onSuccess`. Because hooks are per delivery, there is no event-wide acknowledgement hook that waits for every fan-out delivery.
+With `jsonFileStore`, cursor values and event fields must contain valid JSON values. The file is plaintext, so don't put access tokens or other secrets in them.
 
-Set `id` when a poll's cursor must survive registration reordering. Named polls use `${channelId}:${id}`; unnamed polls continue to use `${channelId}:${pollRegistrationIndex}`. Duplicate resolved poll IDs and ambiguous final cursor keys are rejected. In a multi-poll channel, name every poll before reorganizing registrations because unnamed neighbors remain positional.
+## Acknowledge the source after processing
 
-Adding or renaming a descriptive ID selects another cursor key and leaves the old cursor record unchanged; the runtime does not infer migrations. A key that has never existed starts empty, while reusing a historical ID restores its existing cursor, so do not recycle IDs for unrelated polls. To retain existing positional cursors during adoption, assign each poll its current index as a string, such as `id: "0"`, before moving registrations.
+`commit` means the poll fetched and saved events. Handlers may not have started yet, so don't use `commit` to tell a source that processing succeeded.
 
-Channel definitions and their `polls` arrays are inspectable and readonly-typed but not frozen. Builder registration happens immediately; a runtime snapshots polls at `init()`. Mutating a definition after initialization does not alter that runtime, and live reconfiguration is unsupported.
+If the source needs that confirmation, choose one handler and send it from `onSuccess`. Make that call safe to repeat because a retry can run it again. If an event fans out to several handlers, there is no event-wide callback that waits for all of them, so pick the handler whose success is enough to confirm the source. See [acknowledge the source](failure-semantics.md#acknowledge-the-source-at-the-right-time).
+
+Channel and poll registrations are captured when the runtime initializes. If you add, remove, or reorder them afterward, create a new runtime to apply the change.
+
+## Next steps
+
+- [Process events with clients](clients.md)
+- [Keep context with sessions](sessions-state.md)
+- [Look up the channel API](../api-reference.md#channels-and-events)

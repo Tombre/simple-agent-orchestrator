@@ -1,17 +1,43 @@
-# Sessions and state
+# Keep context with sessions
 
-A session is durable state attached to a `sessionKey`.
+You want several events to continue the same task or conversation. Give those events the same `sessionKey`, and they'll reuse one active session: a saved set of values and notes shared by related deliveries. A **delivery** is one handler's saved work record for an event, including its attempts and result. With the project JSON store, both sessions and deliveries remain available after restarts.
 
-If two events have the same `sessionKey`, they resolve to the same active session.
-
-## Basic state
+For example, all events for one pull request could use:
 
 ```ts
-session.set("agent.sessionId", "agent_123");
-const id = session.get<string>("agent.sessionId");
+sessionKey: `github:${repository}:pr:${pullRequestNumber}`
 ```
 
-You can use typed keys for better TypeScript ergonomics:
+A session isn't created when you dispatch an event. It's created when a matching delivery starts processing. If no handler matches, no session is needed or created.
+
+## Remember a value for the next event
+
+Read a value if it exists, then update it:
+
+```ts
+const count = session.getOptional<number>("messageCount") ?? 0;
+session.set("messageCount", count + 1);
+```
+
+Use `get` when a missing value means your code can't continue. It throws if the key isn't present:
+
+```ts
+const agentId = session.get<string>("agent.sessionId");
+```
+
+You can also check or remove values:
+
+```ts
+if (session.has("agent.sessionId")) {
+  session.delete("agent.sessionId");
+}
+```
+
+These ordinary changes are staged during the attempt. They're saved only after the handler, `onSuccess`, and any required sandbox cleanup all succeed. If any of those steps fails, the changes are discarded so a retry starts from the last successful result.
+
+## Keep key names and TypeScript types together
+
+For values used in several places, create a typed key:
 
 ```ts
 import { sessionKey } from "simple-agent-orchestrator";
@@ -19,58 +45,98 @@ import { sessionKey } from "simple-agent-orchestrator";
 const agentSessionId = sessionKey<string>("agent.sessionId");
 
 session.set(agentSessionId, "agent_123");
-const id = session.get(agentSessionId);
+const id = session.get(agentSessionId); // string
 ```
 
-## Optional values
+Typed keys don't change how values are stored. They help TypeScript catch a mismatched value while keeping the saved key name explicit.
 
-```ts
-const id = session.getOptional(agentSessionId);
-```
+## Create one value and reuse it on retries
 
-## Eager resource identifiers
-
-Use `session.ensure` when retries and concurrent deliveries should reuse a persisted value:
+Sometimes creating the value is itself external work. Use `session.ensure` when the first attempt should create an agent session and every later attempt should reuse its ID:
 
 ```ts
 const id = await session.ensure(agentSessionId, async () => {
   const created = await createAgentSession({
     idempotencyKey: `agent-session:${session.id}`,
   });
+
   return created.id;
 });
 ```
 
-The returned value is persisted eagerly and survives a later failed attempt. The external creation and local write are not one transaction, so the factory can run again after an uncertain process or store failure. Make the factory retry-safe with provider idempotency or lookup-and-reconcile behavior.
+Inside one runtime process, concurrent calls for the same session and key wait for the same creation work instead of creating separate values. The completed value is saved immediately, so it remains available even if the rest of the handler fails.
 
-Ordinary `set`, `delete`, `note`, and `end` changes made by handlers or hooks persist only after the entire attempt succeeds. They are discarded when `handle`, `onSuccess`, cleanup, or final persistence fails. State mutations made during sandbox creation are a separate eager-persistence path.
+This protection doesn't coordinate separate processes. There is also a crash window between the provider creating the external object and the runtime saving its ID. If the process stops in that window, `ensure` can call your factory again. Use a provider idempotency key or look up the existing object before creating another.
 
-Values persisted in session state, notes, events, and cursors must be JSON-safe and no more than 100 levels deep when using `jsonFileStore`. Unsupported values such as `undefined`, `NaN`, infinities, class instances, and circular objects fail validation instead of being silently changed by JSON serialization.
+Use ordinary `set` when a failed attempt should roll back the value. Use `ensure` only when retries must keep and reuse a successfully created value.
 
-## Notes
+## Know exactly what survives a failure
 
-A session can record human-readable notes:
+| Change made during an attempt | If the attempt succeeds | If the attempt fails |
+| --- | --- | --- |
+| `set` or `delete` | Saved | Discarded |
+| `note` | Saved | Discarded |
+| `end` | Saved | Discarded |
+| Completed `ensure` | Already saved | Kept |
+| Completed sandbox creation changes | Already saved | Kept |
+
+An attempt isn't successful until `handle`, `onSuccess`, required sandbox cleanup, and the final save all finish.
+
+If handlers for the same session overlap, successful changes to different keys are merged. If they write the same key, whichever attempt completes last wins. Set `perSession: true` on every participating client when you need one-at-a-time processing, and remember that this only coordinates work inside one runtime process. See [control concurrency](clients.md#process-several-events-at-once).
+
+If one handler ends a session while another is finishing, the later completion can't make the ended session active again.
+
+## Leave a useful history for people
+
+Use a note for information an operator may want to read later instead of mixing status messages into your keyed values:
 
 ```ts
-session.note("Sent review to agent", {
-  reviewId: event.payload.id,
+session.note("Sent review to the agent", {
+  reviewId: event.id,
 });
 ```
 
-Notes from successful attempts are persisted in the store and are useful for later CLI or UI inspection. Notes from failed attempts are discarded.
+Notes are saved only when the attempt succeeds. Inspect them with:
 
 ```bash
-npx simple-agent-orchestrator sessions show <id-or-key>
+npx simple-agent-orchestrator sessions show <session-id-or-key>
 ```
 
-Programmatic callers can use `runtime.listSessionNotes(idOrKey)`.
+In application code, use `runtime.listSessionNotes(idOrKey)`.
 
-## Ending a session
+## End work and allow a fresh session
+
+When the pull request, conversation, or task is complete, end its session from the handler:
 
 ```ts
 session.end({ reason: "github.pr.merged" });
 ```
 
-An ended session is kept for history. A future event with the same `sessionKey` creates a new active session.
+The ended session remains available as history. A later delivery with the same `sessionKey` creates a new active session instead of reopening the old one.
 
-Explicit state pruning can remove an old ended session and its notes only when no retained delivery references it and no active sandbox marker remains. Active, paused, and failed sessions are preserved. Preview `state prune --before <timestamp>` before applying it; a pruned historical session is no longer available through session inspection.
+You can also end a session from the CLI:
+
+```bash
+npx simple-agent-orchestrator sessions end <session-id-or-key> \
+  --reason "closed by operator"
+```
+
+If the session has a sandbox, CLI or runtime administrative ending doesn't run its cleanup function. Clean the external resource yourself before or after the command, or end the session in a handler when automatic cleanup is required. See [clean up a session sandbox](environments-sandboxes.md#clean-up-after-the-session-ends).
+
+When the same key has both old ended records and a newer active record, lookup by key can return an older one. Use the session ID for `sessions show`, `sessions end`, and runtime lookup when you need one specific record.
+
+Session records can contain `paused` and `failed` status values, but the package doesn't currently provide pause, resume, or session-failure commands and workflows.
+
+## Store values safely
+
+With `jsonFileStore`, session values and note data must be valid JSON and no more than 100 levels deep: strings, finite numbers, booleans, `null`, arrays, and plain objects containing those values. Don't store `undefined`, class instances, functions, `BigInt`, circular objects, or non-finite numbers. Invalid values fail the save instead of being silently changed.
+
+The JSON file is plaintext. Don't put credentials, tokens, or other secrets in session values or notes unless you've made an explicit decision to protect that file appropriately.
+
+Old ended sessions aren't removed automatically. A state-prune operation can remove one only when no kept delivery refers to it and it has no active sandbox marker. Preview the prune first; after you apply it, that session and its notes are no longer available for inspection.
+
+## Next steps
+
+- [Create session-specific resources](environments-sandboxes.md)
+- [See what is kept after a failed attempt](failure-semantics.md#understand-which-session-changes-survive)
+- [Look up the Session API](../api-reference.md#sessions)
