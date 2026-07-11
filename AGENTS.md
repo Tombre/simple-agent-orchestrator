@@ -92,6 +92,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Dispatch persists the event and matching deliveries before returning `queued`.
 - Runtime object dispatch requires the exact registered channel definition; string dispatch resolves the channel ID. Definition dispatch rejects when zero or multiple initialized runtimes are bound.
 - Builders configure mutable definitions immediately. Runtime initialization snapshots registrations and config collections; definitions remain inspectable and unfrozen, but post-init changes do not affect that runtime and live reconfiguration is unsupported.
+- Runtime initialization registers explicit channels first, then exact channel definitions referenced by configured client handlers in client and handler order. Repeated handler references to one definition register it once; explicit duplicate entries and distinct definitions with one ID remain duplicate errors.
 - Runtime dispatch and administrative mutation methods reject after stop; store-backed inspection remains available.
 - Shutdown settles mutation calls accepted before stopping before it releases store ownership.
 - `runOffline()` settles every context operation started during its callback before releasing ownership, including promises the callback does not return. Calls started after callback settlement reject.

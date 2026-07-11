@@ -30,11 +30,9 @@ logs/
 
 ```ts
 import { defineConfig } from "simple-agent-orchestrator";
-import { manualChannel } from "./channels/manual.ts";
 import { exampleClient } from "./clients/example.ts";
 
 export default defineConfig({
-  channels: [manualChannel],
   clients: [exampleClient],
 });
 ```
@@ -124,7 +122,7 @@ export const codingClient = createClient("coding", (client) => {
 import { createRuntime } from "simple-agent-orchestrator/runtime";
 
 const runtime = await createRuntime(
-  { channels: [manualChannel], clients: [exampleClient] },
+  { clients: [exampleClient] },
   { root: process.cwd() },
 );
 await runtime.start({ http: false });
@@ -134,7 +132,6 @@ await runtime.start({ http: false });
 import { createTestRuntime } from "simple-agent-orchestrator/testing";
 
 const test = await createTestRuntime({
-  channels: [manualChannel],
   clients: [exampleClient],
 });
 try {

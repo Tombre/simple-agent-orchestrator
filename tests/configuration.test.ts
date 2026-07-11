@@ -8,6 +8,54 @@ import { findConfigFile, findProjectRoot, loadProjectConfig } from "../src/runti
 import { createRuntime } from "./helpers.js";
 
 describe("configuration validation", () => {
+  it("registers channels referenced by configured client handlers", async () => {
+    const handled: string[] = [];
+    const channel = createChannel("inferred");
+    const standalone = createChannel("standalone");
+    const firstClient = createClient("first", (builder) => {
+      builder.handle(channel, ({ event }) => {
+        handled.push(`first:${event.id}`);
+      });
+    });
+    const secondClient = createClient("second", (builder) => {
+      builder.handle(channel, ({ event }) => {
+        handled.push(`second:${event.id}`);
+      });
+    });
+    const runtime = await createRuntime({
+      channels: [standalone],
+      clients: [firstClient, secondClient],
+    });
+
+    await runtime.init();
+    expect((await runtime.printConfig()).channels).toEqual(["standalone", "inferred"]);
+    expect(await channel.dispatch({ id: "event" })).toMatchObject({ status: "queued" });
+    expect(await runtime.dispatch("standalone", { id: "standalone-event" })).toMatchObject({ status: "queued" });
+    await runtime.drain();
+
+    expect(handled).toEqual(["first:event", "second:event"]);
+    await runtime.stop();
+  });
+
+  it("rejects duplicate channel ids inferred from different handler definitions", async () => {
+    const firstChannel = createChannel("duplicate-inferred");
+    const secondChannel = createChannel("duplicate-inferred");
+    const firstClient = createClient("first", (builder) => {
+      builder.handle(firstChannel, () => {});
+    });
+    const secondClient = createClient("second", (builder) => {
+      builder.handle(secondChannel, () => {});
+    });
+
+    await expect(
+      createRuntime({ clients: [firstClient, secondClient] }).then((runtime) => runtime.init()),
+    ).rejects.toThrow("Duplicate channel id: duplicate-inferred");
+
+    await expect(
+      createRuntime({ channels: [firstChannel], clients: [secondClient] }).then((runtime) => runtime.init()),
+    ).rejects.toThrow("Duplicate channel id: duplicate-inferred");
+  });
+
   it("rejects ambiguous channel, client, and per-client handler identifiers", async () => {
     const channel = createChannel("same");
     const duplicateChannel = createChannel("same");

@@ -33,7 +33,6 @@ describe("message client", () => {
     });
 
     test = await createTestRuntime({
-      channels: [channel],
       clients: [client],
     });
 
@@ -90,7 +89,7 @@ const client = createClient("failing", (client) => {
   });
 });
 
-test = await createTestRuntime({ channels: [channel], clients: [client] });
+test = await createTestRuntime({ clients: [client] });
 await test.dispatch(channel, { id: "failure", sessionKey: "demo" });
 
 const session = await test.sessions.get("demo");

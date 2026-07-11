@@ -455,11 +455,21 @@ export class OrchestratorRuntime {
 
   private compileConfiguration(): void {
     const source = this.sourceOptions.config;
+    const clients = [...(source.clients ?? [])];
+    const channels = [...(source.channels ?? [])];
+    const channelDefinitions = new Set(channels);
+    for (const client of clients) {
+      for (const handler of client.handlers) {
+        if (channelDefinitions.has(handler.channel)) continue;
+        channelDefinitions.add(handler.channel);
+        channels.push(handler.channel);
+      }
+    }
     const config: OrchestratorConfig = {
       ...source,
       store: this.store,
-      ...(source.channels ? { channels: [...source.channels] } : {}),
-      ...(source.clients ? { clients: [...source.clients] } : {}),
+      channels,
+      clients,
       ...(source.retries ? { retries: { ...source.retries } } : {}),
       ...(source.http ? { http: { ...source.http } } : {}),
     };

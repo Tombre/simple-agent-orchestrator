@@ -84,7 +84,7 @@ const client = createClient("echo", (builder) => {
     session.note("Echoed input", { input: event.input });
   }});
 });
-export default defineConfig({ channels: [manual], clients: [client] });
+export default defineConfig({ clients: [client] });
 `,
     "utf8",
   );
@@ -109,6 +109,9 @@ describe("CLI", { timeout: 15_000 }, () => {
     expect(await readFile(join(root, "package.json"), "utf8")).toBe(packageJson);
     const orchestrator = await readFile(join(root, ".simple-agent-orchestrator", "orchestrator.ts"), "utf8");
     expect(orchestrator).toContain("defineConfig");
+    expect(orchestrator).toContain("clients: [exampleClient]");
+    expect(orchestrator).not.toContain("manualChannel");
+    expect(orchestrator).not.toContain("channels:");
     expect(orchestrator).not.toContain("jsonFileStore");
     expect(await readFile(join(root, ".simple-agent-orchestrator", ".gitignore"), "utf8")).toBe("state/\ntmp/\nlogs/\n");
     const example = await readFile(join(root, ".simple-agent-orchestrator", "clients", "example.ts"), "utf8");
@@ -157,7 +160,9 @@ describe("CLI", { timeout: 15_000 }, () => {
   it("persists a dispatch across CLI processes and supports inspection and ending", async () => {
     const { root } = await createFixture();
 
-    expect(await runCli("doctor", "--root", root)).toContain("Doctor completed.");
+    const doctor = await runCli("doctor", "--root", root);
+    expect(doctor).toContain("✓ Channels: manual");
+    expect(doctor).toContain("Doctor completed.");
     const dispatch = await runCli(
       "dispatch",
       "manual",

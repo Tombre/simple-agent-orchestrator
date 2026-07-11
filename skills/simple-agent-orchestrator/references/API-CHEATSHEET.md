@@ -9,7 +9,6 @@ import { defineConfig } from "simple-agent-orchestrator";
 
 export default defineConfig(({ project }) => ({
   name: String(project.packageJson.name ?? "agent-orchestrator"),
-  channels: [manualChannel],
   clients: [codingClient],
   timeout: "10m",
   http: {
@@ -30,7 +29,9 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-The config lives at `.simple-agent-orchestrator/orchestrator.ts`.
+The config lives at `.simple-agent-orchestrator/orchestrator.ts`. In this example, `codingClient` handles the channel whose ID is `source`. `projectAuthenticationMiddleware` and `verifiedEvent` are project-provided functions.
+
+Configured clients register the exact channel definitions passed to their handlers. Use `channels` for additional definitions, including channels with no configured handler. Explicit channels are registered first, followed by handler channels in client and handler order; distinct definitions with the same channel ID are invalid.
 
 Builders configure mutable channel/client/environment definitions immediately. Definitions are inspectable and readonly-typed but not frozen. Runtime `init()` snapshots registrations; later mutations do not affect that runtime. Live reconfiguration is unsupported.
 

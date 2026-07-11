@@ -18,7 +18,7 @@ export const codingClient = createClient("coding", (client) => {
 });
 ```
 
-Register the client and channel in `orchestrator.ts`. Client IDs must be globally unique.
+Register the client in `orchestrator.ts`. Client IDs must be globally unique.
 
 Each accepted event creates a **delivery** for this handler. A delivery is the saved record that tracks this handler's attempts and result for that event. If three clients subscribe, all three get independent deliveries. One client can also register several handlers for the same channel, and each handler gets its own delivery.
 

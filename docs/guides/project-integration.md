@@ -29,17 +29,15 @@ import { fetchReviews } from "../../src/github.ts";
 
 Keep that dependency direction: orchestrator files call application code, while application code doesn't need to know how this project's channels and clients are assembled.
 
-## Connect channels to clients
+## Register your clients
 
-A channel describes where events come from. A client subscribes your handler to those events. Register both in `.simple-agent-orchestrator/orchestrator.ts`:
+A channel describes where events come from. A client subscribes your handler to those events. Register the client in `.simple-agent-orchestrator/orchestrator.ts`:
 
 ```ts
 import { defineConfig } from "simple-agent-orchestrator";
-import { reviewsChannel } from "./channels/reviews.ts";
 import { codingClient } from "./clients/coding.ts";
 
 export default defineConfig({
-  channels: [reviewsChannel],
   clients: [codingClient],
   retries: { attempts: 3, delay: "5s" },
   timeout: "10m",

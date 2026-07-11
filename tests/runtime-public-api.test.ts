@@ -105,6 +105,28 @@ describe("runtime public API", () => {
     await runtime.stop();
   });
 
+  it("does not infer handler channels added after init", async () => {
+    const registered = createChannel("registered-through-handler");
+    const late = createChannel("late-handler-channel");
+    const client = createClient("worker", (builder) => {
+      builder.handle(registered, () => {});
+    });
+    const runtime = await createRuntime({ clients: [client] });
+    await runtime.init();
+
+    (client.handlers as RegisteredHandler[]).push({
+      ...client.handlers[0]!,
+      id: "late-handler",
+      channelId: late.id,
+      channel: late,
+    });
+
+    expect(await runtime.dispatch(registered, { id: "accepted" })).toMatchObject({ status: "queued" });
+    await expect(runtime.dispatch(late, { id: "rejected" })).rejects.toThrow("Unknown channel: late-handler-channel");
+    await expect(late.dispatch({ id: "unbound" })).rejects.toThrow(/not bound.*initialized/i);
+    await runtime.stop();
+  });
+
   it("initializes a custom store before every public runtime access path", async () => {
     let initialized = false;
     let initCalls = 0;

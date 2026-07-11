@@ -110,7 +110,6 @@ Example:
 ```ts
 export default defineConfig(({ project }) => ({
   store: jsonFileStore(project.statePath("state.json")),
-  channels: [manualChannel],
   clients: [exampleClient],
 }));
 ```
@@ -134,12 +133,14 @@ interface OrchestratorConfig {
 | --- | --- | --- |
 | `name` | `undefined` | Optional configuration name. |
 | `store` | Depends on the construction API | Store for events, deliveries, sessions, notes, and cursors. |
-| `channels` | `[]` | Globally unique channel definitions. |
+| `channels` | `[]` | Additional globally unique channel definitions, including channels without client handlers. |
 | `clients` | `[]` | Globally unique client definitions. |
 | `logger` | Console logger | Logger used by the runtime. |
 | `retries` | Three attempts, zero delay | Global retry defaults. |
 | `timeout` | `0` | Global handler timeout. Zero disables it. |
 | `http` | Enabled by `start()` | Built-in server and project route configuration. |
+
+During `init()`, the runtime registers explicit `channels` first, then the exact channel definitions referenced by configured client handlers in client and handler registration order. A handler channel already registered explicitly or through another handler is not added again. Duplicate entries in `channels` and distinct channel definitions with the same ID cause initialization to fail. Channels without handlers must be listed explicitly when the runtime needs them for polling or dispatch.
 
 ### `RetryOptions`
 

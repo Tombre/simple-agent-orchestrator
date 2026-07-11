@@ -15,7 +15,7 @@ import { createManualChannel } from "simple-agent-orchestrator";
 export const manualChannel = createManualChannel("manual");
 ```
 
-Register it in `orchestrator.ts`, then send an event:
+Use the channel in a [client handler](clients.md#handle-your-first-event) and register that client in `orchestrator.ts`. Then send an event:
 
 ```bash
 npx simple-agent-orchestrator dispatch manual \

@@ -26,16 +26,14 @@ The install makes the CLI and library available to this project. `init` then add
   tsconfig.json
 ```
 
-The important file is `orchestrator.ts`. It connects the generated `manual` channel to the generated example client:
+The important file is `orchestrator.ts`. It registers the generated example client:
 
 ```ts
 // .simple-agent-orchestrator/orchestrator.ts
 import { defineConfig } from "simple-agent-orchestrator";
-import { manualChannel } from "./channels/manual.ts";
 import { exampleClient } from "./clients/example.ts";
 
 export default defineConfig({
-  channels: [manualChannel],
   clients: [exampleClient],
 });
 ```

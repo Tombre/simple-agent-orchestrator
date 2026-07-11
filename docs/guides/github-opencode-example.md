@@ -229,18 +229,16 @@ Both agent calls and `markReviewSeen` can repeat after a timeout, process interr
 
 Acknowledgement belongs in `onSuccess` so GitHub isn't marked before the agent call succeeds. If you add other handlers for the same event, remember that each gets an independent delivery; this hook doesn't wait for those other handlers.
 
-## 5. Register the channel and client
+## 5. Register the client
 
-The config is the final wiring layer:
+Register the client in `orchestrator.ts`:
 
 ```ts
 // .simple-agent-orchestrator/orchestrator.ts
 import { defineConfig } from "simple-agent-orchestrator";
-import { githubReviews } from "./channels/github.ts";
 import { codingClient } from "./clients/coding.ts";
 
 export default defineConfig({
-  channels: [githubReviews],
   clients: [codingClient],
 });
 ```
