@@ -1,321 +1,78 @@
 # Simple Agent Orchestrator
 
-Simple Agent Orchestrator is a small TypeScript framework for routing events from channels into durable agent sessions.
+Simple Agent Orchestrator is a dependency-light Node.js 20+ TypeScript library and CLI for routing events into durable, retryable agent sessions inside an existing project.
 
-It is designed to be installed inside existing TypeScript projects. You add a project-local `.simple-agent-orchestrator` directory, define channels, clients, environments, and prompts there, and run the runtime from the project root:
+## Five-minute start
 
-```bash
-npx simple-agent-orchestrator start
-```
-
-The framework gives you durable plumbing and gets out of your way:
-
-- Channels discover or receive external events.
-- Events are deduped and stored.
-- Clients subscribe to channels and handle deliveries.
-- Sessions preserve state across related events.
-- Environments mount project resources and optional sandboxes.
-- A project-level Hono server provides normalized webhook ingress, bounded operational inspection, health checks, and route extension hooks.
-- CLI commands let you inspect sessions, events, and failed deliveries.
-
-## Install
+Run this from an existing npm project with a valid `package.json`:
 
 ```bash
 npm install -D simple-agent-orchestrator
-```
-
-For a local checkout during development, install it by relative path instead:
-
-```bash
-npm install -D "file:../simple-agent-orchestrator"
-```
-
-The local install runs the package's `prepare` script to build `dist/`. Run
-`npm install` in the local checkout first so its build dependencies are
-available.
-
-Then initialize your project:
-
-```bash
 npx simple-agent-orchestrator init
-```
-
-This creates:
-
-```text
-.simple-agent-orchestrator/
-  orchestrator.ts
-  channels/
-    manual.ts
-  clients/
-    echo.ts
-  environments/
-  prompts/
-  state/
-  logs/
-  tmp/
-```
-
-The state, log, and tmp directories are ignored by git by default.
-
-## First run
-
-Check the setup:
-
-```bash
 npx simple-agent-orchestrator doctor
-npx simple-agent-orchestrator state validate
-```
-
-Send a manual event:
-
-```bash
-npx simple-agent-orchestrator dispatch manual \
-  --id manual-1 \
-  --session test-session \
-  --input "Hello from a manual event"
-```
-
-List sessions:
-
-```bash
+npx simple-agent-orchestrator dispatch manual --id first-event --session demo --input "Hello"
+npx simple-agent-orchestrator events list
 npx simple-agent-orchestrator sessions list
 ```
 
-Show a session:
+`init` discovers the nearest parent package unless `--root` is supplied. It creates only `.simple-agent-orchestrator/`; it does not edit the host `package.json`. Re-running requires `--force`, which overwrites known template files but preserves unknown files.
 
-```bash
-npx simple-agent-orchestrator sessions show test-session
+The generated project is deliberately small:
+
+```text
+.simple-agent-orchestrator/
+  .gitignore
+  package.json
+  tsconfig.json
+  orchestrator.ts
+  channels/manual.ts
+  clients/example.ts
 ```
 
-The `dispatch` command processes currently eligible work in a one-shot runtime and exits. A configured delayed retry remains durably pending for a later drain or long-running runtime. After this smoke test, start the long-running runtime for HTTP ingress, polls, and workers:
+The example client only logs event and session identifiers. Replace it with project-owned agent code, then run the long-lived runtime:
 
 ```bash
 npx simple-agent-orchestrator start
 ```
 
-While it is running, the generated `manual` channel accepts normalized events:
+Ordinary `start` runs pollers, workers, and an HTTP listener on `127.0.0.1:3000`. Use `--no-http` to disable HTTP or `--drain` to poll once, process currently eligible work, and exit.
 
-```bash
-curl -i -X POST http://127.0.0.1:3000/webhooks/manual \
-  -H 'Content-Type: application/json' \
-  -d '{"id":"http-1","sessionKey":"http-demo","input":"Hello over HTTP"}'
-curl http://127.0.0.1:3000/api/v1/status
-curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
-curl 'http://127.0.0.1:3000/api/v1/sessions?limit=25'
-```
+## Mental model
 
-A new event returns `202` with `{ "status": "queued", "eventId": "..." }`; a duplicate returns `200` with the original `eventId`. Acceptance means durable ingestion, not completed delivery processing.
+- A **channel** receives normalized events or polls a source.
+- An **event** is durably ingested and deduplicated by `channelId + dedupeKey`.
+- Each matching client handler gets an independent **delivery** with retries.
+- A **session** preserves state and notes for related events sharing a `sessionKey`.
+- A client **environment** owns process-local resources and an optional session sandbox.
+- The one-process **runtime** coordinates persistence, workers, polls, lifecycle, and optional HTTP.
 
-The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline operations: they acquire the same ownership lock and fail before writing if `start` is active. Inspection commands, including `state validate` and a `state prune` preview without `--apply`, remain available while the runtime is running.
+Definitions returned by `createChannel`, `createClient`, and `createEnvironment` are inspectable and readonly-typed, but they are not frozen. Builder callbacks configure mutable definitions. A runtime snapshots registrations when `init()` first runs; changes after that do not affect that runtime. Live runtime reconfiguration is unsupported.
 
-## Project-local config
+## Critical warnings
 
-The runtime looks for:
+- Processing is retryable, not exactly once. Handlers, hooks, sandbox operations, and external effects can repeat. Use stable external idempotency keys or reconciliation.
+- The default JSON store supports one active mutating runtime or offline operation per state file. Stop `start` before CLI `dispatch`, `sessions end`, `events retry`, or `state prune --apply`.
+- JSON state, event content, session state, notes, errors, and ordinary project/default logs are plaintext and are not automatically redacted. Do not persist or log credentials or sensitive source content without an explicit policy.
+- Built-in operational HTTP summaries omit event bodies, session state, notes, and errors. That does not constrain project middleware, custom routes, handlers, or logging. HTTP has no built-in authentication, provider signature verification, CORS, rate limiting, or TLS.
+- `POST /webhooks/:channelId` confirms durable ingestion, not successful processing. Add authentication and source verification before exposure.
+- Handler timeouts and shutdown are cooperative. Project code must pass `signal` to cancellation-aware operations.
 
-```text
-.simple-agent-orchestrator/orchestrator.ts
-```
+## Common tasks
 
-Example:
-
-```ts
-import { defineConfig, jsonFileStore } from "simple-agent-orchestrator";
-import { githubReviewsChannel } from "./channels/github";
-import { codingClient } from "./clients/coding";
-
-export default defineConfig(({ project }) => ({
-  name: String(project.packageJson.name ?? "local-project"),
-
-  store: jsonFileStore(project.statePath("state.json")),
-
-  http: {
-    hostname: "127.0.0.1",
-    port: 3000,
-    middleware({ app }) {
-      app.use("*", projectAuthenticationMiddleware);
-    },
-    routes({ app, dispatch }) {
-      app.post("/project-hook", async (context) => {
-        const result = await dispatch("github.reviews", { id: crypto.randomUUID() });
-        return result.status === "queued"
-          ? context.json(result, 202)
-          : context.json(result, 200);
-      });
-    },
-  },
-
-  channels: [githubReviewsChannel],
-
-  clients: [codingClient],
-}));
-```
-
-The config receives a project context so you can resolve paths relative to the repository root or the `.simple-agent-orchestrator` directory.
-
-Normal `start` and `dev` runs bind HTTP to `127.0.0.1:3000` by default. `SAO_HTTP_PORT` overrides the configured port. Built-ins are `GET /health`, `POST /webhooks/:channelId`, `GET /api/v1/status`, `GET /api/v1/events?limit=N`, and `GET /api/v1/sessions?limit=N`; these namespaces are reserved. Webhooks require strict `application/json`, accept at most 1 MiB, and validate normalized JSON-safe events. Operational lists default to 25, allow at most 100, reject invalid limits, and omit event bodies, metadata, session state, notes, delivery errors, and individual deliveries. Project middleware runs before built-ins and project routes are registered afterward. The server does not log request bodies by default and provides no authentication, signature verification, CORS, rate limiting, or TLS. Add those controls before exposure: unauthenticated dispatch can trigger project side effects and unbounded durable state growth. Use `--no-http` to disable the listener.
-
-## Core example
-
-```ts
-import {
-  createChannel,
-  createClient,
-  defineKey,
-  sessionKey,
-} from "simple-agent-orchestrator";
-
-const githubPr = defineKey<{ owner: string; repo: string; number: number }>(
-  "github.pr",
-  { parts: ["owner", "repo", "number"] },
-);
-
-const agentSessionId = sessionKey<string>("opencode.sessionId");
-
-export const githubReviewsChannel = createChannel(
-  "github.reviews",
-  (channel) => {
-    channel.poll({
-      id: "reviews",
-      every: "60s",
-
-      async fetch() {
-        return fetchRecentReviewCandidates();
-      },
-
-      async map(review) {
-        return {
-          id: review.id,
-          dedupeKey: `github.review:${review.id}:${review.updatedAt}`,
-          sessionKey: githubPr({
-            owner: review.owner,
-            repo: review.repo,
-            number: review.prNumber,
-          }),
-          input: review.toMarkdown(),
-          payload: review,
-          meta: {
-            branch: review.branch,
-          },
-        };
-      },
-    });
-  },
-);
-
-export const codingClient = createClient("coding", (client) => {
-  client.retries({ attempts: 3, delay: "5s" });
-  client.timeout("10m");
-
-  client.handle(githubReviewsChannel, async ({ event, session, signal }) => {
-    const id = await session.ensure(agentSessionId, async () => {
-      const created = await createAgentSession({
-        idempotencyKey: `agent-session:${session.id}`,
-        signal,
-      });
-      return created.id;
-    });
-
-    await sendToAgent(id, String(event.input), {
-      idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
-      signal,
-    });
-  });
-});
-```
-
-## Important concepts
-
-### Channel
-
-A channel is an event source. It can poll or receive normalized webhook, CLI, or project-route dispatches on the runtime-owned HTTP server.
-
-### Event
-
-An event is the durable unit of input. Events have a source `id`, optional `dedupeKey`, `sessionKey`, `input`, `payload`, and `meta`.
-
-### Delivery
-
-A delivery is a client/handler-specific attempt to process an event. One event can be delivered to multiple clients.
-
-Delivery processing is retryable, not exactly once. Retries are immediate by default; a fixed `delay` can durably postpone automatic retries. An optional `timeout` cooperatively aborts a delivery attempt and applies the same retry rules. Integrations must pass the context `signal` to their own agents, subprocesses, and network APIs; JavaScript that ignores cancellation is still awaited and cannot be forcefully terminated. A later failure, timeout, or restart recovery can repeat handlers, hooks, and external effects even though event dispatch was deduped. See [Failure semantics and idempotency](docs/guides/failure-semantics.md).
-
-### Client
-
-A client subscribes to channels and handles deliveries. It is where you integrate with your actual agent, tool, or workflow code.
-
-### Session
-
-A session is durable state attached to a `sessionKey`. Related events reuse the same active session.
-
-### Environment
-
-An environment mounts shared resources for a client, such as local servers, API clients, credentials, or sandboxes.
-
-## CLI
-
-```bash
-# Project setup and runtime
-simple-agent-orchestrator init
-simple-agent-orchestrator start
-simple-agent-orchestrator dev
-# Add --no-http to start or dev when no listener is wanted.
-
-# Inspection (safe while start is active)
-simple-agent-orchestrator doctor
-simple-agent-orchestrator print-config
-simple-agent-orchestrator state validate
-simple-agent-orchestrator sessions list
-simple-agent-orchestrator sessions show <id-or-key>
-simple-agent-orchestrator events list
-
-# Explicit state retention (preview first; add --apply while start is stopped)
-simple-agent-orchestrator state prune --before 2026-01-01T00:00:00Z
-
-# Offline mutation (requires start to be stopped)
-simple-agent-orchestrator dispatch <channel> --id <id> --session <sessionKey> --input <text>
-simple-agent-orchestrator sessions end <id-or-key>
-simple-agent-orchestrator events retry <delivery-id>
-```
-
-State pruning removes old processed deliveries and safely unreferenced ended sessions with their notes. Events remain as dedupe records by default. `--drop-dedupe` also removes old unreferenced events and can cause the same source identities to run again; preview the exact IDs, back up persistent state, and use that flag only when this behavior is intended. Cursors and operational work are never pruned.
-
-See [`docs/guides/cli.md`](docs/guides/cli.md) for details.
-
-## Documentation
-
+- [Documentation index](docs/index.md)
 - [Getting started](docs/guides/getting-started.md)
 - [Project integration](docs/guides/project-integration.md)
-- [Channels](docs/guides/channels.md)
-- [Clients and handlers](docs/guides/clients.md)
-- [Failure semantics and idempotency](docs/guides/failure-semantics.md)
+- [Channels and dispatch](docs/guides/channels.md)
+- [Clients, retries, and timeouts](docs/guides/clients.md)
 - [Sessions and state](docs/guides/sessions-state.md)
 - [Environments and sandboxes](docs/guides/environments-sandboxes.md)
 - [Testing](docs/guides/testing.md)
-- [GitHub + persistent coding agent example](docs/guides/github-opencode-example.md)
-- [CLI guide](docs/guides/cli.md)
+- [CLI](docs/guides/cli.md)
+- [Failure semantics and idempotency](docs/guides/failure-semantics.md)
 - [API reference](docs/api-reference.md)
 - [Design principles](docs/design-principles.md)
 
-## Current implementation notes
-
-This generated project is intentionally small and dependency-light. It ships with an in-memory store and a JSON-file store. The public store interface is small so that you can add a SQLite or Postgres adapter later without changing user code.
-
-The JSON-file store strictly validates state before runtime work and writes. State version 3 is current; valid version 1 and 2 snapshots are upgraded deterministically in memory with immediate retry defaults and persisted as version 3 by the next successful write. Validation and inspection do not rewrite historical files. Malformed, structurally invalid, obsolete, and future versions fail with actionable errors and are not replaced. Run `state validate` for a read-only compatibility check.
-
-The JSON-file store enforces one active runtime or offline operation per state file with a local PID lock and reclaims stale ownership after a process exits. Atomic first-run state initialization and runtime ownership require a local hard-link-capable filesystem and fail explicitly when the filesystem cannot provide atomic hard links. After acquiring ownership, startup and drain recover stale `processing` deliveries automatically. The CLI rejects offline mutations, including applying state retention, while `start` is active, but direct unscoped library writes remain unsafe. Multi-process worker coordination is not implemented.
-
-The package is ESM-only and requires Node.js 20 or newer.
-
-## Release verification
-
-Before proposing a release, run the same package-level check used by CI:
-
-```bash
-npm run release:check
-```
-
-This builds the npm tarball, validates its release-facing files, installs it in a clean temporary consumer, checks all public package subpaths and declarations, initializes the packaged template, and exercises the installed CLI against persisted state. CI runs the test, typecheck, and build contract on Node.js 20, 22, 24, and 26, then runs the package-artifact check on Node.js 20 and 26 on Linux and Windows.
+The package is ESM-only and requires Node.js 20 or newer. It ships public package subpaths `.`, `./runtime`, and `./testing`.
 
 ## License
 

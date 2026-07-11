@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,6 +40,17 @@ async function run(command, args, options = {}) {
 
 function runNpm(args, options) {
   return run(npmCommand, [...npmArgs, ...args], options);
+}
+
+async function assertRejectsCommand(operation, pattern) {
+  let failure;
+  try {
+    await operation();
+  } catch (error) {
+    failure = error;
+  }
+  assert(failure instanceof Error, "Expected command to fail");
+  assert.match(failure.message, pattern);
 }
 
 function parsePackResult(stdout) {
@@ -116,31 +127,65 @@ async function verifyConsumer(consumerRoot, archive) {
     process.platform === "win32" ? "simple-agent-orchestrator.cmd" : "simple-agent-orchestrator",
   );
   await access(cliShim);
+  const installedCliPath = join(
+    consumerRoot,
+    "node_modules",
+    "simple-agent-orchestrator",
+    "dist",
+    "cli.js",
+  );
   const runCli = (args) => runNpm(["run", "--silent", "sao", "--", ...args], { cwd: consumerRoot });
+  const runCliFrom = (cwd, args) => run(process.execPath, [installedCliPath, ...args], { cwd });
 
   console.log("Initializing and validating the packaged template...");
+  const packageJsonBeforeInit = await readFile(join(consumerRoot, "package.json"), "utf8");
   const initialized = await runCli(["init"]);
   assert.match(initialized.stdout, /Created .*\.simple-agent-orchestrator/);
-  for (const path of [
-    ".simple-agent-orchestrator/orchestrator.ts",
-    ".simple-agent-orchestrator/logs/.gitignore",
-    ".simple-agent-orchestrator/state/.gitignore",
-    ".simple-agent-orchestrator/tmp/.gitignore",
-  ]) {
-    await access(join(consumerRoot, ...path.split("/")));
-  }
+  assert.equal(await readFile(join(consumerRoot, "package.json"), "utf8"), packageJsonBeforeInit);
+  assert.deepEqual(
+    await listFiles(join(consumerRoot, ".simple-agent-orchestrator")),
+    [".gitignore", "channels/manual.ts", "clients/example.ts", "orchestrator.ts", "package.json", "tsconfig.json"],
+  );
+  assert.equal(
+    await readFile(join(consumerRoot, ".simple-agent-orchestrator", ".gitignore"), "utf8"),
+    "state/\ntmp/\nlogs/\n",
+  );
+  const exampleSource = await readFile(
+    join(consumerRoot, ".simple-agent-orchestrator", "clients", "example.ts"),
+    "utf8",
+  );
+  assert.doesNotMatch(exampleSource, /messageCount|session\.note|event\.(?:input|payload|meta)/);
+
+  await assertRejectsCommand(() => runCli(["dev"]), /Unknown command: dev/);
+  await assertRejectsCommand(
+    () => runCli(["dispatch", "manual"]),
+    /Missing required option: --id/,
+  );
 
   const doctor = await runCli(["doctor"]);
   assert.match(doctor.stdout, /Doctor completed\./);
+  const nestedDoctor = await runCliFrom(
+    join(consumerRoot, ".simple-agent-orchestrator", "clients"),
+    ["doctor"],
+  );
+  assert.match(nestedDoctor.stdout, /Doctor completed\./);
+  const explicitConfigDoctor = await runCli([
+    "doctor",
+    "--config",
+    ".simple-agent-orchestrator/orchestrator.ts",
+  ]);
+  assert.match(explicitConfigDoctor.stdout, /Doctor completed\./);
   const stateValidation = await runCli(["state", "validate"]);
   assert.match(stateValidation.stdout, /State is valid and compatible\./);
 
   await writeFile(
     join(consumerRoot, "verify-types.ts"),
-    `import { CURRENT_STATE_VERSION, createClient, createManualChannel, defineConfig, validateAndMigrateState } from "simple-agent-orchestrator";
-import type { HttpRegistrationContext, OrchestratorState, StateValidationErrorCode } from "simple-agent-orchestrator";
-import { loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
+    `import { CURRENT_STATE_VERSION, createClient, createManualChannel, defineConfig, memoryStore, validateAndMigrateState } from "simple-agent-orchestrator";
+import type { DispatchResult, HttpRegistrationContext, OrchestratorState, StateValidationErrorCode } from "simple-agent-orchestrator";
+import { createRuntime, loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
+import type { OfflineOperationContext } from "simple-agent-orchestrator/runtime";
 import { createTestRuntime } from "simple-agent-orchestrator/testing";
+import type { TestRuntime } from "simple-agent-orchestrator/testing";
 
 const channel = createManualChannel("types");
 const client = createClient("types", (builder) => builder.handle(channel, () => {}));
@@ -149,12 +194,24 @@ const registerRoutes = ({ app }: HttpRegistrationContext) => {
 };
 const config = { channels: [channel], clients: [client], http: { enabled: false, routes: registerRoutes } };
 void defineConfig(config);
+const runtimePromise = createRuntime({ ...config, store: memoryStore() }, { root: "." });
+const testRuntimePromise: Promise<TestRuntime> = createTestRuntime(config, { root: "." });
+declare const offline: OfflineOperationContext;
+const dispatchResult: Promise<DispatchResult> = offline.dispatch(channel, { id: "typed" });
+// @ts-expect-error Public channel definitions are readonly.
+channel.id = "changed";
+// @ts-expect-error Public poll collections are readonly.
+channel.polls.push({ every: 1, fetch: () => [] });
+// @ts-expect-error Public handler collections are readonly.
+client.handlers.push(client.handlers[0]!);
 const state: OrchestratorState = validateAndMigrateState({ version: CURRENT_STATE_VERSION, sessions: [], events: [], deliveries: [], notes: [], cursors: {} });
 const validationCode: StateValidationErrorCode = "invalid-state";
+void runtimePromise;
+void testRuntimePromise;
+void dispatchResult;
 void state;
 void validationCode;
 void loadProjectOrchestrator({ root: "." });
-void createTestRuntime({ config });
 `,
     "utf8",
   );
@@ -177,6 +234,44 @@ void createTestRuntime({ config });
   console.log("Checking public package subpaths and declarations...");
   const tsc = join(repositoryRoot, "node_modules", "typescript", "bin", "tsc");
   await run(process.execPath, [tsc, "-p", join(consumerRoot, "tsconfig.json")], { cwd: consumerRoot });
+  await run(
+    process.execPath,
+    [tsc, "-p", join(consumerRoot, ".simple-agent-orchestrator", "tsconfig.json")],
+    { cwd: consumerRoot },
+  );
+
+  await writeFile(
+    join(consumerRoot, "verify-runtime.mjs"),
+    `import assert from "node:assert/strict";
+import { createClient, createManualChannel, memoryStore } from "simple-agent-orchestrator";
+import { createRuntime } from "simple-agent-orchestrator/runtime";
+import { createTestRuntime } from "simple-agent-orchestrator/testing";
+
+const channel = createManualChannel("programmatic");
+const client = createClient("programmatic", (builder) => builder.handle(channel, () => {}));
+const config = { channels: [channel], clients: [client], http: { enabled: false } };
+
+const runtime = await createRuntime({ ...config, store: memoryStore() }, { root: process.cwd() });
+await runtime.init();
+try {
+  const result = await runtime.dispatch(channel, { id: "runtime-event" });
+  assert.equal(result.status, "queued");
+  await runtime.drain();
+} finally {
+  await runtime.stop();
+}
+
+const test = await createTestRuntime(config, { root: process.cwd() });
+const testResult = await test.dispatch(channel, { id: "test-event" });
+assert.equal(testResult.status, "queued");
+await test.stop();
+await assert.rejects(() => test.dispatch(channel, { id: "after-stop" }), /stopped/);
+await assert.rejects(() => channel.dispatch({ id: "after-stop" }), /not bound/);
+`,
+    "utf8",
+  );
+  console.log("Exercising installed runtime and testing subpaths...");
+  await run(process.execPath, [join(consumerRoot, "verify-runtime.mjs")], { cwd: consumerRoot });
 
   const probe = createServer();
   await new Promise((resolve, reject) => {
@@ -189,8 +284,7 @@ void createTestRuntime({ config });
   await new Promise((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
 
   console.log("Running the installed CLI webhook and operational API smoke test...");
-  const cliPath = join(consumerRoot, "node_modules", "simple-agent-orchestrator", "dist", "cli.js");
-  const child = spawn(process.execPath, [cliPath, "start"], {
+  const child = spawn(process.execPath, [installedCliPath, "start"], {
     cwd: consumerRoot,
     env: { ...process.env, NO_COLOR: "1", SAO_HTTP_PORT: String(port) },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -210,6 +304,7 @@ void createTestRuntime({ config });
     });
   });
   const baseUrl = `http://127.0.0.1:${port}`;
+  let acceptedEventId;
   try {
     const deadline = Date.now() + 10_000;
     while (true) {
@@ -227,12 +322,13 @@ void createTestRuntime({ config });
     const webhook = await fetch(`${baseUrl}/webhooks/manual`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id: "smoke-1", sessionKey: "smoke", input: "Smoke test" }),
+      body: JSON.stringify({ id: "smoke-1", sessionKey: "smoke", input: "DISPATCHED_INPUT_MUST_NOT_BE_LOGGED" }),
     });
     assert.equal(webhook.status, 202);
     const accepted = await webhook.json();
     assert.equal(accepted.status, "queued");
     assert.equal(typeof accepted.eventId, "string");
+    acceptedEventId = accepted.eventId;
 
     const status = await fetch(`${baseUrl}/api/v1/status`).then((response) => response.json());
     assert.equal(status.http.port, port);
@@ -263,16 +359,24 @@ void createTestRuntime({ config });
     }
   }
   assert.deepEqual(childExit, { code: 0, signal: null }, childOutput);
+  assert.doesNotMatch(childOutput, /DISPATCHED_INPUT_MUST_NOT_BE_LOGGED/);
 
   console.log("Inspecting persisted package state with the installed CLI...");
   const session = JSON.parse((await runCli(["sessions", "show", "smoke"])).stdout);
   assert.equal(session.key, "smoke");
-  assert.equal(session.state["example.messageCount"], 1);
-  assert.equal(session.notes[0]?.message, "Handled manual event");
+  assert.deepEqual(session.state, {});
+  assert.deepEqual(session.notes, []);
+  const sessions = JSON.parse((await runCli(["sessions", "list", "--json"])).stdout);
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].key, "smoke");
 
-  const events = (await runCli(["events", "list"])).stdout;
-  assert.match(events, /smoke-1/);
-  assert.match(events, /processed/);
+  const events = JSON.parse((await runCli(["events", "list", "--json"])).stdout);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].event.sourceId, "smoke-1");
+  assert.equal(events[0].deliveries[0].status, "processed");
+  const shownEvent = JSON.parse((await runCli(["events", "show", acceptedEventId])).stdout);
+  assert.equal(shownEvent.event.id, acceptedEventId);
+  assert.equal(shownEvent.event.sourceId, "smoke-1");
 }
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), "sao-release-check-"));

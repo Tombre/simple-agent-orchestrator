@@ -15,17 +15,15 @@ my-project/
     orchestrator.ts
     channels/
     clients/
-    environments/
-    prompts/
-    state/
-    logs/
-    tmp/
+    package.json
+    tsconfig.json
+    .gitignore
 ```
 
 The orchestrator directory can import code from your project:
 
 ```ts
-import { fetchRecentReviewCandidates } from "../../src/lib/github/reviews";
+import { fetchRecentReviewCandidates } from "../../src/lib/github/reviews.ts";
 ```
 
 The app should generally not import from `.simple-agent-orchestrator`. Keep the dependency direction as:
@@ -57,6 +55,8 @@ You can also run with an explicit root:
 npx simple-agent-orchestrator start --root packages/api
 ```
 
+`init` has a narrower contract than general runtime discovery. Without `--root`, it finds the nearest `package.json` above the current directory. The selected root must already contain a regular, valid, object-valued `package.json`. Initialization writes only known files under `.simple-agent-orchestrator` and does not edit the host manifest. `--force` replaces known template files while preserving files it does not own.
+
 ## Project context
 
 `defineConfig` receives a `project` context:
@@ -84,7 +84,7 @@ Use these helpers instead of long relative path chains.
 
 ## HTTP integration
 
-Ordinary `start` and `dev` runs own one project-level Hono server alongside polling and workers:
+Ordinary `start` owns one project-level Hono server alongside polling and workers:
 
 ```ts
 export default defineConfig({
@@ -109,7 +109,13 @@ export default defineConfig({
 
 Middleware is registered before built-ins; custom routes are registered afterward. Hooks also receive `project`, `logger`, and the runtime `signal`. Built-ins are `GET /health`, normalized `POST /webhooks/:channelId`, and bounded read-only `GET /api/v1/status`, `/api/v1/events`, and `/api/v1/sessions`; their namespaces are reserved. Middleware that inspects a body needed by a later handler should read `context.req.raw.clone()`. Provider-specific parsing, authentication, signatures, source acknowledgement, CORS, rate limiting, TLS, and public exposure policy remain project responsibilities.
 
-The normalized webhook requires `application/json`, limits encoded bodies to 1 MiB, rejects unknown or non-JSON-safe fields, and durably dispatches before returning `202 queued` or `200 duplicate`. It does not wait for delivery processing. Operational lists default to 25 and allow at most 100; they omit event bodies and metadata, session state and notes, delivery errors, and individual deliveries. Request bodies are not logged by default. Add security middleware before exposure because unauthenticated ingress can trigger external effects and unbounded state growth. HTTP belongs at project/runtime scope rather than in a client environment, which may be mounted once per client.
+The normalized webhook requires `application/json`, limits encoded bodies to 1 MiB, rejects unknown or non-JSON-safe fields, and durably dispatches before returning `202 queued` or `200 duplicate`. It does not wait for delivery processing. Built-in operational lists default to 25 and allow at most 100; they omit event bodies and metadata, session state and notes, delivery errors, and individual deliveries. This is a contract of those built-in routes, not of project middleware, custom routes, handlers, or loggers. Add security middleware before exposure because unauthenticated ingress can trigger external effects and unbounded state growth. HTTP belongs at project/runtime scope rather than in a client environment, which may be mounted once per client.
+
+## Definition and runtime boundary
+
+`createChannel`, `createClient`, and `createEnvironment` run their builder callbacks immediately. Builders configure mutable definition data; the returned definitions expose that data through readonly TypeScript types for inspection and composition, but the objects and arrays are not frozen.
+
+The runtime snapshots channels, polls, clients, handlers, retry settings, and HTTP/config collections when `runtime.init()` first succeeds. Changes made before initialization are observed. Changes made to config arrays or definitions after initialization do not reconfigure that runtime. Live add/remove/reload behavior is unsupported; create a fresh runtime for changed definitions.
 
 ## TypeScript loading
 
@@ -119,13 +125,15 @@ The init command creates `.simple-agent-orchestrator/tsconfig.json` so your edit
 
 ## Runtime state
 
-The template stores mutable state under:
+The default runtime store writes mutable state under:
 
 ```text
 .simple-agent-orchestrator/state/state.json
 ```
 
 The state directory is git-ignored by default.
+
+State and ordinary logging are plaintext and are not automatically redacted. Event input/payload/meta, session state, notes, cursor values, and stored errors may be sensitive. The generated example client logs identifiers only, but project code controls its own logs and must avoid secrets or sensitive content.
 
 You can change the store in `orchestrator.ts`:
 

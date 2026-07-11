@@ -1,126 +1,70 @@
 # Getting started
 
-Simple Agent Orchestrator is meant to live inside an existing TypeScript project.
+Simple Agent Orchestrator is installed inside an existing Node.js 20+ project.
 
-## 1. Install
+## Initialize
 
 ```bash
 npm install -D simple-agent-orchestrator
-```
-
-## 2. Initialize
-
-```bash
 npx simple-agent-orchestrator init
-```
-
-This creates `.simple-agent-orchestrator` at your project root.
-
-## 3. Check the project
-
-```bash
 npx simple-agent-orchestrator doctor
 ```
 
-`doctor` loads your config, initializes and validates the store, validates identifiers, and prints the discovered channels and clients. It does not run environment hooks, HTTP hooks/listeners, pollers, or handlers. Use `npx simple-agent-orchestrator state validate` when you only need a persisted-state compatibility check.
+`init` walks upward from the current directory to the nearest `package.json`, or uses `--root <path>`. The root must already be a directory and its `package.json` must be a regular file containing a JSON object. Initialization does not create a host package and does not edit its manifest or scripts.
 
-## 4. Dispatch a manual event
+The command creates `.simple-agent-orchestrator/orchestrator.ts`, a manual channel, a minimal example client, local TypeScript/package metadata, and one `.gitignore` for `state/`, `tmp/`, and `logs/`. If the orchestrator directory exists, initialization fails unless `--force` is supplied. Force replaces known generated files while preserving unknown files.
 
-The default template includes a manual channel and an echo client.
+`doctor` loads config, initializes and validates the store, and validates registrations. It does not run hooks, HTTP, polls, or handlers.
+
+## Process an event
 
 ```bash
 npx simple-agent-orchestrator dispatch manual \
   --id first-event \
   --session demo \
   --input "Hello agent runtime"
+
+npx simple-agent-orchestrator events list
+npx simple-agent-orchestrator sessions list
 ```
 
-The `dispatch` command loads the config, processes the event in a one-shot runtime, and exits. Then inspect the session:
+`--id` is required. The generated example client logs only the internal event and session identifiers, so it does not add session state or notes. Replace `.simple-agent-orchestrator/clients/example.ts` with your integration.
 
-```bash
-npx simple-agent-orchestrator sessions show demo
-```
+CLI dispatch acquires offline ownership, persists the event, drains currently eligible work, and exits. It does not wait for a future delayed retry.
 
-You should see session state like:
-
-```json
-{
-  "key": "demo",
-  "status": "active",
-  "state": {
-    "example.messageCount": 1
-  }
-}
-```
-
-## 5. Start the runtime
-
-After the manual smoke test, start the long-running runtime for HTTP ingress, polls, and workers:
+## Start the runtime
 
 ```bash
 npx simple-agent-orchestrator start
 ```
 
-The runtime loads `.simple-agent-orchestrator/orchestrator.ts` from your project root and validates persisted state before polling, mounting environments, opening HTTP, recovering deliveries, or invoking handlers. The listener defaults to `http://127.0.0.1:3000`; check `GET /health`, or pass `--no-http` when it is not needed. The default JSON store supports one mutating orchestrator process. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` fail before writing while `start` is active; inspection commands such as `state validate`, a retention preview, `sessions show`, and `events list` remain available.
-
-In another terminal, exercise the running listener:
+Ordinary startup runs pollers and workers and binds HTTP to `127.0.0.1:3000` by default. In another terminal:
 
 ```bash
 curl -i -X POST http://127.0.0.1:3000/webhooks/manual \
   -H 'Content-Type: application/json' \
-  -d '{"id":"http-first","sessionKey":"http-demo","input":"Hello agent runtime"}'
+  -d '{"id":"http-first","sessionKey":"http-demo","input":"Hello"}'
 curl http://127.0.0.1:3000/api/v1/status
-curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
-curl 'http://127.0.0.1:3000/api/v1/sessions?limit=25'
 ```
 
-The webhook response confirms durable ingestion, not successful handling. Stop with Ctrl+C before using offline mutation commands. `--no-http` and `--drain` do not expose these routes. The default loopback bind is not authentication; add project middleware before exposing the listener.
+Webhook success means durable ingestion, not handler success. Stop the runtime before offline mutation commands. Use `start --no-http` when no listener is wanted or `start --drain` to poll once, process eligible deliveries, and stop.
 
-## 6. Replace the echo client
+## Add project code
 
-Edit:
-
-```text
-.simple-agent-orchestrator/clients/echo.ts
-```
-
-Replace the handler with your own agent integration:
-
-```ts
-client.timeout("10m");
-client.handle(manualChannel, async ({ event, session, signal }) => {
-  const agentSessionId = await session.ensure("agent.sessionId", async () => {
-    const created = await createAgentSession({
-      idempotencyKey: `agent-session:${session.id}`,
-      signal,
-    });
-    return created.id;
-  });
-
-  await sendToAgent(agentSessionId, String(event.input), {
-    idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
-    signal,
-  });
-});
-```
-
-Both external operations use stable keys because a later failure or timeout can retry the handler, and both receive the cooperative cancellation signal. A timeout cannot force JavaScript or prove that an external side effect did not occur. Avoid submitting the first prompt during ensured session creation: an attempt-local `createdNow` flag cannot prevent duplicate first-event delivery after a retry.
-
-## 7. Add real channels
-
-Channels can poll existing project code:
+Project-local TypeScript imports use explicit `.ts` extensions:
 
 ```ts
 import { createChannel } from "simple-agent-orchestrator";
-import { fetchReviewCandidates } from "../../src/lib/github/reviews";
+import { fetchReviewCandidates } from "../../src/lib/github/reviews.ts";
 
-export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
+export const reviews = createChannel("github.reviews", (channel) => {
   channel.poll({
     id: "reviews",
     every: "60s",
     fetch: () => fetchReviewCandidates(),
     map: (review) => ({
       id: review.id,
+      dedupeKey: `${review.id}:${review.updatedAt}`,
       sessionKey: `github:${review.repo}:pr:${review.prNumber}`,
       input: review.toMarkdown(),
       payload: review,
@@ -129,4 +73,4 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
 });
 ```
 
-Then add the channel and client to `orchestrator.ts`.
+Keep external operations idempotent. JSON state and normal logs are plaintext; do not persist or log secrets or sensitive event content by default.

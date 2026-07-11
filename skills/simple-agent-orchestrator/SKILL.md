@@ -1,75 +1,52 @@
 ---
 name: simple-agent-orchestrator
-description: Build, review, or modify Simple Agent Orchestrator integrations in TypeScript projects. Use when the user mentions .simple-agent-orchestrator, persistent agent sessions, routing channel events to agents, createChannel/createClient/createEnvironment, sessionKey/dedupeKey, or npx simple-agent-orchestrator.
+description: Build, review, or modify Simple Agent Orchestrator integrations in TypeScript projects. Use for .simple-agent-orchestrator, durable agent sessions, channel/client/environment definitions, runtime dispatch, or the simple-agent-orchestrator CLI.
 license: MIT
 compatibility: Node.js 20+, TypeScript, npm projects
 metadata:
   version: "0.1.0"
 ---
 
-Simple Agent Orchestrator is an embedded project runtime: events enter through **channels**, clients route them into durable **sessions**, sessions keep state for persistent agents, **environments** provide shared resources and optional sandboxes, and an optional project-level **HTTP** listener hosts normalized webhook ingress, bounded operational inspection, and project routes.
+Simple Agent Orchestrator is embedded, one-process durable plumbing. Channels ingest events, client handlers receive independent retryable deliveries, sessions preserve continuity, environments own process resources and optional sandboxes, and ordinary startup may host built-in and project-defined HTTP routes.
 
 ## Procedure
 
-1. **Find the project spine.** Work from the repository root. Check for `package.json`, `tsconfig.json`, and `.simple-agent-orchestrator/orchestrator.ts`. If the directory is missing and the task is setup, create it with `npx simple-agent-orchestrator init` or scaffold the same layout manually. Done when the project root and orchestrator config path are known.
+1. **Locate the package.** Find the nearest existing valid `package.json` and `.simple-agent-orchestrator/orchestrator.ts`. `npx simple-agent-orchestrator init` discovers that nearest package; `--root` selects one explicitly. Init does not create or edit the host manifest. `--force` replaces known template files while preserving unknown files.
 
-2. **Choose the branch.** Use the smallest branch that fits the task:
-   - setup: create `.simple-agent-orchestrator`, config, manual channel, and npm scripts.
-   - channel: add or edit a source of events.
-   - client: route a channel to a session and call project agent/tool code.
-   - environment: mount shared runtime resources or create/cleanup sandboxes.
-   - HTTP: use normalized webhook/operational built-ins or register project middleware and custom routes on the runtime-owned Hono app.
-   - debug: inspect config, persisted-state compatibility, sessions, events, deliveries, and retries.
-   - review: check routing identity, idempotency, cleanup, and validation.
-   Done when the intended branch is explicit in the changes.
+2. **Preserve dependency direction.** Keep orchestration code under `.simple-agent-orchestrator/` and let it import project code, not the reverse. Use explicit `.ts` extensions for all project-local TypeScript imports.
 
-3. **Preserve the spine layout.** Keep orchestrator-specific code under:
+3. **Choose durable identities.** Require a stable event `id`; add `dedupeKey` when source identity differs from processing identity; add `sessionKey` for the durable work unit. Name polls whose cursor must survive registration reordering. Never recycle historical poll IDs for unrelated cursors.
 
-   ```txt
-   .simple-agent-orchestrator/
-     orchestrator.ts
-     channels/
-     clients/
-     environments/
-     prompts/
-     state/.gitignore
-     logs/.gitignore
-     tmp/.gitignore
-   ```
+4. **Respect the definition boundary.** Builders configure mutable channel, client, and environment definitions. Definitions are inspectable and readonly-typed but not frozen. A runtime snapshots config and registrations at `init()`; changes afterward do not affect it. Do not implement or imply live reconfiguration.
 
-   The orchestrator may import existing project code; avoid making application code import orchestrator definitions. Done when dependency direction is `.simple-agent-orchestrator -> project code`.
+5. **Dispatch deliberately.** `channel.dispatch(event)` works only while exactly one initialized runtime is bound to that exact channel object. It throws with no binding or multiple bindings. Use `runtime.dispatch(channel, event)` to select by exact object or `runtime.dispatch(channelId, event)` to select by registered ID.
 
-4. **Use durable identity deliberately.** Every dispatched event should have a stable `id`; add `dedupeKey` when the source id is not the desired processing identity; add `sessionKey` for the durable work unit. Prefer `defineKey` for structured session keys. Give each poll a stable `id` when its cursor must survive registration reordering; unnamed polls deliberately use their registration index. Changing a poll ID selects another cursor key, and reusing a historical ID restores that key's existing cursor. Done when duplicate suppression, session routing, and cursor ownership are explainable from the code.
+6. **Make every external effect retry-safe.** Event dedupe is not exactly-once handling. `handle`, `onSuccess`, sandbox work, and interrupted attempts can repeat. Use stable operation-specific idempotency keys or reconciliation, never `attempt`. Use `session.ensure` for eager durable identifiers, but keep its external factory retry-safe. Pass `signal` to cancellation-aware work; timeout is cooperative.
 
-5. **Make handlers first-event and retry safe.** Any channel event may be the first event for a session. Use `session.ensure(...)` for persistent external identifiers and environment sandboxes for resources that need cleanup, but make their external factories idempotent or reconciling because creation can repeat before local markers persist. Do not submit the first event as part of ensured resource creation and then depend on an attempt-local `createdNow` flag. Done when no handler assumes prior initialization and every retryable external operation has a stable identity.
+7. **Acknowledge sources after handling.** Put source acknowledgement in one designated `onSuccess`, not polling or the start of `handle`. It can still repeat after cleanup or persistence failure. Poll `commit` is an ingestion checkpoint, not delivery success.
 
-6. **Keep source acknowledgement after handling.** If a source item must be marked handled, reacted to, or labelled, do it in a designated client `onSuccess`, not during polling or at the start of `handle`. Hooks are per delivery; there is no event-wide hook that waits for all fan-out deliveries. Make acknowledgement idempotent because a later cleanup or persistence failure can repeat it. Treat poll `commit` as an ingestion cursor checkpoint, not successful-processing acknowledgement. Done when acknowledgement ownership is explicit, failed deliveries remain retryable, and repeated acknowledgement is safe.
+8. **Keep HTTP ownership clear.** Built-in normalized webhook and operational routes belong to the runtime. Provider parsing, authentication, signature verification, CORS, rate limiting, TLS, and exposure policy belong to project middleware/routes. Built-in operational summaries omit sensitive bodies/state/errors, but project handlers and logs have no categorical redaction guarantee.
 
-7. **Assume at-least-once external effects.** Event dedupe is not exactly-once processing. `handle`, `onSuccess`, `onFailure`, sandbox hooks, and external agent operations can repeat after uncertain failures. Startup and drain automatically retry deliveries interrupted in `processing`, without knowing whether their external effects completed. Use operation-specific idempotency keys derived from stable event/session identity, never from `attempt`; reconcile current external state when providers do not support keys. Done when every external effect is safe to retry or its residual risk is explicit.
+9. **Treat persistence and logs as plaintext.** The JSON store, events, state, notes, cursors, errors, and ordinary project/default logs are plaintext. Do not persist or log credentials, tokens, or sensitive source content without an explicit policy. The generated example logs identifiers only.
 
-   When a handler timeout is appropriate, configure it globally, with `client.timeout(...)`, or on the handler, and pass the context `signal` into agents, subprocesses, network requests, and sandbox operations. Timeout cancellation is cooperative: code that ignores the signal is still awaited, and provider-side effects may already have happened. Done when bounded operations honor cancellation without being treated as exactly once.
+10. **Use the right runtime helper.** Prefer `createRuntime(config, options)` for programmatic persistent use; it defaults to the project JSON store. Project loaders discover config. The direct `OrchestratorRuntime` constructor plus `init()` is low-level. Use `runOffline(({ dispatch, drain, endSession, retryDelivery, pruneState }) => ...)` for scoped persistent mutations.
 
-8. **Validate with the CLI.** Prefer these checks after edits:
+11. **Test through the public harness.** Call `createTestRuntime(config, options)`, not a nested `{ config }` object. It defaults to isolated memory state, a silent logger, and no HTTP. Prefer dispatch/session/event/delivery helpers and always stop it; `test.runtime` is the public escape hatch for lifecycle behavior.
 
-   ```bash
-   npx simple-agent-orchestrator doctor
-   npx simple-agent-orchestrator state validate
-   npx simple-agent-orchestrator print-config
-   npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
-    npx simple-agent-orchestrator sessions list
-    npx simple-agent-orchestrator events list
-    curl http://127.0.0.1:3000/health
-    curl -X POST http://127.0.0.1:3000/webhooks/manual -H 'Content-Type: application/json' -d '{"id":"http-smoke","sessionKey":"smoke","input":"Smoke test"}'
-    curl http://127.0.0.1:3000/api/v1/status
-    curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
-    ```
+12. **Validate strict CLI usage.** Useful checks:
 
-   Run the CLI `dispatch` smoke test only after stopping a long-running JSON-store runtime; it is an offline command and will fail before writing while `start` is active. Normal `start`/`dev` opens HTTP by default; use `--no-http` when unwanted. The normalized webhook requires strict JSON, limits bodies to 1 MiB, and reports durable queued/duplicate ingestion rather than processing success. Operational lists default to 25, allow at most 100, and omit bodies, state, notes, and errors. The listener has no built-in authentication, signature verification, CORS, rate limiting, or TLS, so add project middleware before exposing routes and do not treat loopback as an authentication boundary. Unauthenticated dispatch can trigger external effects and unbounded state growth. Inspection commands such as `doctor`, `state validate`, `print-config`, `sessions list`, `events list`, and `state prune --before <timestamp>` without `--apply` remain safe while `start` is active and never open HTTP. `state validate` reports malformed, incompatible, or unsupported persisted state without replacing it. If state growth requires retention, preview exact IDs, back up the state file, and stop the runtime before adding `--apply`; do not add `--drop-dedupe` unless redispatching old source identities is acceptable. Also run the project’s TypeScript/test commands when available. Done when config and state validate and the changed route can be smoke-tested or the remaining blocker is named.
+```bash
+npx simple-agent-orchestrator doctor
+npx simple-agent-orchestrator state validate
+npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
+npx simple-agent-orchestrator events list --json --limit 25
+npx simple-agent-orchestrator sessions list --json --limit 25
+```
+
+`dispatch --id` is required. Unknown flags, extra arguments, missing values, invalid limits, and missing show/retry/end records fail. Stop a long-running JSON-store runtime before `dispatch`, `sessions end`, `events retry`, or `state prune --apply`. Inspection and prune preview remain available while it runs.
 
 ## References
 
-Read [`references/API-CHEATSHEET.md`](references/API-CHEATSHEET.md) when writing imports or API calls.
-
-Read [`references/TEMPLATES.md`](references/TEMPLATES.md) when creating files from scratch.
-
-Read [`references/ROUTING-CHECKLIST.md`](references/ROUTING-CHECKLIST.md) when reviewing or debugging an integration.
+- Read [`references/API-CHEATSHEET.md`](references/API-CHEATSHEET.md) before writing API calls.
+- Read [`references/TEMPLATES.md`](references/TEMPLATES.md) before creating project-local files.
+- Read [`references/ROUTING-CHECKLIST.md`](references/ROUTING-CHECKLIST.md) when reviewing or debugging.

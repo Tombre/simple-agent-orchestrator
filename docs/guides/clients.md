@@ -4,7 +4,7 @@ A client subscribes to channels and handles event deliveries.
 
 ```ts
 import { createClient } from "simple-agent-orchestrator";
-import { githubReviewsChannel } from "../channels/github";
+import { githubReviewsChannel } from "../channels/github.ts";
 
 export const codingClient = createClient("coding", (client) => {
   client.handle(githubReviewsChannel, async ({ event, session, logger }) => {
@@ -97,3 +97,5 @@ client.concurrency({ workers: 4, perSession: true });
 For agents with their own queueing, you can leave `perSession` disabled.
 
 Concurrent successful deliveries merge writes to different session-state keys. Concurrent writes to the same key use completion order, so enable `perSession` when same-session ordering matters.
+
+Client definitions remain inspectable through readonly-typed properties such as `handlers`, `environment`, and concurrency/retry defaults, but they are not frozen. Builder calls configure the definition before it is returned. A runtime snapshots client registrations at `init()`; later mutation does not add handlers or reconfigure a live runtime.

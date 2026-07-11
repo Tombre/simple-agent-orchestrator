@@ -117,6 +117,32 @@ describe("configuration validation", () => {
     expect(loaded.project.orchestratorDir).toBe(orchestratorDir);
   });
 
+  it("prefers the nearest package boundary over a distant orchestrator directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-project-"));
+    const packageRoot = join(root, "packages", "api");
+    const sourceDirectory = join(packageRoot, "src");
+    await mkdir(join(root, ".simple-agent-orchestrator"), { recursive: true });
+    await mkdir(sourceDirectory, { recursive: true });
+    await writeFile(join(root, "package.json"), JSON.stringify({ name: "workspace" }), "utf8");
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "api" }), "utf8");
+
+    expect(await findProjectRoot({ cwd: sourceDirectory })).toBe(packageRoot);
+  });
+
+  it("treats the conventional orchestrator directory as part of its parent project", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-project-"));
+    const orchestratorDir = join(root, ".simple-agent-orchestrator");
+    const clientDirectory = join(orchestratorDir, "clients");
+    const configFile = join(orchestratorDir, "orchestrator.ts");
+    await mkdir(clientDirectory, { recursive: true });
+    await writeFile(join(root, "package.json"), JSON.stringify({ name: "fixture" }), "utf8");
+    await writeFile(join(orchestratorDir, "package.json"), JSON.stringify({ type: "module" }), "utf8");
+    await writeFile(configFile, "export default {};", "utf8");
+
+    expect(await findProjectRoot({ cwd: clientDirectory })).toBe(root);
+    expect(await findProjectRoot({ config: configFile })).toBe(root);
+  });
+
   it("prefers the conventional config before a package.json pointer", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-project-"));
     const orchestratorDir = join(root, ".simple-agent-orchestrator");

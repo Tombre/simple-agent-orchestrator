@@ -1,120 +1,74 @@
 # CLI guide
 
-## init
+The CLI is strict: unknown commands and flags, extra positionals, duplicate flags, missing values, and missing required options exit nonzero. `-h` and `--help` print command-specific usage. Boolean flags may be bare or use `=true`/`=false`; other values are rejected.
+
+`--root <path>` and `--config <path>` are accepted only by commands that show them in help.
+
+## Setup and runtime
 
 ```bash
-npx simple-agent-orchestrator init
+npx simple-agent-orchestrator init [--root <path>] [--force]
+npx simple-agent-orchestrator start [--root <path>] [--config <path>] [--drain] [--no-http]
 ```
 
-Creates a project-local `.simple-agent-orchestrator` directory and adds helpful npm scripts to `package.json` when possible.
+`init` discovers the nearest parent package when `--root` is omitted. It requires an existing valid object-valued `package.json`, writes only `.simple-agent-orchestrator`, and never edits the host manifest. Without `--force`, an existing destination is an error. Force overwrites known template files and preserves unknown files.
 
-Use `--force` to overwrite template files.
+Ordinary `start` runs HTTP, polls, and workers. `--no-http` disables the listener. `--drain` polls once, drains currently eligible work without HTTP or waiting for delayed retries, and exits.
 
-## doctor
+## Inspection
+
+These commands are read-only after any required first-run store initialization and remain available while `start` owns the JSON store:
 
 ```bash
 npx simple-agent-orchestrator doctor
-```
-
-Loads the project config, validates persisted state, and prints discovered runtime resources. It does not run polls, handlers, environment hooks, HTTP hooks, or a listener.
-
-## state validate
-
-```bash
+npx simple-agent-orchestrator print-config
 npx simple-agent-orchestrator state validate
-```
-
-Loads the project and validates that the complete persisted snapshot is compatible. It is an inspection command and does not rewrite a valid historical file, so it remains available while `start` is active. A missing JSON state file is initialized as an empty current snapshot, consistent with `doctor` and other first-run commands. Invalid JSON, invalid shapes or references, obsolete versions, and future versions exit unsuccessfully with recovery guidance; the invalid file is not replaced.
-
-## state prune
-
-```bash
-# Preview only
-npx simple-agent-orchestrator state prune --before 2026-01-01T00:00:00Z
-
-# Apply after backing up state and stopping start
-npx simple-agent-orchestrator state prune --before 2026-01-01T00:00:00Z --apply
-```
-
-The default preview and apply select old processed deliveries plus ended sessions that have no retained deliveries or active sandbox marker; notes are removed only with their session. Pending, processing, and failed deliveries, operational sessions, cursors, and records without valid retention timestamps remain. Preview reports exact removal IDs, blocked ended sessions, and otherwise-eligible events protected as dedupe records, and does not write, so it is available while `start` is active. Apply acquires offline ownership and recomputes the plan before writing.
-
-Events are retained by default because they suppress duplicate dispatch. Add `--drop-dedupe` to preview or apply removal of old events with no retained delivery. After those events are removed, dispatching the same source dedupe identities can create new work. Back up persistent state and inspect the preview before applying this irreversible history loss.
-
-## start
-
-```bash
-npx simple-agent-orchestrator start
-```
-
-Starts the project-level HTTP listener, pollers, and client workers. HTTP defaults to `127.0.0.1:3000`; `SAO_HTTP_PORT` overrides `http.port`, and occupied ports trigger up to nine sequential fallback attempts. Startup logs the actual URL. The listener provides `GET /health`, normalized `POST /webhooks/:channelId`, and bounded read-only `GET /api/v1/status`, `/api/v1/events`, and `/api/v1/sessions`. Status reports the actual fallback address.
-
-When using `jsonFileStore`, a local ownership lock rejects a second runtime or offline mutation for the same state and reports the active PID and start time. Ownership is released on normal shutdown, and a lock left by a process that exited is reclaimed on the next operation.
-
-`doctor`, `print-config`, `state validate`, `sessions list`, `sessions show`, `events list`, and a `state prune` preview only inspect runtime state and are safe while `start` is active. `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline mutations: they fail before writing unless the long-running runtime is stopped. This does not make direct library writes or arbitrary JSON-store writers safe.
-
-Options:
-
-```bash
---root <path>
---config <path>
---drain
---no-http
-```
-
-`--drain` runs polls once, processes currently eligible pending deliveries, and exits. It does not wait for future delayed retries or start HTTP. `--no-http` disables HTTP for an otherwise normal `start`.
-
-The webhook accepts at most 1 MiB of strict JSON and returns after durable ingestion, before processing. Operational lists default to 25, allow at most 100, and omit event bodies, state, notes, and errors. The HTTP server has no built-in authentication, signature verification, CORS, rate limiting, or TLS. A non-loopback bind warns because dispatch and custom routes may be remotely reachable; loopback binding is still not an authentication boundary. Unauthenticated dispatch can trigger external side effects and unbounded state growth.
-
-## dev
-
-```bash
-npx simple-agent-orchestrator dev
-```
-
-Currently equivalent to `start` with more development-oriented messaging and supports `--no-http`. This is the right place to add watch/reload behavior later.
-
-## dispatch
-
-```bash
-npx simple-agent-orchestrator dispatch manual \
-  --id manual-1 \
-  --session demo \
-  --input "Hello"
-```
-
-This offline command acquires runtime ownership, dispatches the event, drains currently eligible matching deliveries in the same one-shot runtime, and exits. A configured delayed retry remains pending for a later drain or long-running runtime. If a long-running JSON-store runtime is active, it fails before dispatching.
-
-Additional options:
-
-```bash
---type <type>
---payload-json '{"x":1}'
---meta-json '{"branch":"main"}'
-```
-
-## sessions
-
-```bash
-npx simple-agent-orchestrator sessions list
+npx simple-agent-orchestrator sessions list [--json] [--limit <count>]
 npx simple-agent-orchestrator sessions show <id-or-key>
-npx simple-agent-orchestrator sessions end <id-or-key> --reason manual
+npx simple-agent-orchestrator events list [--json] [--limit <count>]
+npx simple-agent-orchestrator events show <internal-event-id>
 ```
 
-`list` and `show` are inspection commands available while `start` is active; `show` includes persisted session notes. `end` is an offline mutation that records the session as ended but does not invoke sandbox cleanup hooks.
+`--limit` must be a positive integer. Without it, CLI lists are not truncated. `--json` prints complete stored list records rather than a console table. `sessions show` includes notes. `events list --json` and `events show` return each stored event together with its delivery records, including attempts, status, errors, and delayed eligibility. `events show` expects the internal ID returned by dispatch or shown in `events list`, not the source event ID.
 
-## events
+Missing sessions, events, or deliveries exit nonzero. Empty lists succeed and print `No sessions found.`, `No events found.`, or `[]` with `--json`.
+
+`doctor` loads config and validates state and registrations without running hooks, polls, handlers, or HTTP. `state validate` does not rewrite a valid historical snapshot. `print-config` prints a resolved summary, not arbitrary config values or secrets.
+
+## Dispatch
 
 ```bash
-npx simple-agent-orchestrator events list
+npx simple-agent-orchestrator dispatch <channel> \
+  --id <source-id> \
+  [--session <session-key>] \
+  [--input <text>] \
+  [--type <type>] \
+  [--payload-json <json>] \
+  [--meta-json <json>]
+```
+
+`--id` is required. Invalid JSON and unknown channels fail. The command acquires offline ownership, durably dispatches, drains eligible work, prints the queued/duplicate result, and exits. Delayed pending work remains for a later drain or ordinary runtime.
+
+## Sessions and retries
+
+```bash
+npx simple-agent-orchestrator sessions end <id-or-key> [--reason <reason>]
 npx simple-agent-orchestrator events retry <delivery-id>
 ```
 
-`list` is an inspection command available while `start` is active. Its attempts column shows consumed/maximum attempts, and `nextAttemptAt` distinguishes delayed pending work. `retry` is an offline mutation that grants one immediately eligible attempt to a failed delivery and drains the runtime once. The retry action itself does not requeue pending, processing, or processed deliveries; however, its drain automatically recovers any delivery left `processing` by an interrupted runtime. The complete handler attempt can run again, so external effects and source acknowledgement must use stable idempotency keys or reconciliation.
+Both are offline mutations. Ending a missing or already-ended session fails and does not run sandbox cleanup. Retry accepts only an existing failed delivery, grants one immediately eligible attempt, drains, and fails for pending, processing, or processed deliveries.
 
-## print-config
+## Retention
 
 ```bash
-npx simple-agent-orchestrator print-config
+npx simple-agent-orchestrator state prune --before <timestamp> [--drop-dedupe]
+npx simple-agent-orchestrator state prune --before <timestamp> --apply [--drop-dedupe]
 ```
 
-Prints the resolved config summary without secrets.
+The default is a read-only preview. Apply requires offline ownership and recomputes the plan. It removes only eligible processed deliveries and safely unreferenced ended sessions/notes. Events remain as dedupe history unless `--drop-dedupe` is explicit. Back up persistent state before applying.
+
+## Ownership and plaintext
+
+With the default JSON store, `dispatch`, `sessions end`, `events retry`, and `state prune --apply` fail before writing while another runtime owns the state. Inspection and prune preview remain available.
+
+The JSON state file and CLI inspection output can contain event input, payload, metadata, session state, notes, and delivery errors in plaintext. Built-in HTTP operational summaries are separately bounded and omit those fields; project routes, middleware, handlers, and logs are not automatically sanitized.

@@ -1,6 +1,7 @@
 export { defineConfig } from "./core/config.js";
 export type {
   DefineConfigContext,
+  ConfigFactory,
   HttpConfig,
   HttpDispatch,
   HttpRegistrationContext,
@@ -43,6 +44,7 @@ export { defineKey, cursorKey, envKey, sessionKey } from "./core/types.js";
 export type {
   ConcurrencyOptions,
   DispatchEvent,
+  DispatchResult,
   JsonRecord,
   JsonValue,
   KeyBuilder,

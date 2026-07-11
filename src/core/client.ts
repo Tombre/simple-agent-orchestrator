@@ -35,23 +35,23 @@ export interface HandleOptions<
   TInput = unknown,
   TMeta extends Record<string, unknown> = Record<string, unknown>,
 > {
-  id?: string;
-  retries?: RetryOptions;
-  timeout?: number | string;
-  handle: EventHandler<TPayload, TInput, TMeta>;
-  onSuccess?: (ctx: HandlerContext<TPayload, TInput, TMeta>) => Promise<void> | void;
-  onFailure?: (ctx: HandlerContext<TPayload, TInput, TMeta> & { error: unknown }) => Promise<void> | void;
+  readonly id?: string;
+  readonly retries?: RetryOptions;
+  readonly timeout?: number | string;
+  readonly handle: EventHandler<TPayload, TInput, TMeta>;
+  readonly onSuccess?: (ctx: HandlerContext<TPayload, TInput, TMeta>) => Promise<void> | void;
+  readonly onFailure?: (ctx: HandlerContext<TPayload, TInput, TMeta> & { error: unknown }) => Promise<void> | void;
 }
 
 export interface RegisteredHandler {
-  id: string;
-  channelId: string;
-  channel: ChannelDefinition;
-  retries: RetryOptions;
-  timeout?: number | string | undefined;
-  handle: EventHandler;
-  onSuccess?: ((ctx: HandlerContext) => Promise<void> | void) | undefined;
-  onFailure?: ((ctx: HandlerContext & { error: unknown }) => Promise<void> | void) | undefined;
+  readonly id: string;
+  readonly channelId: string;
+  readonly channel: ChannelDefinition;
+  readonly retries: Readonly<RetryOptions>;
+  readonly timeout?: number | string | undefined;
+  readonly handle: EventHandler;
+  readonly onSuccess?: ((ctx: HandlerContext) => Promise<void> | void) | undefined;
+  readonly onFailure?: ((ctx: HandlerContext & { error: unknown }) => Promise<void> | void) | undefined;
 }
 
 export interface ClientBuilder {
@@ -71,10 +71,10 @@ export interface ClientBuilder {
 
 export interface ClientDefinition {
   readonly id: string;
-  readonly handlers: RegisteredHandler[];
+  readonly handlers: readonly RegisteredHandler[];
   readonly environment?: EnvironmentDefinition | undefined;
-  readonly concurrencyOptions: Required<ConcurrencyOptions>;
-  readonly retryOptions: RetryOptions;
+  readonly concurrencyOptions: Readonly<Required<ConcurrencyOptions>>;
+  readonly retryOptions: Readonly<RetryOptions>;
   readonly timeout?: number | string | undefined;
 }
 
@@ -131,7 +131,7 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
 
   return {
     id,
-    handlers,
+    handlers: [...handlers],
     environment,
     concurrencyOptions,
     retryOptions,

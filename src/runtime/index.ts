@@ -7,10 +7,11 @@ export type {
 } from "./state-retention.js";
 export {
   createProjectContext,
+  createRuntime,
   findConfigFile,
   findProjectRoot,
   loadConfigFile,
   loadProjectConfig,
   loadProjectOrchestrator,
 } from "./project.js";
-export type { LoadProjectOptions } from "./project.js";
+export type { CreateRuntimeOptions, LoadProjectOptions } from "./project.js";

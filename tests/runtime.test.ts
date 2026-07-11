@@ -13,12 +13,15 @@ describe("runtime", () => {
       });
     });
 
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+    try {
+      await test.dispatch("test", { id: "1", sessionKey: "session-a", input: "hello" });
+      await test.dispatch("test", { id: "1", sessionKey: "session-a", input: "duplicate" });
 
-    await test.dispatch("test", { id: "1", sessionKey: "session-a", input: "hello" });
-    await test.dispatch("test", { id: "1", sessionKey: "session-a", input: "duplicate" });
-
-    const session = await test.sessions.get("session-a");
-    expect(session?.state.count).toBe(1);
+      const session = await test.sessions.get("session-a");
+      expect(session?.state.count).toBe(1);
+    } finally {
+      await test.stop();
+    }
   });
 });

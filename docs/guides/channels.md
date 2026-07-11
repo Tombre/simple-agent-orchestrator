@@ -33,6 +33,25 @@ npx simple-agent-orchestrator dispatch manual \
 
 CLI dispatch is an offline one-shot operation. Stop a long-running JSON-store runtime first; the command fails before writing when that runtime owns the state.
 
+## Programmatic dispatch
+
+Every channel definition has a first-class `dispatch(event)` method:
+
+```ts
+const result = await manualChannel.dispatch({ id: "manual-2" });
+```
+
+Initialization binds a registered channel object to its runtime. `channel.dispatch` succeeds only while exactly one initialized, non-stopped runtime is bound to that exact definition. It throws when no runtime is bound and when the same channel object is bound to multiple initialized runtimes, because the destination would be ambiguous.
+
+Use explicit runtime dispatch whenever runtime selection matters:
+
+```ts
+await runtime.dispatch(manualChannel, { id: "manual-3" });
+await runtime.dispatch("manual", { id: "manual-4" });
+```
+
+Object dispatch requires the exact registered definition, not another channel with the same ID. String dispatch resolves a registered channel by ID. All forms initialize the runtime if needed and return `{ status: "queued" | "duplicate", eventId }` after persistence.
+
 ## Polling channel
 
 ```ts
@@ -116,3 +135,5 @@ Executions of the same poll do not overlap within one runtime process. Mapping i
 Set `id` when a poll's cursor must survive registration reordering. Named polls use `${channelId}:${id}`; unnamed polls continue to use `${channelId}:${pollRegistrationIndex}`. Duplicate resolved poll IDs and ambiguous final cursor keys are rejected. In a multi-poll channel, name every poll before reorganizing registrations because unnamed neighbors remain positional.
 
 Adding or renaming a descriptive ID selects another cursor key and leaves the old cursor record unchanged; the runtime does not infer migrations. A key that has never existed starts empty, while reusing a historical ID restores its existing cursor, so do not recycle IDs for unrelated polls. To retain existing positional cursors during adoption, assign each poll its current index as a string, such as `id: "0"`, before moving registrations.
+
+Channel definitions and their `polls` arrays are inspectable and readonly-typed but not frozen. Builder registration happens immediately; a runtime snapshots polls at `init()`. Mutating a definition after initialization does not alter that runtime, and live reconfiguration is unsupported.

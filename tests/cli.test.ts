@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,9 +10,10 @@ import { loadProjectOrchestrator } from "../src/runtime/index.js";
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cliFile = join(repositoryRoot, "src", "cli.ts");
+const tsxLoader = join(repositoryRoot, "node_modules", "tsx", "dist", "loader.mjs");
 
 async function runCli(...args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cliFile, ...args], {
+  const { stdout } = await execFileAsync(process.execPath, ["--import", tsxLoader, cliFile, ...args], {
     cwd: repositoryRoot,
     timeout: 10_000,
   });
@@ -29,7 +30,7 @@ async function runCliResult(...args: string[]): Promise<{ failed: boolean; stdou
 }
 
 async function runUntilStarted(args: string[], marker: string): Promise<string> {
-  const child = spawn(process.execPath, ["--import", "tsx", cliFile, ...args], {
+  const child = spawn(process.execPath, ["--import", tsxLoader, cliFile, ...args], {
     cwd: repositoryRoot,
     env: { ...process.env, SAO_HTTP_PORT: "invalid" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -91,30 +92,66 @@ export default defineConfig({ channels: [manual], clients: [client] });
 }
 
 describe("CLI", { timeout: 15_000 }, () => {
-  it("initializes a project without replacing existing npm scripts", async () => {
+  it("initializes the nearest project without modifying package.json", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-cli-"));
-    await writeFile(join(root, "package.json"), JSON.stringify({ scripts: { test: "existing" } }), "utf8");
+    const packageJson = `${JSON.stringify({ scripts: { test: "existing" } }, null, 2)}\n`;
+    await writeFile(join(root, "package.json"), packageJson, "utf8");
+    const nested = join(root, "packages", "example");
+    await mkdir(nested, { recursive: true });
 
-    const output = await runCli("init", "--root", root);
-
-    expect(output).toContain(`Created ${join(root, ".simple-agent-orchestrator")}`);
-    const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
-      scripts: Record<string, string>;
-    };
-    expect(packageJson.scripts).toMatchObject({
-      test: "existing",
-      agents: "simple-agent-orchestrator start",
-      "agents:dev": "simple-agent-orchestrator dev",
-      "agents:doctor": "simple-agent-orchestrator doctor",
+    const { stdout: output } = await execFileAsync(process.execPath, ["--import", tsxLoader, cliFile, "init"], {
+      cwd: nested,
+      timeout: 10_000,
     });
+
+    expect(output).toContain("Created ");
+    expect(output).toContain(`${root.split("/").at(-1)}/.simple-agent-orchestrator`);
+    expect(await readFile(join(root, "package.json"), "utf8")).toBe(packageJson);
     const orchestrator = await readFile(join(root, ".simple-agent-orchestrator", "orchestrator.ts"), "utf8");
     expect(orchestrator).toContain("defineConfig");
-    expect(orchestrator).toContain("hostname: \"127.0.0.1\"");
-    for (const directory of ["logs", "state", "tmp"]) {
-      expect(await readFile(join(root, ".simple-agent-orchestrator", directory, ".gitignore"), "utf8")).toBe(
-        "*\n!.gitignore\n",
-      );
-    }
+    expect(orchestrator).not.toContain("jsonFileStore");
+    expect(await readFile(join(root, ".simple-agent-orchestrator", ".gitignore"), "utf8")).toBe("state/\ntmp/\nlogs/\n");
+    const example = await readFile(join(root, ".simple-agent-orchestrator", "clients", "example.ts"), "utf8");
+    expect(example).toContain("eventId: event.id");
+    expect(example).not.toMatch(/event\.(input|payload|meta)/);
+  });
+
+  it("validates init before writes and force preserves unknown files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-cli-"));
+    await writeFile(join(root, "package.json"), "{}\n", "utf8");
+    await runCli("init", "--root", root);
+    const unknown = join(root, ".simple-agent-orchestrator", "custom.ts");
+    await writeFile(unknown, "keep\n", "utf8");
+    await writeFile(join(root, ".simple-agent-orchestrator", "orchestrator.ts"), "replace\n", "utf8");
+
+    await runCli("init", "--root", root, "--force");
+    expect(await readFile(unknown, "utf8")).toBe("keep\n");
+    expect(await readFile(join(root, ".simple-agent-orchestrator", "orchestrator.ts"), "utf8")).toContain("defineConfig");
+
+    const badRoot = await mkdtemp(join(tmpdir(), "sao-cli-"));
+    await writeFile(join(badRoot, "package.json"), "[]", "utf8");
+    const invalid = await runCliResult("init", "--root", badRoot);
+    expect(invalid.failed).toBe(true);
+    expect(invalid.stderr).toContain("must contain a JSON object");
+
+    const linkTarget = join(root, "linked.ts");
+    await writeFile(linkTarget, "linked\n", "utf8");
+    const destination = join(root, ".simple-agent-orchestrator", "channels", "manual.ts");
+    await writeFile(destination, "temporary\n", "utf8");
+    await rm(destination);
+    await symlink(linkTarget, destination);
+    const symlinkFailure = await runCliResult("init", "--root", root, "--force");
+    expect(symlinkFailure.failed).toBe(true);
+    expect(symlinkFailure.stderr).toContain("Destination must be a regular file");
+    expect(await readFile(linkTarget, "utf8")).toBe("linked\n");
+
+    await rm(destination);
+    const hardLinkTarget = join(root, "hard-linked.ts");
+    await writeFile(hardLinkTarget, "external\n", "utf8");
+    await link(hardLinkTarget, destination);
+    await runCli("init", "--root", root, "--force");
+    expect(await readFile(hardLinkTarget, "utf8")).toBe("external\n");
+    expect(await readFile(destination, "utf8")).toContain("createManualChannel");
   });
 
   it("persists a dispatch across CLI processes and supports inspection and ending", async () => {
@@ -141,6 +178,12 @@ describe("CLI", { timeout: 15_000 }, () => {
     expect(shown.state.lastInput).toBe("hello");
     expect(shown.notes).toMatchObject([{ message: "Echoed input" }]);
     expect(await runCli("events", "list", "--root", root)).toContain("processed");
+    expect(await runCli("events", "list", "--root", root)).toContain("echo:manual:1");
+    const listedEvents = JSON.parse(await runCli("events", "list", "--root", root, "--json", "--limit", "1")) as {
+      event: { id: string };
+    }[];
+    expect(listedEvents).toHaveLength(1);
+    expect(await runCli("events", "show", listedEvents[0]!.event.id, "--root", root)).toContain('"sourceId": "event-1"');
     expect(await runCli("sessions", "end", "work-1", "--root", root, "--reason", "operator")).toContain("ended");
     expect(await runCli("sessions", "show", "work-1", "--root", root)).toContain('"endReason": "operator"');
   });
@@ -183,6 +226,30 @@ describe("CLI", { timeout: 15_000 }, () => {
 
     expect(output).toContain("1/2");
     expect(output).toContain(nextAttemptAt);
+  });
+
+  it("prints empty states and fails missing or inapplicable operations", async () => {
+    const { root } = await createFixture();
+    expect(await runCli("sessions", "list", "--root", root)).toContain("No sessions found.");
+    expect(await runCli("events", "list", "--root", root)).toContain("No events found.");
+    expect(JSON.parse(await runCli("sessions", "list", "--root", root, "--json"))).toEqual([]);
+
+    for (const args of [
+      ["sessions", "show", "missing", "--root", root],
+      ["sessions", "end", "missing", "--root", root],
+      ["events", "show", "missing", "--root", root],
+      ["events", "retry", "missing", "--root", root],
+    ]) {
+      expect((await runCliResult(...args)).failed).toBe(true);
+    }
+
+    await runCli("dispatch", "manual", "--root", root, "--id", "success", "--input", "hello");
+    const events = JSON.parse(await runCli("events", "list", "--root", root, "--json")) as {
+      deliveries: { id: string }[];
+    }[];
+    const retry = await runCliResult("events", "retry", events[0]!.deliveries[0]!.id, "--root", root);
+    expect(retry.failed).toBe(true);
+    expect(retry.stderr).toContain("Delivery is not failed");
   });
 
   it("rejects offline mutations before writing while allowing inspection during an active runtime", async () => {
@@ -301,15 +368,31 @@ describe("CLI", { timeout: 15_000 }, () => {
     }
     expect(output).toContain("simple-agent-orchestrator state prune --before <timestamp> [--apply] [--drop-dedupe]");
     expect(output).toContain("simple-agent-orchestrator start [--root <path>] [--config <path>] [--drain] [--no-http]");
-    expect(output).toContain("simple-agent-orchestrator dev [--root <path>] [--config <path>] [--no-http]");
+    expect(output).not.toContain("simple-agent-orchestrator dev");
+    expect(output).toContain("simple-agent-orchestrator events show <internal-event-id>");
   });
 
-  it("disables HTTP for start and dev even when the environment port is invalid", async () => {
+  it("disables HTTP for start and removes dev", async () => {
     const { root } = await createFixture();
 
     expect(await runUntilStarted(["start", "--root", root, "--no-http"], "Simple Agent Orchestrator is running"))
       .toContain("Simple Agent Orchestrator is running");
-    expect(await runUntilStarted(["dev", "--root", root, "--no-http"], "Development mode is running"))
-      .toContain("Development mode is running");
+    const dev = await runCliResult("dev", "--root", root);
+    expect(dev.failed).toBe(true);
+    expect(dev.stderr).toContain("Unknown command: dev");
+  });
+
+  it("strictly validates command arguments and provides command help", async () => {
+    expect(await runCli("dispatch", "--help")).toContain("dispatch <channel> --id <id>");
+    expect(await runCli("sessions", "list", "--help")).toContain("sessions list [--json]");
+    for (const args of [
+      ["doctor", "--unknown"],
+      ["doctor", "extra"],
+      ["doctor", "--root"],
+      ["dispatch", "manual"],
+      ["dispatch", "manual", "--id", "one", "--session-key", "old"],
+    ]) {
+      expect((await runCliResult(...args)).failed).toBe(true);
+    }
   });
 });

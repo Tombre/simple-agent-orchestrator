@@ -9,6 +9,14 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - `sessionKey` names the durable work unit, not the individual event.
 - Session keys include enough namespace to avoid collisions across owners, repos, projects, threads, or tenants.
 - `defineKey` is used for structured keys when there are multiple parts.
+- The dispatch path is explicit: `channel.dispatch` is used only when exactly one initialized runtime can be bound; `runtime.dispatch(channel|string, event)` is used when runtime selection matters.
+
+## Definitions
+
+- Builder callbacks configure definitions before runtime initialization.
+- Composition mutations, if any, finish before `runtime.init()`.
+- Code does not expect post-init mutations to reconfigure a live runtime.
+- Readonly TypeScript properties are not mistaken for runtime freezing.
 
 ## Handler safety
 
@@ -42,7 +50,8 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - Normalized webhooks enforce `application/json`, the 1 MiB body limit, strict fields, JSON safety, queued/duplicate semantics, and unknown-channel errors.
 - Operational lists are bounded to 100, use stable ordering, and omit event bodies, metadata, session state, notes, delivery records, and errors.
 - Authentication, source signature verification, additional edge limits, CORS, rate limiting, TLS, and public exposure are explicit project responsibilities.
-- Request bodies are not logged by default, and unauthenticated dispatch is reviewed for external side effects and unbounded state growth.
+- Built-in operational responses omit sensitive body/state/error fields, but project middleware, routes, handlers, and logs are reviewed separately for plaintext exposure.
+- JSON state, event content, session state, notes, cursors, errors, and ordinary logs are treated as plaintext and not automatically redacted.
 - A loopback bind is not treated as authentication, and non-loopback exposure receives an explicit security review.
 
 ## Queue and retries
@@ -64,14 +73,15 @@ npx simple-agent-orchestrator state validate
 npx simple-agent-orchestrator print-config
 npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
 npx simple-agent-orchestrator sessions list
-npx simple-agent-orchestrator events list
+npx simple-agent-orchestrator events list --json --limit 25
+npx simple-agent-orchestrator events show <internal-event-id>
 curl http://127.0.0.1:3000/health
 curl -X POST http://127.0.0.1:3000/webhooks/manual -H 'Content-Type: application/json' -d '{"id":"http-smoke","sessionKey":"smoke","input":"Smoke test"}'
 curl http://127.0.0.1:3000/api/v1/status
 curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
 ```
 
-The HTTP smoke commands run while ordinary `start` is active; stop it cleanly afterward. `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. Normal `start` and `dev` open HTTP unless `--no-http` is passed; drain and inspection commands do not. The inspection commands, including `state validate` and a retention preview without `--apply`, remain available while `start` is active. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
+The HTTP smoke commands run while ordinary `start` is active; stop it cleanly afterward. `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. Ordinary `start` opens HTTP unless `--no-http` is passed; drain and inspection commands do not. The inspection commands, including `state validate` and a retention preview without `--apply`, remain available while `start` is active. CLI dispatch requires `--id`; list `--limit` must be positive; missing show/end/retry targets fail. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
 
 ## Common failures
 

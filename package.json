@@ -41,7 +41,6 @@
     "test": "vitest run",
     "prepack": "npm run build",
     "prepare": "npm run build",
-    "dev": "tsx src/cli.ts",
     "pack:local": "npm pack",
     "release:check": "node scripts/release-check.mjs"
   },

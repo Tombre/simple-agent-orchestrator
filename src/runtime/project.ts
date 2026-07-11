@@ -1,6 +1,6 @@
 import { access, readFile } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ConfigFactory, OrchestratorConfig } from "../core/config.js";
 import type { ProjectContext } from "../core/types.js";
@@ -44,24 +44,25 @@ async function findUp(start: string, predicate: (dir: string) => Promise<boolean
   }
 }
 
+async function findProjectBoundary(start: string): Promise<string | undefined> {
+  const boundary = await findUp(start, async (directory) => {
+    if (basename(directory) === ".simple-agent-orchestrator") return true;
+    return (await exists(join(directory, ".simple-agent-orchestrator"))) ||
+      (await exists(join(directory, "package.json")));
+  });
+  return boundary && basename(boundary) === ".simple-agent-orchestrator"
+    ? dirname(boundary)
+    : boundary;
+}
+
 export async function findProjectRoot(options: { cwd?: string; root?: string; config?: string } = {}): Promise<string> {
   if (options.root) return resolve(options.root);
   if (options.config) {
     const configDir = dirname(resolve(options.cwd ?? process.cwd(), options.config));
-    const orchestratorRoot = await findUp(configDir, async (dir) => exists(join(dir, ".simple-agent-orchestrator")));
-    if (orchestratorRoot) return orchestratorRoot;
-    const packageRoot = await findUp(configDir, async (dir) => exists(join(dir, "package.json")));
-    return packageRoot ?? configDir;
+    return (await findProjectBoundary(configDir)) ?? configDir;
   }
   const cwd = resolve(options.cwd ?? process.cwd());
-
-  const orchestratorRoot = await findUp(cwd, async (dir) => exists(join(dir, ".simple-agent-orchestrator")));
-  if (orchestratorRoot) return orchestratorRoot;
-
-  const packageRoot = await findUp(cwd, async (dir) => exists(join(dir, "package.json")));
-  if (packageRoot) return packageRoot;
-
-  return cwd;
+  return (await findProjectBoundary(cwd)) ?? cwd;
 }
 
 export async function createProjectContext(root: string): Promise<ProjectContext> {
@@ -144,6 +145,28 @@ export interface LoadProjectOptions {
   cwd?: string;
   root?: string;
   config?: string;
+}
+
+export type CreateRuntimeOptions =
+  | { project: ProjectContext; cwd?: never; root?: never }
+  | { project?: never; cwd?: string; root?: string };
+
+export async function createRuntime(
+  factory: ConfigFactory,
+  options: CreateRuntimeOptions = {},
+): Promise<OrchestratorRuntime> {
+  if (options.project !== undefined && (options.root !== undefined || options.cwd !== undefined)) {
+    throw new Error("Runtime options cannot specify project together with root or cwd");
+  }
+  const project = options.project ?? await createProjectContext(await findProjectRoot(options));
+  const config = typeof factory === "function" ? await factory({ project }) : factory;
+  return new OrchestratorRuntime({
+    project,
+    config: {
+      ...config,
+      store: config.store ?? jsonFileStore(project.statePath("state.json")),
+    },
+  });
 }
 
 export async function loadProjectConfig(options: LoadProjectOptions = {}): Promise<{

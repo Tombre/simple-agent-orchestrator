@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createChannel,
   createClient,
@@ -6,9 +6,28 @@ import {
   memoryStore,
   type OrchestratorEvent,
 } from "../src/index.js";
-import { createTestRuntime } from "../src/testing/index.js";
+import { createTestRuntime as createUntrackedTestRuntime, type TestRuntime } from "../src/testing/index.js";
 import { MAX_RETRY_DELAY_MS } from "../src/utils/time.js";
 import { deferred } from "./helpers.js";
+
+const activeTestRuntimes = new Set<TestRuntime>();
+
+async function createTestRuntime(
+  ...args: Parameters<typeof createUntrackedTestRuntime>
+): Promise<TestRuntime> {
+  const test = await createUntrackedTestRuntime(...args);
+  activeTestRuntimes.add(test);
+  return test;
+}
+
+afterEach(async () => {
+  const results = await Promise.allSettled([...activeTestRuntimes].map((test) => test.stop()));
+  activeTestRuntimes.clear();
+  const errors = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason);
+  if (errors.length) throw new AggregateError(errors, "Test runtime cleanup failed");
+});
 
 describe("runtime behavior", () => {
   it("preserves event fields, scopes dedupe by channel, and fans out to every client", async () => {
@@ -37,7 +56,7 @@ describe("runtime behavior", () => {
     });
 
     const test = await createTestRuntime({
-      config: { channels: [firstChannel, secondChannel], clients: [firstClient, secondClient] },
+      channels: [firstChannel, secondChannel], clients: [firstClient, secondClient],
     });
     const occurredAt = new Date("2025-01-02T03:04:05.000Z");
     const event = {
@@ -81,7 +100,7 @@ describe("runtime behavior", () => {
         received = event;
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("manual", { id: "event-1" });
 
@@ -106,11 +125,11 @@ describe("runtime behavior", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("retry", { id: "event-1" });
 
-    const deliveries = (await test.events.list())[0]!.deliveries;
+    const deliveries = await test.deliveries.list();
     expect(calls).toEqual(["handle:1", "failure:1", "handle:2", "success:2"]);
     expect(deliveries[0]).toMatchObject({ status: "processed", attempts: 2, lastError: undefined });
   });
@@ -138,7 +157,7 @@ describe("runtime behavior", () => {
           },
         });
       });
-      const test = await createTestRuntime({ config: { channels: [channel], clients: [client], timeout: "10ms" } });
+      const test = await createTestRuntime({ channels: [channel], clients: [client], timeout: "10ms" });
 
       const dispatch = test.dispatch("timeout", { id: "event", sessionKey: "work" });
       await starts[0]!.promise;
@@ -152,11 +171,11 @@ describe("runtime behavior", () => {
       expect(failures[0]).toMatchObject({ timeoutMs: 10 });
       expect(await test.sessions.get("work")).toMatchObject({ state: { eager: "kept" } });
       expect(await test.sessions.notes("work")).toEqual([]);
-      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({
+      expect((await test.deliveries.list())[0]).toMatchObject({
         status: "failed",
         attempts: 2,
       });
-      expect((await test.events.list())[0]!.deliveries[0]!.lastError).toContain("HandlerTimeoutError");
+      expect((await test.deliveries.list())[0]!.lastError).toContain("HandlerTimeoutError");
     } finally {
       vi.useRealTimers();
     }
@@ -193,13 +212,13 @@ describe("runtime behavior", () => {
           },
         });
       });
-      const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+      const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
       await test.dispatch("timeout", { id: "event" });
       await vi.advanceTimersByTimeAsync(100);
 
       expect(signal?.aborted).toBe(false);
-      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "processed" });
+      expect((await test.deliveries.list())[0]).toMatchObject({ status: "processed" });
     } finally {
       vi.useRealTimers();
     }
@@ -227,7 +246,7 @@ describe("runtime behavior", () => {
           },
         });
       });
-      const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+      const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
       const dispatch = test.dispatch("timeout", { id: "event", sessionKey: "work" });
       await started.promise;
@@ -236,7 +255,7 @@ describe("runtime behavior", () => {
 
       expect(failure).toBeInstanceOf(HandlerTimeoutError);
       expect(await test.sessions.get("work")).toMatchObject({ state: {} });
-      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "failed", attempts: 1 });
+      expect((await test.deliveries.list())[0]).toMatchObject({ status: "failed", attempts: 1 });
     } finally {
       vi.useRealTimers();
     }
@@ -267,7 +286,7 @@ describe("runtime behavior", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("retry", { id: "event", sessionKey: "work" });
 
@@ -286,7 +305,7 @@ describe("runtime behavior", () => {
       state: { ordinary: 2 },
     });
     expect(await test.sessions.notes("work")).toMatchObject([{ message: "attempt 2" }]);
-    expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({
+    expect((await test.deliveries.list())[0]).toMatchObject({
       status: "processed",
       attempts: 2,
       lastError: undefined,
@@ -306,11 +325,11 @@ describe("runtime behavior", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("retry", { id: "event" });
 
-    const delivery = (await test.events.list())[0]!.deliveries[0]!;
+    const delivery = (await test.deliveries.list())[0]!;
     expect(delivery.status).toBe("failed");
     expect(delivery.lastError).toContain("original failure");
     expect(delivery.lastError).not.toContain("secondary failure");
@@ -324,12 +343,12 @@ describe("runtime behavior", () => {
       });
     });
     const test = await createTestRuntime({
-      config: { channels: [channel], clients: [client], retries: { attempts: 1 } },
+      channels: [channel], clients: [client], retries: { attempts: 1 },
     });
 
     await test.dispatch("retry", { id: "event-1" });
 
-    const deliveries = (await test.events.list())[0]!.deliveries;
+    const deliveries = await test.deliveries.list();
     expect(deliveries[0]).toMatchObject({ status: "failed", attempts: 1, maxAttempts: 1 });
   });
 
@@ -344,16 +363,14 @@ describe("runtime behavior", () => {
       builder.handle(channel, { id: "global-default", handle() {} });
     });
     const test = await createTestRuntime({
-      config: {
-        channels: [channel],
-        clients: [clientDefault, globalDefault],
-        retries: { attempts: 5 },
-      },
+      channels: [channel],
+      clients: [clientDefault, globalDefault],
+      retries: { attempts: 5 },
     });
 
     await test.dispatch("retry", { id: "event" });
 
-    const deliveries = (await test.events.list())[0]!.deliveries;
+    const deliveries = await test.deliveries.list();
     expect(Object.fromEntries(deliveries.map(({ handlerId, maxAttempts }) => [handlerId, maxAttempts]))).toEqual({
       "client-default": 2,
       "handler-override": 4,
@@ -373,16 +390,14 @@ describe("runtime behavior", () => {
       builder.handle(channel, { id: "global-default", handle() {} });
     });
     const test = await createTestRuntime({
-      config: {
-        channels: [channel],
-        clients: [client, globalClient],
-        retries: { attempts: 5, delay: "5s" },
-      },
+      channels: [channel],
+      clients: [client, globalClient],
+      retries: { attempts: 5, delay: "5s" },
     });
 
     await test.dispatch("retry", { id: "event" });
 
-    const deliveries = (await test.events.list())[0]!.deliveries;
+    const deliveries = await test.deliveries.list();
     expect(Object.fromEntries(deliveries.map(({ handlerId, maxAttempts, retryDelayMs }) => [
       handlerId,
       { maxAttempts, retryDelayMs },
@@ -407,11 +422,11 @@ describe("runtime behavior", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client], store } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] }, { store });
 
     await test.dispatch("retry", { id: "event" });
 
-    const delayed = (await test.events.list())[0]!.deliveries[0]!;
+    const delayed = (await test.deliveries.list())[0]!;
     expect(attempts).toEqual([1]);
     expect(delayed).toMatchObject({ status: "pending", attempts: 1, retryDelayMs: 3_600_000 });
     expect(Date.parse(delayed.nextAttemptAt!)).toBeGreaterThan(Date.now());
@@ -419,10 +434,10 @@ describe("runtime behavior", () => {
     const state = await store.read();
     state.deliveries[0]!.nextAttemptAt = new Date(0).toISOString();
     await store.write(state);
-    await test.runtime.drain();
+    await test.drain();
 
     expect(attempts).toEqual([1, 2]);
-    expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({
+    expect((await test.deliveries.list())[0]).toMatchObject({
       status: "processed",
       attempts: 2,
       nextAttemptAt: undefined,
@@ -439,11 +454,11 @@ describe("runtime behavior", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("retry", { id: "event" });
 
-    const delivery = (await test.events.list())[0]!.deliveries[0]!;
+    const delivery = (await test.deliveries.list())[0]!;
     expect(delivery).toMatchObject({
       status: "pending",
       attempts: 1,
@@ -458,11 +473,11 @@ describe("runtime behavior", () => {
       builder.handle(channel, { id: "number", retries: { delay: 0.1 }, handle() {} });
       builder.handle(channel, { id: "string", retries: { delay: "0.5ms" }, handle() {} });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("retry", { id: "event" });
 
-    expect((await test.events.list())[0]!.deliveries.map(({ retryDelayMs }) => retryDelayMs)).toEqual([1, 1]);
+    expect((await test.deliveries.list()).map(({ retryDelayMs }) => retryDelayMs)).toEqual([1, 1]);
   });
 
   it("persists ensured values but rolls back ordinary state after a failed attempt", async () => {
@@ -485,7 +500,7 @@ describe("runtime behavior", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("retry", { id: "event", sessionKey: "work" });
 
@@ -515,7 +530,7 @@ describe("runtime behavior", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("retry", { id: "event", sessionKey: "work" });
 
@@ -536,17 +551,16 @@ describe("runtime behavior", () => {
         if (shouldFail) throw new Error("not yet");
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
     await test.dispatch("retry", { id: "failed-event" });
-    const deliveries = (await test.events.list())[0]!.deliveries;
+    const deliveries = await test.deliveries.list();
     const delivery = deliveries[0]!;
 
     shouldFail = false;
-    expect(await test.runtime.retryDelivery(delivery.id)).toBe(true);
-    await test.runtime.drain();
-    const retriedDeliveries = (await test.events.list())[0]!.deliveries;
+    expect(await test.deliveries.retry(delivery.id)).toBe(true);
+    const retriedDeliveries = await test.deliveries.list();
     expect(retriedDeliveries[0]).toMatchObject({ status: "processed", attempts: 2, maxAttempts: 2 });
-    expect(await test.runtime.retryDelivery(delivery.id)).toBe(false);
+    expect(await test.deliveries.retry(delivery.id)).toBe(false);
   });
 
   it("retains ended session history and creates a new active session for the same key", async () => {
@@ -557,7 +571,7 @@ describe("runtime behavior", () => {
         if (event.id === "first") session.end({ reason: "complete" });
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("sessions", { id: "first", sessionKey: "work" });
     await test.dispatch("sessions", { id: "second", sessionKey: "work" });
@@ -582,7 +596,7 @@ describe("runtime behavior", () => {
         session.note("Handled review", { reviewId: 7 });
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("notes", { id: "event", sessionKey: "work" });
 

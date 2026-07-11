@@ -28,8 +28,8 @@ export const herdrWorktreeId = sessionKey<string>("herdr.worktreeId");
 ```ts
 // .simple-agent-orchestrator/channels/github.ts
 import { createChannel } from "simple-agent-orchestrator";
-import { fetchRecentReviewCandidates } from "../../src/lib/github/reviews";
-import { githubPrSession } from "../keys";
+import { fetchRecentReviewCandidates } from "../../src/lib/github/reviews.ts";
+import { githubPrSession } from "../keys.ts";
 
 export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
   channel.poll({
@@ -75,12 +75,12 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
 ```ts
 // .simple-agent-orchestrator/environments/opencode-herdr.ts
 import { createEnvironment } from "simple-agent-orchestrator";
-import { startPersistentOpencodeServer } from "../../src/lib/opencode/server";
+import { startPersistentOpencodeServer } from "../../src/lib/opencode/server.ts";
 import {
   closeHerdrWorkTreeIdempotently,
   ensureActiveHerdrWorkTree,
-} from "../../src/lib/herdr/worktrees";
-import { herdrWorktreeId, opencodeServerUrl } from "../keys";
+} from "../../src/lib/herdr/worktrees.ts";
+import { herdrWorktreeId, opencodeServerUrl } from "../keys.ts";
 
 export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (environment) => {
   let shutdown: (() => Promise<void>) | undefined;
@@ -127,11 +127,11 @@ export const opencodeHerdrEnvironment = createEnvironment("opencode-herdr", (env
 ```ts
 // .simple-agent-orchestrator/clients/coding.ts
 import { createClient } from "simple-agent-orchestrator";
-import { githubReviewsChannel } from "../channels/github";
-import { opencodeHerdrEnvironment } from "../environments/opencode-herdr";
-import { opencodeServerUrl, opencodeSessionId } from "../keys";
-import { createAgentSession, sendToAgent } from "../../src/lib/opencode/agent";
-import { markReviewSeen } from "../../src/lib/github/reviews";
+import { githubReviewsChannel } from "../channels/github.ts";
+import { opencodeHerdrEnvironment } from "../environments/opencode-herdr.ts";
+import { opencodeServerUrl, opencodeSessionId } from "../keys.ts";
+import { createAgentSession, sendToAgent } from "../../src/lib/opencode/agent.ts";
+import { markReviewSeen } from "../../src/lib/github/reviews.ts";
 
 export const codingClient = createClient("coding", (client) => {
   client.useEnvironment(opencodeHerdrEnvironment);
@@ -176,8 +176,8 @@ The project-owned agent and source functions must honor both the stable keys and
 ```ts
 // .simple-agent-orchestrator/orchestrator.ts
 import { defineConfig, jsonFileStore } from "simple-agent-orchestrator";
-import { githubReviewsChannel } from "./channels/github";
-import { codingClient } from "./clients/coding";
+import { githubReviewsChannel } from "./channels/github.ts";
+import { codingClient } from "./clients/coding.ts";
 
 export default defineConfig(({ project }) => ({
   store: jsonFileStore(project.statePath("state.json")),

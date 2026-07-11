@@ -24,8 +24,8 @@ export interface SandboxContext extends EnvironmentHookContext {
 }
 
 export interface SandboxDefinition {
-  create(ctx: SandboxContext): Promise<void> | void;
-  cleanup?(ctx: SandboxContext): Promise<void> | void;
+  readonly create: (ctx: SandboxContext) => Promise<void> | void;
+  readonly cleanup?: (ctx: SandboxContext) => Promise<void> | void;
 }
 
 export interface EnvironmentBuilder {
@@ -36,8 +36,8 @@ export interface EnvironmentBuilder {
 
 export interface EnvironmentDefinition {
   readonly id: string;
-  readonly mountHooks: ((ctx: EnvironmentHookContext) => Promise<void> | void)[];
-  readonly unmountHooks: ((ctx: EnvironmentHookContext) => Promise<void> | void)[];
+  readonly mountHooks: readonly ((ctx: EnvironmentHookContext) => Promise<void> | void)[];
+  readonly unmountHooks: readonly ((ctx: EnvironmentHookContext) => Promise<void> | void)[];
   readonly sandbox?: SandboxDefinition | undefined;
 }
 
@@ -73,8 +73,8 @@ export function createEnvironment(
   id: string,
   setup: (environment: EnvironmentBuilder) => void,
 ): EnvironmentDefinition {
-  const mountHooks: EnvironmentDefinition["mountHooks"] = [];
-  const unmountHooks: EnvironmentDefinition["unmountHooks"] = [];
+  const mountHooks: Array<(ctx: EnvironmentHookContext) => Promise<void> | void> = [];
+  const unmountHooks: Array<(ctx: EnvironmentHookContext) => Promise<void> | void> = [];
   let sandbox: SandboxDefinition | undefined;
 
   const builder: EnvironmentBuilder = {
@@ -93,8 +93,8 @@ export function createEnvironment(
 
   return {
     id,
-    mountHooks,
-    unmountHooks,
+    mountHooks: [...mountHooks],
+    unmountHooks: [...unmountHooks],
     sandbox,
   };
 }

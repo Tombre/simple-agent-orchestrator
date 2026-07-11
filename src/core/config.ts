@@ -1,6 +1,6 @@
 import type { ChannelDefinition } from "./channel.js";
 import type { ClientDefinition } from "./client.js";
-import type { DispatchEvent, Logger, ProjectContext, RetryOptions } from "./types.js";
+import type { DispatchEvent, DispatchResult, Logger, ProjectContext, RetryOptions } from "./types.js";
 import type { Store } from "../stores/store.js";
 import type { Hono } from "hono";
 
@@ -11,7 +11,7 @@ export interface DefineConfigContext {
 export type HttpDispatch = (
   channelId: string,
   event: DispatchEvent,
-) => Promise<{ status: "queued" | "duplicate"; eventId: string }>;
+) => Promise<DispatchResult>;
 
 export interface HttpRegistrationContext {
   app: Hono;
@@ -34,8 +34,8 @@ export interface HttpConfig {
 export interface OrchestratorConfig {
   name?: string;
   store?: Store;
-  channels?: ChannelDefinition[];
-  clients?: ClientDefinition[];
+  channels?: readonly ChannelDefinition[];
+  clients?: readonly ClientDefinition[];
   logger?: Logger;
   retries?: RetryOptions;
   timeout?: number | string;

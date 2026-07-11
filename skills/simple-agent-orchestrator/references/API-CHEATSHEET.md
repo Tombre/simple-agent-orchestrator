@@ -32,9 +32,11 @@ export default defineConfig(({ project }) => ({
 
 The config lives at `.simple-agent-orchestrator/orchestrator.ts`.
 
+Builders configure mutable channel/client/environment definitions immediately. Definitions are inspectable and readonly-typed but not frozen. Runtime `init()` snapshots registrations; later mutations do not affect that runtime. Live reconfiguration is unsupported.
+
 Normal `start()` binds HTTP by default; `SAO_HTTP_PORT` overrides config, and `start({ http: false })` or CLI `--no-http` disables it. Middleware runs before built-ins and routes afterward. Built-ins are `GET /health`, `POST /webhooks/:channelId`, `GET /api/v1/status`, `GET /api/v1/events?limit=N`, and `GET /api/v1/sessions?limit=N`; their namespaces are reserved. Hooks receive the Hono `app`, `project`, `logger`, runtime `signal`, and durable `dispatch`. The server has no built-in authentication, signature checks, CORS, rate limiting, or TLS.
 
-The webhook accepts a normalized JSON object up to 1 MiB. It requires non-empty `id` and permits `type`, `dedupeKey`, `sessionKey`, JSON-safe `input`/`payload`, object `meta`, and string `occurredAt`. It returns `202 queued` after durable ingestion or `200 duplicate` with the original event ID. Operational lists default to 25, max at 100, and omit event bodies, session state, notes, deliveries, and errors. Add middleware before exposure; unauthenticated dispatch can trigger side effects and state growth.
+The webhook accepts a normalized JSON object up to 1 MiB. It requires non-empty `id` and permits `type`, `dedupeKey`, `sessionKey`, JSON-safe `input`/`payload`, object `meta`, and string `occurredAt`. It returns `202 queued` after durable ingestion or `200 duplicate` with the original internal event ID. Operational lists default to 25, max at 100, and omit event bodies, session state, notes, deliveries, and errors. Add middleware before exposure; unauthenticated dispatch can trigger side effects and state growth.
 
 The `project` helper exposes stable paths:
 
@@ -105,6 +107,15 @@ type DispatchEvent = {
 ```
 
 The HTTP representation is JSON-only: `occurredAt` must be a valid string, values may nest at most 100 levels, identifiers are limited to 512 characters, and `type` to 256.
+
+Every channel definition has `dispatch(event)`. It requires exactly one initialized runtime bound to that exact object and throws with zero or multiple bindings. Explicit runtime dispatch avoids ambiguity:
+
+```ts
+await runtime.dispatch(manualChannel, { id: "one" });
+await runtime.dispatch("manual", { id: "two" });
+```
+
+Object dispatch requires the registered object identity; string dispatch resolves the registered ID.
 
 ## Clients
 
@@ -248,6 +259,58 @@ export default defineConfig(({ project }) => ({
 
 Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 3 is current; valid version 1 and 2 state is upgraded in memory with immediate retry defaults and persisted by the next successful write, while invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
 
-Use `runtime.previewStatePrune({ before })` to inspect conservative retention and `runtime.runOffline(() => runtime.pruneState({ before }))` to apply it. The CLI equivalents are `state prune --before <timestamp>` and the same command with `--apply`. Processed deliveries and safely unreferenced ended sessions/notes are eligible; operational records, cursors, and active sandbox markers are preserved. Events remain as dedupe history unless `dropDedupe: true`/`--drop-dedupe` is explicit, which allows old source identities to dispatch again.
+Use `runtime.previewStatePrune({ before })` to inspect conservative retention and `runtime.runOffline(({ pruneState }) => pruneState({ before }))` to apply it. The CLI equivalents are `state prune --before <timestamp>` and the same command with `--apply`. Processed deliveries and safely unreferenced ended sessions/notes are eligible; operational records, cursors, and active sandbox markers are preserved. Events remain as dedupe history unless `dropDedupe: true`/`--drop-dedupe` is explicit, which allows old source identities to dispatch again.
 
 The JSON store rejects a second active runtime or offline operation for the same state file and reclaims ownership left by a dead PID. Atomic first-run initialization and runtime ownership require a local filesystem with atomic hard-link support and fail explicitly when unavailable. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` acquire ownership and fail before writing while `start` is active; inspection commands and retention preview remain available. Direct library mutations require an explicit `runtime.runOffline(...)` scope. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.
+
+## Runtime creation and offline work
+
+```ts
+import { createRuntime, OrchestratorRuntime } from "simple-agent-orchestrator/runtime";
+
+const runtime = await createRuntime(config, { root: process.cwd() });
+// createRuntime defaults an omitted store to project.statePath("state.json").
+
+const lowLevel = new OrchestratorRuntime({ project, config });
+await lowLevel.init();
+// Direct construction is low-level and defaults an omitted store to memory.
+```
+
+`config` may be an object or sync/async `({ project }) => config` factory. `createRuntime` options accept `project`, `cwd`, or `root`. It constructs but does not start or initialize the runtime.
+
+```ts
+await runtime.runOffline(async ({
+  dispatch,
+  drain,
+  endSession,
+  retryDelivery,
+  pruneState,
+}) => {
+  await dispatch(manualChannel, { id: "offline-1" });
+  await drain();
+});
+```
+
+The context is valid only during the callback. `runOffline` requires an unused one-shot runtime, owns persistent state for the complete scope, and always shuts down. `drain` processes eligible work and recovers interruptions; mutation-only scopes do not recover unless they drain.
+
+## Testing
+
+```ts
+import { createTestRuntime } from "simple-agent-orchestrator/testing";
+
+const test = await createTestRuntime(config, { root: process.cwd() });
+await test.dispatch(channel, event); // drains by default
+await test.sessions.get("session-key");
+await test.events.list();
+await test.deliveries.list();
+await test.readState();
+await test.stop();
+```
+
+Pass config as the first argument rather than nesting it in an options object. Defaults are isolated memory state, silent logging, and disabled HTTP; options may override store/logger/HTTP and select either `root` or `project`. Event helpers return `{ event, deliveries }` records; delivery helpers expose stored deliveries directly. `test.runtime` is the public low-level escape hatch.
+
+## CLI reminders
+
+The parser rejects unknown/duplicate flags, extra positionals, missing values, and missing required options. CLI dispatch requires `--id`. `sessions list` and `events list` accept `--json` and positive `--limit`; `events show <internal-event-id>` returns the event with deliveries. Use the internal ID returned by dispatch or `events list`, not the source ID. Missing show/end/retry targets exit nonzero.
+
+Persisted state and ordinary logs are plaintext. Built-in operational HTTP summaries omit body/state/error fields, but project middleware, routes, handlers, and logs are not automatically redacted.

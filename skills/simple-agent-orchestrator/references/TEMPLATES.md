@@ -1,59 +1,45 @@
 # Simple Agent Orchestrator templates
 
-Use these as starting points. Adapt imports to the project’s existing code.
+Use explicit `.ts` extensions for project-local imports.
 
-## Directory scaffold
+## Generated scaffold
 
-```txt
+`npx simple-agent-orchestrator init` writes these known files under the nearest existing npm package:
+
+```text
 .simple-agent-orchestrator/
+  .gitignore
+  package.json
+  tsconfig.json
   orchestrator.ts
-  channels/
-    manual.ts
-  clients/
-    coding.ts
-  environments/
-    opencode.ts
-  prompts/
-  state/.gitignore
-  logs/.gitignore
-  tmp/.gitignore
+  channels/manual.ts
+  clients/example.ts
 ```
 
-Each `.gitignore` in `state`, `logs`, and `tmp` should contain:
+It does not edit the host `package.json`. The generated `.gitignore` contains:
 
 ```gitignore
-*
-!.gitignore
+state/
+tmp/
+logs/
 ```
 
-## `orchestrator.ts`
+`--force` replaces these known template files but preserves unknown files.
+
+## Minimal config
 
 ```ts
 import { defineConfig } from "simple-agent-orchestrator";
+import { manualChannel } from "./channels/manual.ts";
+import { exampleClient } from "./clients/example.ts";
 
-import { manualChannel } from "./channels/manual";
-import { codingClient } from "./clients/coding";
-
-export default defineConfig(({ project }) => ({
-  name: String(project.packageJson.name ?? "agent-orchestrator"),
-  http: {
-    hostname: "127.0.0.1",
-    port: 3000,
-  },
+export default defineConfig({
   channels: [manualChannel],
-  clients: [codingClient],
-}));
+  clients: [exampleClient],
+});
 ```
 
-Ordinary startup now exposes normalized `POST /webhooks/manual` plus bounded `/api/v1/status`, `/api/v1/events`, and `/api/v1/sessions`. Add authentication and provider signature checks with `http.middleware` before exposing the listener. Provider-specific payload conversion remains project-owned.
-
-```bash
-curl -X POST http://127.0.0.1:3000/webhooks/manual \
-  -H 'Content-Type: application/json' \
-  -d '{"id":"manual-1","sessionKey":"demo","input":"Hello"}'
-```
-
-The first request returns `202 queued` after durable ingestion; a duplicate returns `200 duplicate` with the original internal event ID.
+Omitting `store` in a loaded project config uses `.simple-agent-orchestrator/state/state.json`.
 
 ## Manual channel
 
@@ -63,164 +49,97 @@ import { createManualChannel } from "simple-agent-orchestrator";
 export const manualChannel = createManualChannel("manual");
 ```
 
-## Minimal client
+## Generated example client
 
 ```ts
-import { createClient, sessionKey } from "simple-agent-orchestrator";
+import { createClient } from "simple-agent-orchestrator";
+import { manualChannel } from "../channels/manual.ts";
 
-import { manualChannel } from "../channels/manual";
-
-const fakeAgentSessionId = sessionKey<string>("fakeAgent.sessionId");
-
-export const codingClient = createClient("coding", (client) => {
-  client.handle(manualChannel, async ({ event, session, logger }) => {
-    const agentSessionId = await session.ensure(fakeAgentSessionId, async () => {
-      return `fake-agent-${session.id}`;
+export const exampleClient = createClient("example", (client) => {
+  client.handle(manualChannel, ({ event, session, logger }) => {
+    logger.info("Example client handled event", {
+      eventId: event.id,
+      sessionId: session.id,
     });
-
-    session.note("Handled manual event", { agentSessionId, input: event.input });
-    logger.info("Manual event handled", { sessionId: session.id, agentSessionId });
   });
 });
 ```
 
-## GitHub review channel
+The example intentionally logs identifiers, not `input`, `payload`, or `meta`. Logs and JSON state are plaintext; keep sensitive content out unless the project has an explicit policy.
+
+## Polling channel
 
 ```ts
-import { createChannel, defineKey } from "simple-agent-orchestrator";
-import { fetchRecentReviewCandidates } from "../../src/lib/github";
-
-const githubPr = defineKey("github.pr", {
-  parts: ["owner", "repo", "number"] as const,
-});
+import { createChannel } from "simple-agent-orchestrator";
+import { fetchRecentReviewCandidates } from "../../src/lib/github/reviews.ts";
 
 export const githubReviewsChannel = createChannel("github.reviews", (channel) => {
   channel.poll({
     id: "reviews",
     every: "60s",
-
-    async fetch({ cursor }) {
-      return fetchRecentReviewCandidates({
-        since: cursor.get<string>("lastUpdatedAt"),
-      });
-    },
-
-    async map(review) {
-      return {
-        id: review.id,
-        type: "github.review",
-        dedupeKey: `github.review:${review.id}:${review.updatedAt}`,
-        sessionKey: githubPr({
-          owner: review.owner,
-          repo: review.repo,
-          number: review.prNumber,
-        }),
-        input: review.toMarkdown(),
-        payload: review,
-        meta: {
-          owner: review.owner,
-          repo: review.repo,
-          branch: review.branch,
-          prNumber: review.prNumber,
-        },
-      };
-    },
-
-    async commit({ cursor, items }) {
-      const latest = items.map((review) => review.updatedAt).sort().at(-1);
-      if (latest) cursor.set("lastUpdatedAt", latest);
-    },
+    fetch: () => fetchRecentReviewCandidates(),
+    map: (review) => ({
+      id: review.id,
+      dedupeKey: `${review.id}:${review.updatedAt}`,
+      sessionKey: `github:${review.repo}:pr:${review.prNumber}`,
+      input: review.toMarkdown(),
+      payload: review,
+      meta: { branch: review.branch },
+    }),
   });
 });
 ```
 
-## Persistent coding client
+## Retry-safe client
 
 ```ts
-import {
-  createClient,
-  sessionKey,
-} from "simple-agent-orchestrator";
-import { githubReviewsChannel } from "../channels/github";
-import { opencodeEnvironment, opencodeServerUrl } from "../environments/opencode";
-import { createAgentSession, sendToAgent } from "../../src/lib/opencode";
+import { createClient, sessionKey } from "simple-agent-orchestrator";
+import { githubReviewsChannel } from "../channels/github.ts";
+import { createAgentSession, sendToAgent } from "../../src/lib/agent.ts";
 
-const opencodeSessionId = sessionKey<string>("opencode.sessionId");
+const agentSessionId = sessionKey<string>("agent.sessionId");
 
 export const codingClient = createClient("coding", (client) => {
-  client.useEnvironment(opencodeEnvironment);
-  client.concurrency({ workers: 2, perSession: true });
   client.timeout("10m");
-
-  client.handle(githubReviewsChannel, {
-    id: "coding.githubReviews",
-
-    async handle({ event, session, environment, signal }) {
-      const serverUrl = environment.get(opencodeServerUrl);
-      const agentSessionId = await session.ensure(opencodeSessionId, async () => {
-        const agentSession = await createAgentSession(serverUrl, {
-          idempotencyKey: `agent-session:${session.id}`,
-          signal,
-        });
-        return agentSession.id;
-      });
-      await sendToAgent(serverUrl, agentSessionId, event.input, {
-        idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+  client.handle(githubReviewsChannel, async ({ event, session, signal }) => {
+    const id = await session.ensure(agentSessionId, async () => {
+      const created = await createAgentSession({
+        idempotencyKey: `agent-session:${session.id}`,
         signal,
       });
-    },
+      return created.id;
+    });
 
-    async onSuccess({ event }) {
-      // Mark the source handled here with a stable idempotency key.
-    },
+    await sendToAgent(id, String(event.input), {
+      idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
+      signal,
+    });
   });
 });
 ```
 
-## Environment with sandbox
+## Programmatic runtime and tests
 
 ```ts
-import { createEnvironment, envKey } from "simple-agent-orchestrator";
-import { startPersistentOpencodeServer } from "../../src/lib/opencode";
-import { closeWorktreeIdempotently, ensureActiveWorktree } from "../../src/lib/worktrees";
+import { createRuntime } from "simple-agent-orchestrator/runtime";
 
-export const opencodeServerUrl = envKey<string>("opencode.serverUrl");
+const runtime = await createRuntime(
+  { channels: [manualChannel], clients: [exampleClient] },
+  { root: process.cwd() },
+);
+await runtime.start({ http: false });
+```
 
-export const opencodeEnvironment = createEnvironment("opencode", (environment) => {
-  let shutdown: (() => Promise<void>) | undefined;
+```ts
+import { createTestRuntime } from "simple-agent-orchestrator/testing";
 
-  environment.onMount(async ({ environment, project }) => {
-    const server = await startPersistentOpencodeServer({ cwd: project.root });
-    environment.set(opencodeServerUrl, server.url);
-    shutdown = () => server.shutdown();
-  });
-
-  environment.onUnmount(async () => {
-    await shutdown?.();
-    shutdown = undefined;
-  });
-
-  environment.useSandbox({
-    async create({ event, session, project, signal }) {
-      const branch = event.meta?.branch;
-      if (typeof branch !== "string" || branch.trim() === "") {
-        throw new Error("Expected event.meta.branch");
-      }
-
-      const worktreeId = await ensureActiveWorktree({
-        resourceKey: `worktree:${session.id}`,
-        rootDirectory: project.root,
-        sourceCheckout: "main",
-        branch,
-        signal,
-      });
-      session.set("worktree.id", worktreeId);
-    },
-
-    async cleanup({ session, signal }) {
-      const worktreeId = session.getOptional<string>("worktree.id");
-      if (worktreeId) await closeWorktreeIdempotently(worktreeId, { signal });
-    },
-  });
+const test = await createTestRuntime({
+  channels: [manualChannel],
+  clients: [exampleClient],
 });
+try {
+  await test.dispatch(manualChannel, { id: "test-1" });
+} finally {
+  await test.stop();
+}
 ```

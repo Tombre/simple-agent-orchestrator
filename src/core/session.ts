@@ -19,8 +19,6 @@ export interface Session {
   ensure<T = unknown>(key: KeyLike<T>, factory: () => Promise<T> | T): Promise<T>;
   note(message: string, data?: unknown): void;
   end(options?: SessionEndOptions): void;
-  toStored(): StoredSession;
-  drainNotes(): SessionNote[];
 }
 
 export type EnsureCoordinator = <T>(

@@ -1,5 +1,6 @@
-import type { DispatchEvent, KeyLike, Logger, ProjectContext } from "./types.js";
+import type { DispatchEvent, DispatchResult, KeyLike, Logger, ProjectContext } from "./types.js";
 import { keyName } from "./types.js";
+import { getChannelRuntimeBindings } from "./channel-bindings.js";
 
 export interface Cursor {
   get<T = unknown>(key: KeyLike<T>): T | undefined;
@@ -22,12 +23,15 @@ export interface PollCommitContext<TRaw = unknown> extends PollContext {
 }
 
 export interface PollDefinition<TRaw = unknown> {
-  id?: string;
-  every: number | string;
-  immediate?: boolean;
-  fetch(ctx: PollContext): Promise<TRaw[]> | TRaw[];
-  map?(item: TRaw, ctx: PollContext): Promise<DispatchEvent | null | undefined> | DispatchEvent | null | undefined;
-  commit?(ctx: PollCommitContext<TRaw>): Promise<void> | void;
+  readonly id?: string;
+  readonly every: number | string;
+  readonly immediate?: boolean;
+  readonly fetch: (ctx: PollContext) => Promise<TRaw[]> | TRaw[];
+  readonly map?: (
+    item: TRaw,
+    ctx: PollContext,
+  ) => Promise<DispatchEvent | null | undefined> | DispatchEvent | null | undefined;
+  readonly commit?: (ctx: PollCommitContext<TRaw>) => Promise<void> | void;
 }
 
 export function pollCursorId(channelId: string, poll: PollDefinition, index: number): string {
@@ -36,7 +40,7 @@ export function pollCursorId(channelId: string, poll: PollDefinition, index: num
 
 export interface ChannelRuntimeApi {
   readonly id: string;
-  dispatch(event: DispatchEvent): Promise<{ status: "queued" | "duplicate"; eventId: string }>;
+  readonly dispatch: (event: DispatchEvent) => Promise<DispatchResult>;
 }
 
 export interface ChannelBuilder {
@@ -45,14 +49,12 @@ export interface ChannelBuilder {
 
 export interface ChannelDefinition {
   readonly id: string;
-  readonly polls: PollDefinition[];
-  dispatch(event: DispatchEvent): Promise<{ status: "queued" | "duplicate"; eventId: string }>;
-  __attachDispatch(dispatch: ChannelRuntimeApi["dispatch"]): void;
+  readonly polls: readonly PollDefinition[];
+  readonly dispatch: (event: DispatchEvent) => Promise<DispatchResult>;
 }
 
 export function createChannel(id: string, setup?: (channel: ChannelBuilder) => void): ChannelDefinition {
   const polls: PollDefinition[] = [];
-  let runtimeDispatch: ChannelRuntimeApi["dispatch"] | undefined;
 
   const builder: ChannelBuilder = {
     poll(definition) {
@@ -62,21 +64,26 @@ export function createChannel(id: string, setup?: (channel: ChannelBuilder) => v
 
   setup?.(builder);
 
-  return {
+  const definition: ChannelDefinition = {
     id,
-    polls,
+    polls: [...polls],
     async dispatch(event) {
-      if (!runtimeDispatch) {
+      const bindings = getChannelRuntimeBindings(definition);
+      if (!bindings || bindings.size === 0) {
         throw new Error(
-          `Channel ${id} is not attached to a running orchestrator. Use runtime.dispatch(...) or start the orchestrator first.`,
+          `Channel ${id} is not bound to an initialized orchestrator runtime. Use runtime.dispatch(...) or initialize the runtime first.`,
         );
       }
-      return runtimeDispatch(event);
-    },
-    __attachDispatch(dispatch) {
-      runtimeDispatch = dispatch;
+      if (bindings.size > 1) {
+        throw new Error(
+          `Channel ${id} is bound to multiple initialized orchestrator runtimes. Use runtime.dispatch(...) to select one explicitly.`,
+        );
+      }
+      return [...bindings.values()][0]!(event);
     },
   };
+
+  return definition;
 }
 
 export function createManualChannel(id = "manual"): ChannelDefinition {

@@ -73,6 +73,10 @@ Important primitives:
 
 Avoid large abstractions until repeated real-world integrations prove they are necessary.
 
+Channel, client, and environment builders configure inspectable definitions rather than live services. Definitions are readonly-typed for consumers but deliberately not frozen, so projects can compose them before initialization. A runtime snapshots them at `init()` and does not support live reconfiguration; changed composition belongs in a fresh runtime.
+
+Channel definitions may dispatch directly when exactly one initialized runtime is bound. Explicit `runtime.dispatch(channelOrId, event)` remains the unambiguous primitive when several runtimes or definition identity matter.
+
 State retention is an explicit preview-and-apply operation, not a background compaction service. It preserves operational work and dedupe by default; surrendering old dedupe history requires a separate operator choice.
 
 A fixed durable retry eligibility timestamp is delivery plumbing, not a general scheduling API. Backoff strategies, arbitrary timers, and workflow schedules remain outside the runtime until demonstrated integration needs justify them.

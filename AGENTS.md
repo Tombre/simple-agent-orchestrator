@@ -24,6 +24,7 @@ Read [the design principles](docs/design-principles.md) before changing project 
 ## Domain Model
 
 - **Project**: an existing repository containing project-local orchestration code, normally under `.simple-agent-orchestrator/`.
+- **Definition**: an inspectable, readonly-typed but unfrozen channel, client, or environment description configured by its builder. A runtime snapshots definitions at `init()`; post-init mutation does not reconfigure it.
 - **Channel**: a globally identified source of events. A channel may register polls or receive normalized webhook, CLI, or project-route dispatches. A manual channel is simply a channel without polls.
 - **Poll and cursor**: a poll fetches source items and optionally maps them to dispatch events. Its durable cursor records source progress.
 - **Event**: the durable input unit. Source IDs, dedupe keys, and session keys are separate identities and must be chosen deliberately.
@@ -59,6 +60,7 @@ Public package subpaths are `.`, `./runtime`, and `./testing`. The package is ES
 ## Guides And Skill
 
 - [Getting started](docs/guides/getting-started.md)
+- [Documentation index](docs/index.md)
 - [Project integration](docs/guides/project-integration.md)
 - [Channels](docs/guides/channels.md)
 - [Clients and handlers](docs/guides/clients.md)
@@ -72,7 +74,7 @@ The installable coding-agent skill is [skills/simple-agent-orchestrator/SKILL.md
 
 ## Data Flow
 
-1. A channel poll, CLI command, or project integration calls `runtime.dispatch(channelId, event)`.
+1. A channel poll, CLI command, or project integration calls `runtime.dispatch(channelOrId, event)`; `channel.dispatch(event)` delegates only when exactly one initialized runtime is bound.
 2. Dispatch defaults `dedupeKey` to `event.id` and `sessionKey` to `${channelId}:${event.id}`.
 3. Dedupe is scoped to `channelId + dedupeKey`.
 4. A new event creates one pending delivery for every matching client handler.
@@ -88,6 +90,11 @@ The installable coding-agent skill is [skills/simple-agent-orchestrator/SKILL.md
 Preserve these contracts unless implementation, tests, and documentation are deliberately changed together.
 
 - Dispatch persists the event and matching deliveries before returning `queued`.
+- Runtime object dispatch requires the exact registered channel definition; string dispatch resolves the channel ID. Definition dispatch rejects when zero or multiple initialized runtimes are bound.
+- Builders configure mutable definitions immediately. Runtime initialization snapshots registrations and config collections; definitions remain inspectable and unfrozen, but post-init changes do not affect that runtime and live reconfiguration is unsupported.
+- Runtime dispatch and administrative mutation methods reject after stop; store-backed inspection remains available.
+- Shutdown settles mutation calls accepted before stopping before it releases store ownership.
+- `runOffline()` settles every context operation started during its callback before releasing ownership, including promises the callback does not return. Calls started after callback settlement reject.
 - Ordinary startup binds HTTP after recovery and environment mounting but before pollers and workers. Drain, offline, inspection, config loading, and test-harness initialization never bind it.
 - HTTP middleware registers before built-ins, custom routes register afterward, and `/health`, `/webhooks/*`, and `/api/v1/*` are reserved.
 - Normalized webhooks accept at most 1 MiB of strict JSON and return only after dispatch persistence; operational lists default to 25 records, permit at most 100, and omit event bodies, session state, notes, and errors.
@@ -122,6 +129,9 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Persisted event, session, note, and cursor values must be JSON-safe when using `jsonFileStore`.
 - Dispatch may return `queued` with no matching handlers. Sessions are created only when a delivery is processed.
 - State pruning is explicit and preview-first. It removes only old processed deliveries and safely unreferenced ended sessions/notes, preserves cursors and operational records, preserves sessions with active sandbox markers, and retains event dedupe unless the operator explicitly drops it.
+- CLI parsing is schema-strict. Dispatch requires `--id`; session/event lists support positive `--limit` and `--json`; missing show/end/retry targets fail.
+- `init` discovers the nearest package by default, requires an existing regular valid object-valued `package.json`, never edits the host manifest, and with `--force` overwrites only known template files while preserving unknown files.
+- `createRuntime(config, options)` defaults to the project JSON store. Direct construction plus `init()` is the low-level memory-default path. `createTestRuntime(config, options)` defaults to isolated memory, silent logging, and disabled HTTP and exposes grouped event records, delivery helpers, cleanup, and `test.runtime`.
 
 ## Lifecycle And Concurrency
 
@@ -162,7 +172,6 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Administrative `sessions end` does not invoke sandbox cleanup.
 - Runtime shutdown unmounts environments but does not clean every active session sandbox.
 - Poll dispatch, source acknowledgement, cursor commit, and external effects are not transactionally coupled.
-- `dev` has no watch or reload behavior.
 - No provider-specific webhook route, provider integration, prompt renderer, approval system, or agent queue is bundled.
 - TypeScript config files are transpiled by `tsx` at runtime, not type-checked while loading.
 - `doctor` validates config loading, identifiers, and persisted state; it does not execute environment hooks, polls, handlers, or sandboxes. `state validate` performs the state compatibility check directly.

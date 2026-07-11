@@ -67,6 +67,11 @@ export interface DispatchEvent<
   occurredAt?: Date | string | undefined;
 }
 
+export interface DispatchResult {
+  status: "queued" | "duplicate";
+  eventId: string;
+}
+
 export interface OrchestratorEvent<
   TPayload = unknown,
   TInput = unknown,

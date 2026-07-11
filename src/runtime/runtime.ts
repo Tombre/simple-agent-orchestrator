@@ -8,6 +8,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { ChannelDefinition, PollDefinition } from "../core/channel.js";
 import { CursorImpl, pollCursorId } from "../core/channel.js";
+import { bindChannelRuntime, unbindChannelRuntime } from "../core/channel-bindings.js";
 import type { ClientDefinition, HandlerContext, RegisteredHandler } from "../core/client.js";
 import type { EnvironmentDefinition, EnvironmentInstance, SandboxContext } from "../core/environment.js";
 import { createEmptyEnvironment, EnvironmentInstanceImpl } from "../core/environment.js";
@@ -16,6 +17,7 @@ import { HandlerTimeoutError } from "../core/errors.js";
 import { createStoredSession, SessionImpl } from "../core/session.js";
 import type {
   DispatchEvent,
+  DispatchResult,
   JsonRecord,
   JsonValue,
   Logger,
@@ -58,21 +60,35 @@ export interface StartOptions {
 }
 
 export interface OfflineOperationContext {
+  dispatch(channel: ChannelDefinition | string, event: DispatchEvent): Promise<DispatchResult>;
   drain(): Promise<void>;
+  endSession(idOrKey: string, reason?: string): Promise<boolean>;
+  retryDelivery(id: string): Promise<boolean>;
+  pruneState(options: StatePruneOptions): Promise<StatePrunePlan>;
+}
+
+interface RuntimeChannel {
+  readonly definition: ChannelDefinition;
+  readonly id: string;
+  readonly polls: readonly PollDefinition[];
+}
+
+interface RuntimeClient extends ClientDefinition {
+  readonly definition: ClientDefinition;
 }
 
 interface ClaimedDelivery {
   delivery: StoredDelivery;
   event: StoredEvent;
   handler: RegisteredHandler;
-  client: ClientDefinition;
+  client: RuntimeClient;
 }
 
 type RuntimeLifecycleState = "unused" | "starting" | "started" | "drain" | "stopping" | "stopped";
 
 interface MountedEnvironment {
   instance: EnvironmentInstanceImpl;
-  pendingUnmountHooks: EnvironmentDefinition["unmountHooks"];
+  pendingUnmountHooks: Array<(ctx: Parameters<EnvironmentDefinition["unmountHooks"][number]>[0]) => Promise<void> | void>;
 }
 
 interface HttpRequestToken {
@@ -331,16 +347,45 @@ function formatError(error: unknown): string {
   return String(error);
 }
 
+function snapshotEnvironment(definition: EnvironmentDefinition | undefined): EnvironmentDefinition | undefined {
+  if (!definition) return undefined;
+  return {
+    id: definition.id,
+    mountHooks: [...definition.mountHooks],
+    unmountHooks: [...definition.unmountHooks],
+    ...(definition.sandbox ? { sandbox: { ...definition.sandbox } } : {}),
+  };
+}
+
+function snapshotClient(client: ClientDefinition): RuntimeClient {
+  return {
+    definition: client,
+    id: client.id,
+    handlers: client.handlers.map((handler) => ({
+      ...handler,
+      retries: { ...handler.retries },
+    })),
+    ...(client.environment ? { environment: snapshotEnvironment(client.environment) } : {}),
+    concurrencyOptions: { ...client.concurrencyOptions },
+    retryOptions: { ...client.retryOptions },
+    ...(client.timeout === undefined ? {} : { timeout: client.timeout }),
+  };
+}
+
 export class OrchestratorRuntime {
-  private readonly store: Store;
-  private readonly channels: ChannelDefinition[];
-  private readonly clients: ClientDefinition[];
-  private readonly logger: Logger;
+  private readonly sourceOptions: RuntimeOptions;
+  private options: RuntimeOptions;
+  private readonly defaultStore = memoryStore();
+  private store: Store;
+  private channels: RuntimeChannel[] = [];
+  private clients: RuntimeClient[] = [];
+  private logger: Logger;
   private readonly mutex = new StoreMutex();
   private readonly abortController = new AbortController();
   private readonly httpRequestContext = new AsyncLocalStorage<HttpRequestToken>();
   private readonly httpRequests = new Set<Promise<void>>();
   private readonly httpDispatches = new Set<Promise<unknown>>();
+  private readonly mutationPromises = new Set<Promise<unknown>>();
   private readonly environmentInstances = new Map<string, MountedEnvironment>();
   private readonly environmentMounts = new Map<string, Promise<EnvironmentInstanceImpl>>();
   private readonly intervalHandles: NodeJS.Timeout[] = [];
@@ -356,17 +401,19 @@ export class OrchestratorRuntime {
   private stopPromise: Promise<void> | undefined;
   private offlineOperationActive = false;
   private initialized = false;
+  private initPromise: Promise<void> | undefined;
+  private storePrepared = false;
   private httpServer: Server | undefined;
   private httpAccepting = false;
   private httpReady = false;
   private httpAddress: { hostname: string; port: number } | undefined;
   private runtimeStartedAt: number | undefined;
 
-  constructor(private readonly options: RuntimeOptions) {
-    this.store = options.config.store ?? memoryStore();
-    this.channels = options.config.channels ?? [];
-    this.clients = options.config.clients ?? [];
-    this.logger = options.config.logger ?? consoleLogger;
+  constructor(options: RuntimeOptions) {
+    this.sourceOptions = options;
+    this.options = options;
+    this.store = this.defaultStore;
+    this.logger = consoleLogger;
   }
 
   get project(): ProjectContext {
@@ -375,13 +422,61 @@ export class OrchestratorRuntime {
 
   async init(): Promise<void> {
     if (this.initialized) return;
-    this.validateConfiguration();
-    await this.store.init();
-    await this.store.read();
-    for (const channel of this.channels) {
-      channel.__attachDispatch((event) => this.dispatch(channel.id, event));
+    if (this.lifecycleState === "stopping" || this.lifecycleState === "stopped") {
+      throw new Error("Cannot initialize a runtime after the runtime has been stopped");
     }
-    this.initialized = true;
+    if (this.initPromise) return this.initPromise;
+    const initializing = (async () => {
+      this.prepareStore();
+      this.compileConfiguration();
+      this.validateConfiguration();
+      await this.store.init();
+      await this.store.read();
+      if (this.lifecycleState === "stopping" || this.lifecycleState === "stopped") {
+        throw new Error("Runtime stopped during initialization");
+      }
+      try {
+        for (const channel of this.channels) {
+          bindChannelRuntime(channel.definition, this, (event) => this.dispatch(channel.definition, event));
+        }
+        this.initialized = true;
+      } catch (error) {
+        for (const channel of this.channels) unbindChannelRuntime(channel.definition, this);
+        throw error;
+      }
+    })();
+    this.initPromise = initializing;
+    try {
+      await initializing;
+    } finally {
+      if (this.initPromise === initializing) this.initPromise = undefined;
+    }
+  }
+
+  private compileConfiguration(): void {
+    const source = this.sourceOptions.config;
+    const config: OrchestratorConfig = {
+      ...source,
+      store: this.store,
+      ...(source.channels ? { channels: [...source.channels] } : {}),
+      ...(source.clients ? { clients: [...source.clients] } : {}),
+      ...(source.retries ? { retries: { ...source.retries } } : {}),
+      ...(source.http ? { http: { ...source.http } } : {}),
+    };
+    this.options = { project: this.sourceOptions.project, config };
+    this.channels = (config.channels ?? []).map((definition) => ({
+      definition,
+      id: definition.id,
+      polls: definition.polls.map((poll) => ({ ...poll })),
+    }));
+    this.clients = (config.clients ?? []).map(snapshotClient);
+    this.logger = config.logger ?? consoleLogger;
+  }
+
+  private prepareStore(): void {
+    if (this.storePrepared) return;
+    this.store = this.sourceOptions.config.store ?? this.defaultStore;
+    this.storePrepared = true;
   }
 
   async start(options: StartOptions = {}): Promise<void> {
@@ -447,6 +542,8 @@ export class OrchestratorRuntime {
   }
 
   private async stopInternal(): Promise<void> {
+    if (this.initPromise) await Promise.allSettled([this.initPromise]);
+    for (const channel of this.channels) unbindChannelRuntime(channel.definition, this);
     const httpClose = this.closeHttpServer();
     this.abortController.abort();
     for (const handle of this.intervalHandles) clearInterval(handle);
@@ -461,6 +558,7 @@ export class OrchestratorRuntime {
       httpFailed = true;
       httpError = error;
     }
+    await this.settleMutationWork();
     let unmountError: unknown;
     let unmountFailed = false;
     try {
@@ -787,6 +885,12 @@ export class OrchestratorRuntime {
     }
   }
 
+  private async settleMutationWork(): Promise<void> {
+    while (this.mutationPromises.size > 0) {
+      await Promise.allSettled(this.mutationPromises);
+    }
+  }
+
   async drain(): Promise<void> {
     this.claimDrain();
     try {
@@ -821,7 +925,7 @@ export class OrchestratorRuntime {
     }
   }
 
-  async runOffline<T>(operation: (context: OfflineOperationContext) => Promise<T>): Promise<T> {
+  async runOffline<T>(operation: (context: OfflineOperationContext) => T | Promise<T>): Promise<T> {
     if (this.offlineOperationActive) throw new Error("An offline operation is already active on this runtime");
     if (this.lifecycleState !== "unused") {
       throw new Error("runOffline requires an unused one-shot runtime");
@@ -833,15 +937,57 @@ export class OrchestratorRuntime {
       this.offlineOperationActive = false;
       throw error;
     }
+    try {
+      await this.init();
+    } catch (error) {
+      let shutdownError: unknown;
+      let shutdownFailed = false;
+      try {
+        await this.shutdown();
+      } catch (caught) {
+        shutdownFailed = true;
+        shutdownError = caught;
+      } finally {
+        this.offlineOperationActive = false;
+      }
+      if (shutdownFailed) {
+        throw new AggregateError([error, shutdownError], "Offline initialization and runtime shutdown failed");
+      }
+      throw error;
+    }
     let result: T | undefined;
     let operationError: unknown;
     let operationFailed = false;
+    let contextActive = true;
+    const contextOperations = new Set<Promise<unknown>>();
+    const trackContextOperation = <T>(operation: () => Promise<T>): Promise<T> => {
+      if (!contextActive) {
+        return Promise.reject(new Error("Offline operation context is no longer active"));
+      }
+      const pending = operation();
+      contextOperations.add(pending);
+      void pending.catch(() => {});
+      return pending;
+    };
+    const context: OfflineOperationContext = {
+      dispatch: (channel, event) => trackContextOperation(() => typeof channel === "string"
+          ? this.dispatch(channel, event)
+          : this.dispatch(channel, event)),
+      drain: () => trackContextOperation(() => this.drainOwnedGuarded()),
+      endSession: (idOrKey, reason) => trackContextOperation(() => this.endSession(idOrKey, reason)),
+      retryDelivery: (id) => trackContextOperation(() => this.retryDelivery(id)),
+      pruneState: (options) => trackContextOperation(() => this.pruneState(options)),
+    };
     try {
-      result = await operation({ drain: () => this.drainOwnedGuarded() });
+      result = await operation(context);
     } catch (error) {
       operationFailed = true;
       operationError = error;
+    } finally {
+      contextActive = false;
     }
+
+    await Promise.allSettled(contextOperations);
 
     let stopError: unknown;
     let stopFailed = false;
@@ -887,82 +1033,108 @@ export class OrchestratorRuntime {
     this.drainInProgress = true;
   }
 
-  async dispatch(
-    channelId: string,
-    event: DispatchEvent,
-  ): Promise<{ status: "queued" | "duplicate"; eventId: string }> {
-    await this.init();
-    const channel = this.channels.find((candidate) => candidate.id === channelId);
-    if (!channel) throw new Error(`Unknown channel: ${channelId}`);
+  private assertMutationAllowed(): void {
+    const acceptedHttpWork = this.httpRequestContext.getStore()?.active === true;
+    if (this.lifecycleState === "stopped" || (this.lifecycleState === "stopping" && !acceptedHttpWork)) {
+      throw new Error("Cannot mutate a runtime after the runtime has been stopped");
+    }
+  }
 
-    return this.mutex.run(async () => {
-      const state = await this.store.read();
-      const sourceId = event.id;
-      const dedupeKey = `${channelId}:${event.dedupeKey ?? event.id}`;
-      const sessionKey = event.sessionKey ?? `${channelId}:${event.id}`;
-      const existing = state.events.find((stored) => stored.channelId === channelId && stored.dedupeKey === dedupeKey);
+  private runMutation<T>(operation: () => Promise<T>): Promise<T> {
+    this.assertMutationAllowed();
+    const pending = operation();
+    this.mutationPromises.add(pending);
+    void pending.then(
+      () => this.mutationPromises.delete(pending),
+      () => this.mutationPromises.delete(pending),
+    );
+    return pending;
+  }
 
-      if (existing) {
-        return { status: "duplicate", eventId: existing.id };
-      }
+  async dispatch(channel: ChannelDefinition, event: DispatchEvent): Promise<DispatchResult>;
+  async dispatch(channel: string, event: DispatchEvent): Promise<DispatchResult>;
+  async dispatch(channel: ChannelDefinition | string, event: DispatchEvent): Promise<DispatchResult>;
+  async dispatch(channel: ChannelDefinition | string, event: DispatchEvent): Promise<DispatchResult> {
+    return this.runMutation(async () => {
+      await this.init();
+      const registered = typeof channel === "string"
+        ? this.channels.find((candidate) => candidate.id === channel)
+        : this.channels.find((candidate) => candidate.definition === channel);
+      if (!registered) throw new Error(`Unknown channel: ${typeof channel === "string" ? channel : channel.id}`);
+      const channelId = registered.id;
 
-      const storedEvent: StoredEvent = {
-        id: newId("evt"),
-        channelId,
-        sourceId,
-        dedupeKey,
-        sessionKey,
-        type: event.type,
-        input: event.input,
-        payload: event.payload,
-        meta: event.meta,
-        occurredAt: normalizeDate(event.occurredAt),
-        receivedAt: nowIso(),
-      };
+      return this.mutex.run(async () => {
+        const state = await this.store.read();
+        const sourceId = event.id;
+        const dedupeKey = `${channelId}:${event.dedupeKey ?? event.id}`;
+        const sessionKey = event.sessionKey ?? `${channelId}:${event.id}`;
+        const existing = state.events.find((stored) => stored.channelId === channelId && stored.dedupeKey === dedupeKey);
 
-      state.events.push(storedEvent);
-
-      for (const client of this.clients) {
-        for (const handler of client.handlers.filter((candidate) => candidate.channelId === channelId)) {
-          const duplicateDelivery = state.deliveries.some(
-            (delivery) =>
-              delivery.eventId === storedEvent.id &&
-              delivery.clientId === client.id &&
-              delivery.handlerId === handler.id,
-          );
-          if (duplicateDelivery) continue;
-          state.deliveries.push({
-            id: newId("deliv"),
-            eventId: storedEvent.id,
-            channelId,
-            clientId: client.id,
-            handlerId: handler.id,
-            status: "pending",
-            attempts: 0,
-            maxAttempts: Math.max(1, handler.retries.attempts ?? this.options.config.retries?.attempts ?? 3),
-            retryDelayMs: parseRetryDelay(handler.retries.delay ?? this.options.config.retries?.delay ?? 0),
-            createdAt: nowIso(),
-            updatedAt: nowIso(),
-          });
+        if (existing) {
+          return { status: "duplicate", eventId: existing.id };
         }
-      }
 
-      await this.store.write(state);
-      return { status: "queued", eventId: storedEvent.id };
+        const storedEvent: StoredEvent = {
+          id: newId("evt"),
+          channelId,
+          sourceId,
+          dedupeKey,
+          sessionKey,
+          type: event.type,
+          input: event.input,
+          payload: event.payload,
+          meta: event.meta,
+          occurredAt: normalizeDate(event.occurredAt),
+          receivedAt: nowIso(),
+        };
+
+        state.events.push(storedEvent);
+
+        for (const client of this.clients) {
+          for (const handler of client.handlers.filter((candidate) => candidate.channelId === channelId)) {
+            const duplicateDelivery = state.deliveries.some(
+              (delivery) =>
+                delivery.eventId === storedEvent.id &&
+                delivery.clientId === client.id &&
+                delivery.handlerId === handler.id,
+            );
+            if (duplicateDelivery) continue;
+            state.deliveries.push({
+              id: newId("deliv"),
+              eventId: storedEvent.id,
+              channelId,
+              clientId: client.id,
+              handlerId: handler.id,
+              status: "pending",
+              attempts: 0,
+              maxAttempts: Math.max(1, handler.retries.attempts ?? this.options.config.retries?.attempts ?? 3),
+              retryDelayMs: parseRetryDelay(handler.retries.delay ?? this.options.config.retries?.delay ?? 0),
+              createdAt: nowIso(),
+              updatedAt: nowIso(),
+            });
+          }
+        }
+
+        await this.store.write(state);
+        return { status: "queued", eventId: storedEvent.id };
+      });
     });
   }
 
   async listSessions(): Promise<StoredSession[]> {
+    await this.init();
     const state = await this.store.read();
     return state.sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
   async getSession(idOrKey: string): Promise<StoredSession | undefined> {
+    await this.init();
     const state = await this.store.read();
     return state.sessions.find((session) => session.id === idOrKey || session.key === idOrKey);
   }
 
   async listSessionNotes(idOrKey: string): Promise<SessionNote[]> {
+    await this.init();
     const state = await this.store.read();
     const session = state.sessions.find((candidate) => candidate.id === idOrKey || candidate.key === idOrKey);
     if (!session) return [];
@@ -972,20 +1144,24 @@ export class OrchestratorRuntime {
   }
 
   async endSession(idOrKey: string, reason = "manual"): Promise<boolean> {
-    return this.mutex.run(async () => {
-      const state = await this.store.read();
-      const session = state.sessions.find((candidate) => candidate.id === idOrKey || candidate.key === idOrKey);
-      if (!session) return false;
-      session.status = "ended";
-      session.endedAt = nowIso();
-      session.endReason = reason;
-      session.updatedAt = nowIso();
-      await this.store.write(state);
-      return true;
+    return this.runMutation(async () => {
+      await this.init();
+      return this.mutex.run(async () => {
+        const state = await this.store.read();
+        const session = state.sessions.find((candidate) => candidate.id === idOrKey || candidate.key === idOrKey);
+        if (!session) return false;
+        session.status = "ended";
+        session.endedAt = nowIso();
+        session.endReason = reason;
+        session.updatedAt = nowIso();
+        await this.store.write(state);
+        return true;
+      });
     });
   }
 
   async listEvents(): Promise<{ event: StoredEvent; deliveries: StoredDelivery[] }[]> {
+    await this.init();
     const state = await this.store.read();
     return state.events
       .map((event) => ({
@@ -1001,31 +1177,36 @@ export class OrchestratorRuntime {
   }
 
   async pruneState(options: StatePruneOptions): Promise<StatePrunePlan> {
-    await this.init();
-    return this.mutex.run(async () => {
-      const state = await this.store.read();
-      const plan = planStatePrune(state, options);
-      if (plan.deliveryIds.length || plan.sessionIds.length || plan.noteIds.length || plan.eventIds.length) {
-        applyStatePrune(state, plan);
-        await this.store.write(state);
-      }
-      return plan;
+    return this.runMutation(async () => {
+      await this.init();
+      return this.mutex.run(async () => {
+        const state = await this.store.read();
+        const plan = planStatePrune(state, options);
+        if (plan.deliveryIds.length || plan.sessionIds.length || plan.noteIds.length || plan.eventIds.length) {
+          applyStatePrune(state, plan);
+          await this.store.write(state);
+        }
+        return plan;
+      });
     });
   }
 
   async retryDelivery(id: string): Promise<boolean> {
-    return this.mutex.run(async () => {
-      const state = await this.store.read();
-      const delivery = state.deliveries.find((candidate) => candidate.id === id);
-      if (!delivery || delivery.status !== "failed") return false;
-      delivery.status = "pending";
-      delivery.maxAttempts = Math.max(delivery.maxAttempts, delivery.attempts + 1);
-      delivery.lastError = undefined;
-      delivery.processedAt = undefined;
-      delivery.nextAttemptAt = undefined;
-      delivery.updatedAt = nowIso();
-      await this.store.write(state);
-      return true;
+    return this.runMutation(async () => {
+      await this.init();
+      return this.mutex.run(async () => {
+        const state = await this.store.read();
+        const delivery = state.deliveries.find((candidate) => candidate.id === id);
+        if (!delivery || delivery.status !== "failed") return false;
+        delivery.status = "pending";
+        delivery.maxAttempts = Math.max(delivery.maxAttempts, delivery.attempts + 1);
+        delivery.lastError = undefined;
+        delivery.processedAt = undefined;
+        delivery.nextAttemptAt = undefined;
+        delivery.updatedAt = nowIso();
+        await this.store.write(state);
+        return true;
+      });
     });
   }
 
@@ -1060,6 +1241,7 @@ export class OrchestratorRuntime {
   }
 
   private async ensureRuntimeOwnership(): Promise<void> {
+    this.prepareStore();
     const lockPath = this.store.runtimeLockPath;
     if (!lockPath || this.ownership) return;
     this.ownershipPromise ??= acquireRuntimeOwnership(lockPath);
@@ -1124,7 +1306,7 @@ export class OrchestratorRuntime {
     }
   }
 
-  private schedulePoll(channel: ChannelDefinition, poll: PollDefinition, index: number): Promise<void> {
+  private schedulePoll(channel: RuntimeChannel, poll: PollDefinition, index: number): Promise<void> {
     const cursorId = pollCursorId(channel.id, poll, index);
     const existing = this.pollPromises.get(cursorId);
     if (existing) return existing;
@@ -1135,7 +1317,7 @@ export class OrchestratorRuntime {
     return promise;
   }
 
-  private async runPoll(channel: ChannelDefinition, poll: PollDefinition, index: number): Promise<void> {
+  private async runPoll(channel: RuntimeChannel, poll: PollDefinition, index: number): Promise<void> {
     const cursorId = pollCursorId(channel.id, poll, index);
     const signal = this.abortController.signal;
     if (signal.aborted) return;
@@ -1187,7 +1369,7 @@ export class OrchestratorRuntime {
     }
   }
 
-  private async workerLoop(client: ClientDefinition): Promise<void> {
+  private async workerLoop(client: RuntimeClient): Promise<void> {
     const signal = this.abortController.signal;
     while (!signal.aborted) {
       const processed = await this.processNextDelivery(client);
@@ -1201,7 +1383,7 @@ export class OrchestratorRuntime {
     }
   }
 
-  private async processNextDelivery(client: ClientDefinition): Promise<boolean> {
+  private async processNextDelivery(client: RuntimeClient): Promise<boolean> {
     const claimed = await this.claimNextDelivery(client);
     if (!claimed) return false;
 
@@ -1218,7 +1400,7 @@ export class OrchestratorRuntime {
     return true;
   }
 
-  private async claimNextDelivery(client: ClientDefinition): Promise<ClaimedDelivery | undefined> {
+  private async claimNextDelivery(client: RuntimeClient): Promise<ClaimedDelivery | undefined> {
     return this.mutex.run(async () => {
       const state = await this.store.read();
       for (const delivery of state.deliveries) {
@@ -1268,7 +1450,7 @@ export class OrchestratorRuntime {
         event: orchestratorEvent,
         session: sessionImpl,
         environment,
-        client,
+        client: client.definition,
         project: this.project,
         logger: this.logger,
         attempt: delivery.attempts,
@@ -1459,7 +1641,7 @@ export class OrchestratorRuntime {
         });
       }
     } catch (error) {
-      const failedHooks: EnvironmentDefinition["unmountHooks"] = [];
+      const failedHooks: MountedEnvironment["pendingUnmountHooks"] = [];
       for (const hook of [...definition.unmountHooks].reverse()) {
         try {
           await hook({ environment: instance, project: this.project, logger: this.logger, signal: this.abortController.signal });
@@ -1483,7 +1665,7 @@ export class OrchestratorRuntime {
   private async unmountAllEnvironments(): Promise<void> {
     const errors: unknown[] = [];
     for (const [key, mounted] of [...this.environmentInstances.entries()].reverse()) {
-      const failedHooks: EnvironmentDefinition["unmountHooks"] = [];
+      const failedHooks: MountedEnvironment["pendingUnmountHooks"] = [];
       for (const hook of mounted.pendingUnmountHooks) {
         try {
           await hook({

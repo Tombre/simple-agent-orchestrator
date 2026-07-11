@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createChannel,
   createClient,
@@ -16,9 +16,28 @@ import {
   memoryStore,
   type Store,
 } from "../src/index.js";
-import { createTestRuntime } from "../src/testing/index.js";
+import { createTestRuntime as createUntrackedTestRuntime, type TestRuntime } from "../src/testing/index.js";
 import { emptyState } from "../src/stores/store.js";
 import { createRuntime, deferred, waitFor } from "./helpers.js";
+
+const activeTestRuntimes = new Set<TestRuntime>();
+
+async function createTestRuntime(
+  ...args: Parameters<typeof createUntrackedTestRuntime>
+): Promise<TestRuntime> {
+  const test = await createUntrackedTestRuntime(...args);
+  activeTestRuntimes.add(test);
+  return test;
+}
+
+afterEach(async () => {
+  const results = await Promise.allSettled([...activeTestRuntimes].map((test) => test.stop()));
+  activeTestRuntimes.clear();
+  const errors = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason);
+  if (errors.length) throw new AggregateError(errors, "Test runtime cleanup failed");
+});
 
 type OwnerMessage = { type: "ready"; pid: number } | { type: "error"; message: string };
 
@@ -1054,13 +1073,14 @@ describe("resource lifecycle", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("sandbox", { id: "event", sessionKey: "work" });
 
     expect(creates).toBe(1);
     expect(cleanups).toBe(1);
     expect(seenResources).toEqual(["workspace-1", "workspace-1", "workspace-1"]);
+    await test.stop();
   });
 
   it("retries sandbox creation failures before constructing a handler context", async () => {
@@ -1088,14 +1108,15 @@ describe("resource lifecycle", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("sandbox", { id: "event", sessionKey: "work" });
 
     expect(creates).toBe(2);
     expect(handles).toBe(1);
     expect(failures).toBe(0);
-    expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "processed", attempts: 2 });
+    expect((await test.deliveries.list())[0]).toMatchObject({ status: "processed", attempts: 2 });
+    await test.stop();
   });
 
   it("does not persist sandbox creation when its hook cooperatively times out", async () => {
@@ -1129,7 +1150,7 @@ describe("resource lifecycle", () => {
           },
         });
       });
-      const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+      const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
       const dispatch = test.dispatch("sandbox-timeout", { id: "event", sessionKey: "work" });
       await starts[0]!.promise;
@@ -1142,7 +1163,8 @@ describe("resource lifecycle", () => {
       expect(handles).toBe(0);
       expect(failures).toBe(0);
       expect(await test.sessions.get("work")).toMatchObject({ state: {} });
-      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "failed", attempts: 2 });
+      expect((await test.deliveries.list())[0]).toMatchObject({ status: "failed", attempts: 2 });
+      await test.stop();
     } finally {
       vi.useRealTimers();
     }
@@ -1234,7 +1256,7 @@ describe("resource lifecycle", () => {
         },
       });
     });
-    const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
     await test.dispatch("sandbox", { id: "event", sessionKey: "work" });
 
@@ -1248,6 +1270,7 @@ describe("resource lifecycle", () => {
       "success:2",
     ]);
     expect(await test.sessions.get("work")).toMatchObject({ status: "ended" });
+    await test.stop();
   });
 
   it("keeps the eager sandbox marker when cleanup cooperatively times out", async () => {
@@ -1279,7 +1302,7 @@ describe("resource lifecycle", () => {
           },
         });
       });
-      const test = await createTestRuntime({ config: { channels: [channel], clients: [client] } });
+      const test = await createTestRuntime({ channels: [channel], clients: [client] });
 
       const dispatch = test.dispatch("sandbox-cleanup-timeout", { id: "event", sessionKey: "work" });
       await cleanupStarted.promise;
@@ -1291,7 +1314,8 @@ describe("resource lifecycle", () => {
         status: "active",
         state: { "__sao.sandbox.workspace.created": true },
       });
-      expect((await test.events.list())[0]!.deliveries[0]).toMatchObject({ status: "failed", attempts: 1 });
+      expect((await test.deliveries.list())[0]).toMatchObject({ status: "failed", attempts: 1 });
+      await test.stop();
     } finally {
       vi.useRealTimers();
     }
