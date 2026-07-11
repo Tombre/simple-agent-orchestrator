@@ -1,6 +1,6 @@
 # Simple Agent Orchestrator
 
-Simple Agent Orchestrator helps you run event-driven AI agent code inside an existing Node.js project. You write the integration with your agent and source APIs; the package saves incoming events, retries failed handlers, and keeps context for related work.
+Simple Agent Orchestrator helps you run event-driven AI agent code inside an existing Node.js project. You write the integration with your agent and source APIs; the orchestrator saves incoming events, retries failed handlers, and keeps context for related work.
 
 ## Try it in five minutes
 
