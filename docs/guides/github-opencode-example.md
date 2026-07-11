@@ -227,6 +227,8 @@ Here's how those settings affect what you'll see:
 
 Both agent calls and `markReviewSeen` can repeat after a timeout, process interruption, cleanup error, or local save error. Their stable idempotency keys must cause your adapters and providers to return the earlier result rather than repeating the effect. Don't include the attempt number in those keys.
 
+This example awaits `sendToAgent`, so its two workers limit the calls currently in progress. If your adapter returns immediately while each coding agent keeps running, configure `client.capacity({ maxActiveSessions: 2 })` instead to retain those two slots until a completion event calls `capacity.release()` or ends the session. See [limit active fire-and-forget agents](clients.md#limit-active-fire-and-forget-agents).
+
 Acknowledgement belongs in `onSuccess` so GitHub isn't marked before the agent call succeeds. If you add other handlers for the same event, remember that each gets an independent delivery; this hook doesn't wait for those other handlers.
 
 ## 5. Register the client
@@ -274,7 +276,7 @@ For continuous polling and processing, run:
 npx simple-agent-orchestrator start
 ```
 
-The default JSON state file allows only one process to make changes at a time. Don't run `dispatch`, `events retry`, `sessions end`, or prune with `--apply` beside that process. Lists and shows are safe.
+The default JSON state file allows only one process to make changes at a time. Don't run `dispatch`, `events retry`, `sessions end`, `capacity release`, or prune with `--apply` beside that process. Lists and shows, including `capacity list`, are safe.
 
 ## 7. Decide when a pull request is finished
 

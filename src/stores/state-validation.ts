@@ -1,13 +1,14 @@
 import type {
   OrchestratorState,
   SessionNote,
+  StoredCapacityReservation,
   StoredDelivery,
   StoredEvent,
   StoredSession,
 } from "../core/types.js";
 import { isSupportedRetryDelay } from "../utils/time.js";
 
-export const CURRENT_STATE_VERSION = 3 as const;
+export const CURRENT_STATE_VERSION = 4 as const;
 export const MINIMUM_STATE_VERSION = 1 as const;
 const MAX_JSON_NESTING_DEPTH = 100;
 
@@ -244,6 +245,20 @@ function validateNote(value: unknown, index: number, source: string): asserts va
   if (value.data !== undefined) requireJsonValue(value.data, `${path}.data`, source);
 }
 
+function validateCapacityReservation(
+  value: unknown,
+  index: number,
+  source: string,
+): asserts value is StoredCapacityReservation {
+  const path = `state.capacityReservations[${index}]`;
+  requireRecord(value, path, source);
+  requireFields(value, ["id", "clientId", "sessionId", "acquiredAt"], [], path, source);
+  requireString(value.id, `${path}.id`, source);
+  requireString(value.clientId, `${path}.clientId`, source);
+  requireString(value.sessionId, `${path}.sessionId`, source);
+  requireTimestamp(value.acquiredAt, `${path}.acquiredAt`, source);
+}
+
 function requireUniqueIds(items: readonly { id: string }[], path: string, source: string): void {
   const ids = new Set<string>();
   items.forEach((item, index) => {
@@ -256,6 +271,7 @@ function validateRelationships(state: OrchestratorState, source: string): void {
   requireUniqueIds(state.sessions, "state.sessions", source);
   requireUniqueIds(state.events, "state.events", source);
   requireUniqueIds(state.deliveries, "state.deliveries", source);
+  requireUniqueIds(state.capacityReservations, "state.capacityReservations", source);
   requireUniqueIds(state.notes, "state.notes", source);
 
   const activeKeys = new Set<string>();
@@ -304,6 +320,25 @@ function validateRelationships(state: OrchestratorState, source: string): void {
       failure("invalid-state", source, `state.notes[${index}].sessionId references missing session ${JSON.stringify(note.sessionId)}.`);
     }
   });
+  const capacityIdentities = new Set<string>();
+  state.capacityReservations.forEach((reservation, index) => {
+    const session = sessions.get(reservation.sessionId);
+    if (!session) {
+      failure(
+        "invalid-state",
+        source,
+        `state.capacityReservations[${index}].sessionId references missing session ${JSON.stringify(reservation.sessionId)}.`,
+      );
+    }
+    if (session.status !== "active") {
+      failure("invalid-state", source, `state.capacityReservations[${index}] must reference an active session.`);
+    }
+    const identity = JSON.stringify([reservation.clientId, reservation.sessionId]);
+    if (capacityIdentities.has(identity)) {
+      failure("invalid-state", source, `state.capacityReservations[${index}] duplicates a clientId and sessionId identity.`);
+    }
+    capacityIdentities.add(identity);
+  });
 }
 
 export function validateAndMigrateState(value: unknown, source = "state"): OrchestratorState {
@@ -326,27 +361,41 @@ export function validateAndMigrateState(value: unknown, source = "state"): Orche
     );
   }
 
-  requireFields(value, ["version", "sessions", "events", "deliveries", "notes", "cursors"], [], "state", source);
+  requireFields(
+    value,
+    ["version", "sessions", "events", "deliveries", ...(version >= 4 ? ["capacityReservations"] : []), "notes", "cursors"],
+    [],
+    "state",
+    source,
+  );
   requireArray(value.sessions, "state.sessions", source);
   requireArray(value.events, "state.events", source);
   requireArray(value.deliveries, "state.deliveries", source);
   requireArray(value.notes, "state.notes", source);
   value.sessions.forEach((session, index) => validateSession(session, index, source));
   value.events.forEach((event, index) => validateEvent(event, index, source));
-  const deliveries = version < CURRENT_STATE_VERSION
+  const deliveries = version <= 2
     ? value.deliveries.map((delivery, index) => {
         validateDelivery(delivery, index, source, true);
         return { ...delivery, retryDelayMs: 0 };
       })
     : value.deliveries;
   deliveries.forEach((delivery, index) => validateDelivery(delivery, index, source));
+  const capacityReservations = version >= 4 ? value.capacityReservations : [];
+  requireArray(capacityReservations, "state.capacityReservations", source);
+  capacityReservations.forEach((reservation, index) => validateCapacityReservation(reservation, index, source));
   value.notes.forEach((note, index) => validateNote(note, index, source));
   requireRecord(value.cursors, "state.cursors", source);
   for (const [cursorId, cursor] of Object.entries(value.cursors)) {
     requireJsonRecord(cursor, `state.cursors.${cursorId}`, source);
   }
 
-  const state = { ...value, version: CURRENT_STATE_VERSION, deliveries } as unknown as OrchestratorState;
+  const state = {
+    ...value,
+    version: CURRENT_STATE_VERSION,
+    deliveries,
+    capacityReservations,
+  } as unknown as OrchestratorState;
   validateRelationships(state, source);
   return state;
 }

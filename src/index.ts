@@ -25,6 +25,7 @@ export type {
   ClientBuilder,
   ClientDefinition,
   EventHandler,
+  HandlerCapacity,
   HandlerContext,
   HandleOptions,
 } from "./core/client.js";
@@ -42,6 +43,7 @@ export type {
 
 export { defineKey, cursorKey, envKey, sessionKey } from "./core/types.js";
 export type {
+  CapacityOptions,
   ConcurrencyOptions,
   DispatchEvent,
   DispatchResult,
@@ -57,6 +59,7 @@ export type {
   SessionNote,
   StateKey,
   StoredDelivery,
+  StoredCapacityReservation,
   StoredEvent,
   StoredSession,
 } from "./core/types.js";

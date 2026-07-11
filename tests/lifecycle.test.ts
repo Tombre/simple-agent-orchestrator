@@ -117,6 +117,33 @@ async function waitForChildExit(owner: { child: ChildProcess; stderr: string[] }
 }
 
 describe("resource lifecycle", () => {
+  it("retains active capacity across runtime restarts", async () => {
+    const store = memoryStore();
+    const channel = createChannel("capacity-restart");
+    const started: string[] = [];
+    const client = createClient("agent", (builder) => {
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.handle(channel, ({ event }) => {
+        started.push(event.id);
+      });
+    });
+    const first = await createRuntime({ channels: [channel], clients: [client], store });
+    await first.dispatch(channel, { id: "first", sessionKey: "first-session" });
+    await first.drain();
+    await first.stop();
+
+    const second = await createRuntime({ channels: [channel], clients: [client], store });
+    await second.dispatch(channel, { id: "second", sessionKey: "second-session" });
+    await second.drain();
+
+    expect(started).toEqual(["first"]);
+    expect(await second.listCapacityReservations()).toHaveLength(1);
+    expect(await second.releaseCapacity("agent", "first-session")).toBe(true);
+    await second.drain();
+    expect(started).toEqual(["first", "second"]);
+    await second.stop();
+  });
+
   it("lets runtime shutdown win over a later handler deadline", async () => {
     const channel = createChannel("shutdown");
     const started = deferred();

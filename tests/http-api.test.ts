@@ -212,7 +212,7 @@ describe("HTTP webhook and operational API", () => {
     const occupied = await occupy(requestedPort);
     const now = "2026-07-10T10:00:00.000Z";
     const state: OrchestratorState = {
-      version: 3,
+      version: 4,
       events: ["a", "b", "c"].map((id) => ({
         id: `evt_${id}`,
         channelId: "summary",
@@ -248,6 +248,7 @@ describe("HTTP webhook and operational API", () => {
         updatedAt: now,
         ...(id === "a" ? { endedAt: now, endReason: "secret-reason" } : {}),
       })),
+      capacityReservations: [],
       notes: [{ id: "note", sessionId: "session_a", message: "secret-note", createdAt: now }],
       cursors: {},
     };

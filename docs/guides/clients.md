@@ -1,6 +1,6 @@
 # Process events with clients
 
-You've got events arriving on a channel. Now you want code to do something with them. A client groups the handlers for one consumer and gives you one place to control retries, timeouts, parallel work, and any shared process resources.
+You've got events arriving on a channel. Now you want code to do something with them. A client groups the handlers for one consumer and gives you one place to control retries, timeouts, active session capacity, parallel work, and any shared process resources.
 
 ## Handle your first event
 
@@ -49,6 +49,7 @@ Every handler receives:
 | `logger` | The configured logger. |
 | `attempt` | This delivery's current attempt number, starting at `1`. |
 | `signal` | Cancellation requested by shutdown or a handler timeout. |
+| `capacity` | The retained capacity slot for this client and session, when configured. |
 
 Pass `signal` to `fetch`, subprocesses, agent SDKs, and your own cancellation-aware functions. That gives your code a chance to stop cleanly during shutdown or after a timeout.
 
@@ -143,6 +144,37 @@ The timer covers sandbox creation, `handle`, `onSuccess`, and sandbox cleanup. W
 
 JavaScript can't force code to stop. If your code ignores `signal`, the runtime still has to wait for it, and an external operation may finish even though the attempt timed out. Pass the signal through and keep external calls safe to repeat. If shutdown and the timeout happen together, shutdown cancellation takes precedence.
 
+## Limit active fire-and-forget agents
+
+Suppose your handler starts an OpenCode session and returns while that agent keeps running. Worker concurrency can't limit those detached agents because the worker becomes free when the handler returns. Retained capacity can:
+
+```ts
+client.capacity({ maxActiveSessions: 5 });
+
+client.handle(tasksChannel, async ({ event, session }) => {
+  // Project-provided function. It returns after starting or messaging the agent.
+  await startOrMessageAgent(session.id, String(event.input));
+});
+```
+
+The first delivery for a client and session reserves one slot before the handler starts. At five reserved sessions, deliveries for a sixth session stay `pending` without consuming an attempt. Updates for the five existing sessions can still run and reuse their slots.
+
+The reservation remains after the handler returns and after failures, restarts, and shutdown. The runtime can't know whether an external launch completed just before an error, so it never guesses that a slot is safe to release.
+
+Use a completion channel on the same client when the external agent reports that it is done:
+
+```ts
+client.handle(agentCompletedChannel, ({ capacity }) => {
+  capacity.release();
+});
+```
+
+The completion event must use the original `sessionKey`. It can run while capacity is full because that client and session already hold a slot. `capacity.release()` is saved only when the completion attempt succeeds. It keeps the session active, so a later event can reserve capacity again.
+
+Calling `session.end()` after successful work releases every client's capacity reservation for that session. It does not stop any of those clients' external agents, so end a shared session only after all attached external work has stopped. Operators can also release one client's slot through the runtime API or offline CLI without ending the session.
+
+Capacity is disabled by default. `maxActiveSessions` must be a positive integer. Configure it only when one orchestrator session represents one external agent session; if one session launches several independent agents, a session-based limit cannot count them accurately.
+
 ## Process several events at once
 
 Clients start with one worker. Increase that when this client's handlers can safely overlap:
@@ -157,7 +189,7 @@ That same-session protection applies only to this client and only inside one run
 
 Without `perSession`, same-session handlers can overlap. Changes to different session keys are merged. If two successful attempts write the same key, the one that finishes last wins. Enable `perSession` when order matters, but remember it can't coordinate multiple processes.
 
-Client registrations and their retry, timeout, concurrency, and environment choices are captured when the runtime initializes. Create a new runtime after changing them. Also sanitize provider errors before logging or throwing them; default logs and saved delivery errors are plaintext.
+Client registrations and their capacity, retry, timeout, concurrency, and environment choices are captured when the runtime initializes. Create a new runtime after changing them. Also sanitize provider errors before logging or throwing them; default logs and saved delivery errors are plaintext.
 
 ## Next steps
 

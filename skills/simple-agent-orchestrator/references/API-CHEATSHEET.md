@@ -148,6 +148,8 @@ Retry `attempts` and fixed `delay` resolve independently from handler options, c
 
 Timeout resolves from handler `timeout`, the `client.timeout(...)` value captured at registration, global config `timeout`, then `0` (disabled). An explicit zero disables inheritance. It cooperatively aborts sandbox creation, `handle`, `onSuccess`, and sandbox cleanup with `HandlerTimeoutError`, then applies ordinary retries. Pass `signal` through to project APIs. Work that ignores cancellation is still awaited, and external side effects may repeat. Runtime shutdown wins if it aborts first.
 
+Retained capacity is disabled by default. `client.capacity({ maxActiveSessions: 5 })` reserves one durable slot per client and active session before the handler starts. New sessions stay pending without consuming an attempt when full; existing reserved sessions continue. Reservations survive handler return, failures, shutdown, and restart. A successful `capacity.release()` releases the current client's slot while `session.end()` releases all client slots for that session. Neither action stops external work.
+
 Handler context:
 
 ```ts
@@ -160,6 +162,7 @@ type HandlerContext = {
   logger: Logger;
   attempt: number;
   signal: AbortSignal;
+  capacity: { readonly reserved: boolean; release(): void };
 };
 ```
 
@@ -258,11 +261,11 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 3 is current; valid version 1 and 2 state is upgraded in memory with immediate retry defaults and persisted by the next successful write, while invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
+Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 4 is current; valid version 1 and 2 state gains immediate retry defaults and an empty capacity collection, while version 3 keeps its retry fields and gains the empty collection. The next successful write persists version 4; invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
 
 Use `runtime.previewStatePrune({ before })` to inspect conservative retention and `runtime.runOffline(({ pruneState }) => pruneState({ before }))` to apply it. The CLI equivalents are `state prune --before <timestamp>` and the same command with `--apply`. Processed deliveries and safely unreferenced ended sessions/notes are eligible; operational records, cursors, and active sandbox markers are preserved. Events remain as dedupe history unless `dropDedupe: true`/`--drop-dedupe` is explicit, which allows old source identities to dispatch again.
 
-The JSON store rejects a second active runtime or offline operation for the same state file and reclaims ownership left by a dead PID. Atomic first-run initialization and runtime ownership require a local filesystem with atomic hard-link support and fail explicitly when unavailable. CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` acquire ownership and fail before writing while `start` is active; inspection commands and retention preview remain available. Direct library mutations require an explicit `runtime.runOffline(...)` scope. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.
+The JSON store rejects a second active runtime or offline operation for the same state file and reclaims ownership left by a dead PID. Atomic first-run initialization and runtime ownership require a local filesystem with atomic hard-link support and fail explicitly when unavailable. CLI `dispatch`, `sessions end`, `capacity release`, `events retry`, and `state prune --apply` acquire ownership and fail before writing while `start` is active; inspection commands, including `capacity list`, and retention preview remain available. Direct library mutations require an explicit `runtime.runOffline(...)` scope. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.
 
 ## Runtime creation and offline work
 
@@ -284,6 +287,7 @@ await runtime.runOffline(async ({
   dispatch,
   drain,
   endSession,
+  releaseCapacity,
   retryDelivery,
   pruneState,
 }) => {
@@ -302,6 +306,8 @@ import { createTestRuntime } from "simple-agent-orchestrator/testing";
 const test = await createTestRuntime(config, { root: process.cwd() });
 await test.dispatch(channel, event); // drains by default
 await test.sessions.get("session-key");
+await test.capacity.list();
+await test.capacity.release("client-id", "session-key"); // drains by default
 await test.events.list();
 await test.deliveries.list();
 await test.readState();
@@ -312,6 +318,6 @@ Pass config as the first argument rather than nesting it in an options object. D
 
 ## CLI reminders
 
-The parser rejects unknown/duplicate flags, extra positionals, missing values, and missing required options. CLI dispatch requires `--id`. `sessions list` and `events list` accept `--json` and positive `--limit`; `events show <internal-event-id>` returns the event with deliveries. Use the internal ID returned by dispatch or `events list`, not the source ID. Missing show/end/retry targets exit nonzero.
+The parser rejects unknown/duplicate flags, extra positionals, missing values, and missing required options. CLI dispatch requires `--id`. `sessions list`, `capacity list`, and `events list` accept `--json` and positive `--limit`; `capacity release <client-id> <session-id-or-key>` is offline and drains newly available work. `events show <internal-event-id>` returns the event with deliveries. Use the internal ID returned by dispatch or `events list`, not the source ID. Missing show/end/retry targets exit nonzero.
 
 Persisted state and ordinary logs are plaintext. Built-in operational HTTP summaries omit body/state/error fields, but project middleware, routes, handlers, and logs are not automatically redacted.

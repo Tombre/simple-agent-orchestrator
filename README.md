@@ -51,6 +51,7 @@ For a complete first run, including a useful handler and an HTTP request, follow
 - A **client** subscribes a handler to a channel.
 - A **delivery** records one handler's attempts to process one event, including retries.
 - A **session** lets related events share state and notes, such as all comments on one pull request.
+- A client's optional **capacity** limit keeps only a configured number of long-running external agent sessions active while new sessions wait.
 - An **environment** gives a client process-local resources and can manage a session-specific sandbox, such as a worktree.
 - The **runtime** runs all of this in one process and can also serve HTTP.
 

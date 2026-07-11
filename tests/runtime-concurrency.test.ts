@@ -3,6 +3,40 @@ import { createChannel, createClient } from "../src/index.js";
 import { createRuntime, deferred, waitFor } from "./helpers.js";
 
 describe("runtime concurrency", () => {
+  it("atomically limits retained capacity when several workers claim new sessions", async () => {
+    const channel = createChannel("capacity");
+    const bothStarted = deferred();
+    const release = deferred();
+    const started: string[] = [];
+    const client = createClient("agent", (builder) => {
+      builder.capacity({ maxActiveSessions: 2 });
+      builder.concurrency({ workers: 4 });
+      builder.handle(channel, async ({ event }) => {
+        started.push(event.id);
+        if (started.length === 2) bothStarted.resolve();
+        await release.promise;
+      });
+    });
+    const runtime = await createRuntime({ channels: [channel], clients: [client] });
+    for (const id of ["one", "two", "three", "four"]) {
+      await runtime.dispatch("capacity", { id, sessionKey: id });
+    }
+
+    await runtime.start({ prettyStartupLog: false });
+    await bothStarted.promise;
+    expect(await runtime.listCapacityReservations()).toHaveLength(2);
+    release.resolve();
+    await waitFor(async () => {
+      const deliveries = (await runtime.listEvents()).flatMap(({ deliveries }) => deliveries);
+      expect(deliveries.filter(({ status }) => status === "processed")).toHaveLength(2);
+    });
+
+    expect(started).toEqual(["one", "two"]);
+    const deliveries = (await runtime.listEvents()).flatMap(({ deliveries }) => deliveries);
+    expect(deliveries.filter(({ status, attempts }) => status === "pending" && attempts === 0)).toHaveLength(2);
+    await runtime.stop();
+  });
+
   it("merges unrelated mutations from concurrent deliveries in one session", async () => {
     const channel = createChannel("concurrent");
     const bothStarted = deferred();

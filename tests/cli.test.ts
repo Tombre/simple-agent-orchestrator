@@ -91,6 +91,27 @@ export default defineConfig({ clients: [client] });
   return { root, stateFile: join(root, ".simple-agent-orchestrator", "state", "state.json") };
 }
 
+async function createCapacityFixture(): Promise<{ root: string; stateFile: string }> {
+  const root = await mkdtemp(join(tmpdir(), "sao-cli-capacity-"));
+  const configFile = join(root, ".simple-agent-orchestrator", "orchestrator.ts");
+  await mkdir(dirname(configFile), { recursive: true });
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "fixture", type: "module" }), "utf8");
+  const sourceImport = pathToFileURL(join(repositoryRoot, "src", "index.ts")).href;
+  await writeFile(
+    configFile,
+    `import { createManualChannel, createClient, defineConfig } from ${JSON.stringify(sourceImport)};
+const manual = createManualChannel("manual");
+const client = createClient("agent", (builder) => {
+  builder.capacity({ maxActiveSessions: 1 });
+  builder.handle(manual, ({ event, session }) => session.set("lastEvent", event.id));
+});
+export default defineConfig({ clients: [client] });
+`,
+    "utf8",
+  );
+  return { root, stateFile: join(root, ".simple-agent-orchestrator", "state", "state.json") };
+}
+
 describe("CLI", { timeout: 15_000 }, () => {
   it("initializes the nearest project without modifying package.json", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-cli-"));
@@ -193,11 +214,44 @@ describe("CLI", { timeout: 15_000 }, () => {
     expect(await runCli("sessions", "show", "work-1", "--root", root)).toContain('"endReason": "operator"');
   });
 
+  it("lists and releases retained capacity before draining queued sessions", async () => {
+    const { root } = await createCapacityFixture();
+    await runCli("dispatch", "manual", "--root", root, "--id", "first", "--session", "session-1");
+    await runCli("dispatch", "manual", "--root", root, "--id", "second", "--session", "session-2");
+
+    const before = JSON.parse(await runCli("capacity", "list", "--root", root, "--json")) as {
+      clientId: string;
+      sessionId: string;
+    }[];
+    expect(before).toHaveLength(1);
+    expect(before[0]?.clientId).toBe("agent");
+    expect(await runCli("events", "list", "--root", root)).toContain("pending");
+
+    const { runtime } = await loadProjectOrchestrator({ root });
+    await runtime.start({ http: false, prettyStartupLog: false });
+    try {
+      expect(await runCli("capacity", "list", "--root", root)).toContain("session-1");
+      const activeRelease = await runCliResult("capacity", "release", "agent", "session-1", "--root", root);
+      expect(activeRelease.failed).toBe(true);
+      expect(activeRelease.stderr).toContain("active orchestrator runtime");
+    } finally {
+      await runtime.stop();
+    }
+
+    expect(await runCli("capacity", "release", "agent", "session-1", "--root", root)).toContain("released");
+    expect(await runCli("events", "list", "--root", root)).not.toContain("pending");
+    expect(await runCli("capacity", "list", "--root", root)).toContain("session-2");
+    const duplicate = await runCliResult("capacity", "release", "agent", "session-1", "--root", root);
+    expect(duplicate.failed).toBe(true);
+    expect(duplicate.stderr).toContain("Capacity reservation not found");
+  });
+
   it("validates current and supported persisted state without rewriting it", async () => {
     const { root, stateFile } = await createFixture();
     await runCli("doctor", "--root", root);
     const state = JSON.parse(await readFile(stateFile, "utf8")) as Record<string, unknown>;
-    const versionOne = `${JSON.stringify({ ...state, version: 1 }, null, 2)}\n`;
+    const { capacityReservations: _capacityReservations, ...historicalState } = state;
+    const versionOne = `${JSON.stringify({ ...historicalState, version: 1 }, null, 2)}\n`;
     await writeFile(stateFile, versionOne, "utf8");
 
     expect(await runCli("state", "validate", "--root", root)).toContain("State is valid and compatible");
@@ -389,6 +443,7 @@ describe("CLI", { timeout: 15_000 }, () => {
 
   it("strictly validates command arguments and provides command help", async () => {
     expect(await runCli("dispatch", "--help")).toContain("dispatch <channel> --id <id>");
+    expect(await runCli("capacity", "release", "--help")).toContain("capacity release <client-id>");
     expect(await runCli("sessions", "list", "--help")).toContain("sessions list [--json]");
     for (const args of [
       ["doctor", "--unknown"],

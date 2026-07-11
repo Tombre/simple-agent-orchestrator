@@ -17,6 +17,7 @@ The package handles the plumbing around your handlers:
 - ignoring events you've already accepted, based on the channel and deduplication key
 - creating a separate processing record for each matching handler
 - tracking attempts, fixed-delay retries, and cooperative timeouts
+- retaining configured client capacity for external agent sessions after a handler returns
 - finding or creating a session so related events can share context
 - saving ordinary session updates and notes after successful work, while letting `session.ensure` save retry-safe setup earlier
 - remembering poll positions
@@ -40,6 +41,7 @@ Your project decides:
 - how to make outside actions safe to repeat
 - when to acknowledge an item back to its source
 - whether an agent should queue or combine messages
+- when an external agent has actually stopped and its retained capacity can be released
 - how project-specific resources, such as repositories and worktrees, should behave
 
 This split keeps the package useful without turning it into an agent SDK, provider integration, authorization layer, or hosted queue.

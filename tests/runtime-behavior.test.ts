@@ -30,6 +30,111 @@ afterEach(async () => {
 });
 
 describe("runtime behavior", () => {
+  it("retains client capacity after handlers return until the session capacity is released", async () => {
+    const startChannel = createChannel("start");
+    const completionChannel = createChannel("complete");
+    const started: string[] = [];
+    const completed: string[] = [];
+    const client = createClient("agent", (builder) => {
+      builder.capacity({ maxActiveSessions: 2 });
+      builder.handle(startChannel, ({ event }) => {
+        started.push(event.id);
+      });
+      builder.handle(completionChannel, ({ event, capacity }) => {
+        completed.push(event.id);
+        capacity.release();
+      });
+    });
+    const test = await createTestRuntime({
+      channels: [startChannel, completionChannel],
+      clients: [client],
+    });
+
+    await test.dispatch("start", { id: "first", sessionKey: "session-1" });
+    await test.dispatch("start", { id: "second", sessionKey: "session-2" });
+    await test.dispatch("start", { id: "third", sessionKey: "session-3" });
+
+    expect(started).toEqual(["first", "second"]);
+    expect(await test.capacity.list()).toHaveLength(2);
+    const thirdEvent = (await test.events.list()).find(({ event }) => event.sourceId === "third")!;
+    expect(thirdEvent.deliveries[0]).toMatchObject({ status: "pending", attempts: 0 });
+
+    await test.dispatch("complete", { id: "first-complete", sessionKey: "session-1" });
+
+    expect(completed).toEqual(["first-complete"]);
+    expect(started).toEqual(["first", "second", "third"]);
+    expect(await test.capacity.list()).toHaveLength(2);
+    expect((await test.sessions.get("session-1"))?.status).toBe("active");
+    expect((await test.events.get(thirdEvent.event.id))?.deliveries[0]).toMatchObject({
+      status: "processed",
+      attempts: 1,
+    });
+  });
+
+  it("retains capacity after a failed launch until an operator releases it", async () => {
+    const channel = createChannel("launch");
+    const started: string[] = [];
+    const client = createClient("agent", (builder) => {
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.handle(channel, {
+        retries: { attempts: 1 },
+        handle({ event }) {
+          started.push(event.id);
+          if (event.id === "uncertain") throw new Error("launch result unknown");
+        },
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    await test.dispatch("launch", { id: "uncertain", sessionKey: "first-session" });
+    await test.dispatch("launch", { id: "queued", sessionKey: "second-session" });
+
+    expect(started).toEqual(["uncertain"]);
+    expect(await test.capacity.list()).toHaveLength(1);
+    expect((await test.events.list()).find(({ event }) => event.sourceId === "queued")?.deliveries[0]).toMatchObject({
+      status: "pending",
+      attempts: 0,
+    });
+
+    expect(await test.capacity.release("agent", "first-session")).toBe(true);
+    expect(started).toEqual(["uncertain", "queued"]);
+    expect(await test.capacity.release("agent", "first-session")).toBe(false);
+  });
+
+  it("releases retained capacity when a session ends successfully", async () => {
+    const channel = createChannel("end");
+    const client = createClient("agent", (builder) => {
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.handle(channel, ({ session }) => session.end());
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    await test.dispatch("end", { id: "event", sessionKey: "one-session" });
+
+    expect((await test.sessions.get("one-session"))?.status).toBe("ended");
+    expect(await test.capacity.list()).toEqual([]);
+  });
+
+  it("releases every client's reservation when a shared session is ended administratively", async () => {
+    const channel = createChannel("shared-capacity");
+    const first = createClient("first", (builder) => {
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.handle(channel, () => {});
+    });
+    const second = createClient("second", (builder) => {
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.handle(channel, () => {});
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [first, second] });
+    await test.dispatch("shared-capacity", { id: "event", sessionKey: "shared-session" });
+    expect(await test.capacity.list()).toHaveLength(2);
+
+    expect(await test.runtime.endSession("shared-session", "operator")).toBe(true);
+
+    expect(await test.capacity.list()).toEqual([]);
+    expect(await test.sessions.get("shared-session")).toMatchObject({ status: "ended", endReason: "operator" });
+  });
+
   it("preserves event fields, scopes dedupe by channel, and fans out to every client", async () => {
     const firstChannel = createChannel("first");
     const secondChannel = createChannel("second");

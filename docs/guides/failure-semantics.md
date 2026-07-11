@@ -20,12 +20,13 @@ Dedupe does not make a handler safe to retry. Once a delivery exists, its extern
 For each delivery attempt, the runtime follows this order:
 
 1. Find an active session for the event's session key, or create one.
-2. Use the client's mounted environment.
-3. Create or reuse the session sandbox, if the environment defines one.
-4. Run `handle`.
-5. Run `onSuccess`.
-6. If the handler called `session.end()`, clean up that session's sandbox.
-7. Save the successful session changes and mark the delivery `processed`.
+2. Acquire or reuse its client capacity reservation, when configured.
+3. Use the client's mounted environment.
+4. Create or reuse the session sandbox, if the environment defines one.
+5. Run `handle`.
+6. Run `onSuccess`.
+7. If the handler called `session.end()`, clean up that session's sandbox.
+8. Save the successful session changes and mark the delivery `processed`.
 
 An error in sandbox creation, `handle`, `onSuccess`, sandbox cleanup, or saving the successful result fails the attempt. If attempts remain, the delivery returns to `pending` and starts again at step 1 after its configured delay.
 
@@ -114,6 +115,8 @@ The interrupted attempt still counts. If it had used the last configured attempt
 
 The runtime doesn't call `onFailure` for the interrupted run because that process is gone. It also can't know whether the external work completed. The replacement starts the full handler again, so all external actions still need repeat protection.
 
+The same uncertainty applies to retained capacity. If a capacity-configured handler fails, times out, or is interrupted after it may have launched an external agent, its session keeps the slot. Confirm that the external work has stopped before releasing that capacity through a completion handler, the runtime API, or the CLI.
+
 ## Retry manually when a person has fixed the cause
 
 Once a delivery reaches `failed`, an operator can retry it through the testing helper, runtime API, or CLI. Manual retry only applies to failed deliveries. It grants one more attempt that can run immediately; it doesn't reset the historical attempt count.
@@ -136,6 +139,6 @@ Events, session state, notes, cursor values, delivery errors, the JSON state fil
 
 ## Next steps
 
-- [Configure retries, timeouts, and concurrency](clients.md)
+- [Configure capacity, retries, timeouts, and concurrency](clients.md)
 - [Make sandbox creation and cleanup safe to repeat](environments-sandboxes.md#make-creation-and-cleanup-safe-to-repeat)
 - [Test failed attempts and manual retries](testing.md)

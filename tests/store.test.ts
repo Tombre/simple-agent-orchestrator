@@ -7,6 +7,7 @@ import {
   StateValidationError,
   jsonFileStore,
   memoryStore,
+  validateAndMigrateState,
 } from "../src/index.js";
 import { emptyState } from "../src/stores/store.js";
 import { initializeJsonStateFile } from "../src/stores/json-file.js";
@@ -108,6 +109,7 @@ describe("stores", () => {
       expect(migrated).toEqual({
         ...historical,
         version: CURRENT_STATE_VERSION,
+        capacityReservations: [],
         deliveries: historicalDeliveries.map((delivery) => ({
           ...delivery,
           retryDelayMs: 0,
@@ -119,6 +121,56 @@ describe("stores", () => {
       await jsonFileStore(path).write(migrated);
       expect((JSON.parse(await readFile(path, "utf8")) as { version: number }).version).toBe(CURRENT_STATE_VERSION);
     }
+  });
+
+  it("upgrades version 3 without reinterpreting its retry fields", async () => {
+    const fixturePath = join(import.meta.dirname, "fixtures", "state", "version-1.json");
+    const fixture = JSON.parse(await readFile(fixturePath, "utf8")) as Record<string, unknown>;
+    const deliveries = (fixture.deliveries as Record<string, unknown>[]).map((delivery) => ({
+      ...delivery,
+      retryDelayMs: 250,
+    }));
+    const versionThree = { ...fixture, version: 3, deliveries };
+
+    expect(validateAndMigrateState(versionThree)).toEqual({
+      ...versionThree,
+      version: CURRENT_STATE_VERSION,
+      capacityReservations: [],
+    });
+  });
+
+  it("validates durable capacity reservation identities and session references", () => {
+    const state = {
+      ...emptyState(),
+      sessions: [{
+        id: "session",
+        key: "work",
+        status: "active" as const,
+        state: {},
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      }],
+      capacityReservations: [{
+        id: "capacity",
+        clientId: "agent",
+        sessionId: "session",
+        acquiredAt: new Date(0).toISOString(),
+      }],
+    };
+
+    expect(validateAndMigrateState(state)).toEqual(state);
+    expect(() => validateAndMigrateState({
+      ...state,
+      capacityReservations: [...state.capacityReservations, { ...state.capacityReservations[0]!, id: "other" }],
+    })).toThrow("duplicates a clientId and sessionId identity");
+    expect(() => validateAndMigrateState({
+      ...state,
+      capacityReservations: [{ ...state.capacityReservations[0]!, sessionId: "missing" }],
+    })).toThrow("references missing session");
+    expect(() => validateAndMigrateState({
+      ...state,
+      sessions: [{ ...state.sessions[0]!, status: "ended" }],
+    })).toThrow("must reference an active session");
   });
 
   it.each([

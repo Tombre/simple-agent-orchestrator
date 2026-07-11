@@ -58,7 +58,7 @@ function delivery(
 
 function fixtureState(): OrchestratorState {
   return {
-    version: 3,
+    version: 4,
     sessions: [
       session("event-processed", "ended"),
       session("event-pending", "ended"),
@@ -85,6 +85,7 @@ function fixtureState(): OrchestratorState {
       delivery("delivery-failed", "event-failed", "failed", "event-failed"),
       delivery("delivery-recent", "event-recent", "processed", "event-recent"),
     ],
+    capacityReservations: [],
     notes: [
       { id: "note-processed", sessionId: "event-processed", message: "old", createdAt: old },
       { id: "note-pending", sessionId: "event-pending", message: "needed", createdAt: old },

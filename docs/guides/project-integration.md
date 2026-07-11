@@ -168,7 +168,7 @@ The CLI and programmatic `createRuntime()` use this JSON file by default:
 
 It can contain event bodies, session state, notes, poll positions, and delivery errors in plaintext. Avoid credentials and source data you don't need.
 
-The JSON store prevents another `start()`, `drain()`, or `runOffline()` operation from owning the same file. Stop the running orchestrator before using commands such as `dispatch`, `sessions end`, `events retry`, or `state prune --apply`.
+The JSON store prevents another `start()`, `drain()`, or `runOffline()` operation from owning the same file. Stop the running orchestrator before using commands such as `dispatch`, `sessions end`, `capacity release`, `events retry`, or `state prune --apply`.
 
 For programmatic one-off changes, use a fresh runtime and `runOffline()`. Calling mutation methods on a runtime that is only initialized does not acquire the file lock by itself.
 

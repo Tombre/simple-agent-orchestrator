@@ -29,7 +29,7 @@ Read [the design principles](docs/design-principles.md) before changing project 
 - **Poll and cursor**: a poll fetches source items and optionally maps them to dispatch events. Its durable cursor records source progress.
 - **Event**: the durable input unit. Source IDs, dedupe keys, and session keys are separate identities and must be chosen deliberately.
 - **Delivery**: one event's processing record for one matching client handler. Fan-out creates multiple independent deliveries.
-- **Client**: a globally identified consumer that registers handlers, concurrency policy, retry defaults, and at most one environment.
+- **Client**: a globally identified consumer that registers handlers, optional retained session capacity, concurrency policy, retry defaults, and at most one environment.
 - **Handler**: a client's subscription to a channel. It owns `handle`, `onSuccess`, `onFailure`, and an optional retry override.
 - **Session**: durable continuity for a `sessionKey`. It stores typed state and notes across related deliveries; only active sessions are reused.
 - **Environment**: process-local resources mounted for a client. Values are not durable and environment definitions may own one sandbox lifecycle.
@@ -78,12 +78,12 @@ The installable coding-agent skill is [skills/simple-agent-orchestrator/SKILL.md
 2. Dispatch defaults `dedupeKey` to `event.id` and `sessionKey` to `${channelId}:${event.id}`.
 3. Dedupe is scoped to `channelId + dedupeKey`.
 4. A new event creates one pending delivery for every matching client handler.
-5. A worker claims a delivery, increments its attempt, and resolves or creates an active session.
+5. A worker claims a delivery, resolves or creates its active session, atomically acquires or reuses configured client capacity, and increments the attempt.
 6. The runtime ensures the client environment is mounted and creates its sandbox if needed.
 7. The runtime calls `handle`, then `onSuccess`.
-8. Success persists session mutations and notes and marks the delivery `processed`.
-9. Failure calls `onFailure`, records the error, and returns the delivery to `pending` or marks it `failed`.
-10. Ended sessions remain as history; a later event with the same key creates a new active session.
+8. Success persists session mutations, notes, and requested capacity release and marks the delivery `processed`.
+9. Failure calls `onFailure`, records the error, and returns the delivery to `pending` or marks it `failed`; retained capacity remains reserved.
+10. Ended sessions remain as history and release their capacity reservations; a later event with the same key creates a new active session.
 
 ## Behavioral Invariants
 
@@ -107,6 +107,9 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Handler timeout resolves through handler override, client default captured at handler registration, config default, then zero (disabled); an explicit zero disables inheritance.
 - Handler timeout cooperatively aborts sandbox creation, `handle`, `onSuccess`, and sandbox cleanup, records `HandlerTimeoutError`, and uses ordinary retry and rollback behavior.
 - Positive fixed retry delays persist on deliveries; delayed work remains `pending` with `nextAttemptAt`, normal workers honor eligibility, and drains do not wait for future work.
+- Configured capacity is one durable reservation per client and active session. New-session deliveries remain pending without consuming an attempt when the client is full; deliveries for reserved sessions may continue.
+- Capacity reservations survive handler return, failure, timeout, interruption, shutdown, and restart. Successful `capacity.release()` releases the current client's reservation, while successful or administrative session end releases every reservation for that session.
+- Capacity release never cancels external work. Integrations must confirm that a detached agent has stopped before releasing its slot.
 - `handle` runs before `onSuccess`. An error from either fails the attempt.
 - `onFailure` runs when a handler context exists; an error from `onFailure` is logged and does not replace the delivery error.
 - Manual retry applies only to `failed` deliveries and grants one immediately eligible additional attempt.
@@ -126,7 +129,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - A named poll's cursor identity is `${channelId}:${pollId}` and remains stable when registrations move. An unnamed poll uses `${channelId}:${pollRegistrationIndex}`; reordering unnamed polls can reinterpret persisted cursors.
 - `memoryStore` isolates reads and writes by cloning.
 - `jsonFileStore` validates the full snapshot before runtime work and writes, does not replace invalid state, and writes via temporary file plus rename.
-- State version 3 is current. Structurally valid version 1 and 2 snapshots migrate deterministically in memory with immediate retry defaults and persist as version 3 on the next successful write; inspection does not rewrite them.
+- State version 4 is current. Structurally valid version 1 and 2 snapshots migrate deterministically in memory with immediate retry defaults and an empty capacity collection; version 3 retains its retry fields and gains the empty collection. The next successful write persists version 4; inspection does not rewrite older state.
 - Persisted event, session, note, and cursor values must be JSON-safe when using `jsonFileStore`.
 - Dispatch may return `queued` with no matching handlers. Sessions are created only when a delivery is processed.
 - State pruning is explicit and preview-first. It removes only old processed deliveries and safely unreferenced ended sessions/notes, preserves cursors and operational records, preserves sessions with active sandbox markers, and retains event dedupe unless the operator explicitly drops it.
@@ -149,11 +152,12 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Runtime shutdown wins over a later attempt timeout; cancellation-aware work is awaited in both cases.
 - `workers` controls in-process parallelism.
 - `perSession: true` serializes same-session deliveries for that client only within one runtime process; every participating client must opt in for runtime-wide same-session serialization.
+- Retained capacity limits active sessions for one client in the saved state; it is separate from currently executing workers and has no automatic expiry.
 - Session merging, `session.ensure`, sandbox locks, poll locks, and `StoreMutex` provide only in-process coordination.
 - Sandbox creation and cleanup are serialized per session/environment in one process.
 - Sandbox cleanup runs only after `handle` and `onSuccess` succeed and the handler called `session.end()`.
 - Keep external side effects idempotent because delivery state and external systems are not one transaction.
-- CLI `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline operations that fail before writing while a `jsonFileStore` runtime owns the state. Inspection and retention preview remain available; direct library mutations need an explicit `runtime.runOffline(...)` scope.
+- CLI `dispatch`, `sessions end`, `capacity release`, `events retry`, and `state prune --apply` are offline operations that fail before writing while a `jsonFileStore` runtime owns the state. Inspection, `capacity list`, and retention preview remain available; direct library mutations need an explicit `runtime.runOffline(...)` scope.
 
 ## Accepted Limitations
 
@@ -164,6 +168,7 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - There is no distributed worker coordination or distributed per-session lock.
 - Processing is not exactly once, and retries can repeat external side effects.
 - Retries support only a fixed delay; there is no backoff, jitter, arbitrary schedule, or dead-letter queue.
+- Retained capacity has no TTL or external-agent reconciliation. Failed or abandoned launches can hold a slot until explicit release or session end.
 - Handler timeouts are cooperative. JavaScript that ignores cancellation cannot be forcefully terminated and external side effects may already have occurred.
 - Only memory and JSON-file stores ship.
 - There is no automatic retention, archival, or background compaction policy.

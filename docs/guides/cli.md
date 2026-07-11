@@ -128,6 +128,24 @@ The table gives you both kinds of IDs:
 
 Each delivery shows its client, handler, status, attempt count, and the time a delayed retry can run. Use `--json` or `events show` for complete records, including recorded errors.
 
+## Inspect and release retained capacity
+
+When a client uses `client.capacity(...)`, inspect the sessions currently holding its slots:
+
+```bash
+npx simple-agent-orchestrator capacity list \
+  [--json] [--limit <count>] [--root <path>] [--config <path>]
+```
+
+Listing is read-only and can run beside `start`. To release a slot from the CLI, stop the long-running process first:
+
+```bash
+npx simple-agent-orchestrator capacity release <client-id> <session-id-or-key> \
+  [--root <path>] [--config <path>]
+```
+
+Release keeps the session active, processes work that can now run, and prints `released`. It does not stop or cancel the external agent. For a live completion callback, dispatch an event with the original session key to a handler that calls `capacity.release()` instead of trying to modify the JSON state from a second process.
+
 ## End a session or retry failed work
 
 Stop the long-running `start` process before running commands that change the JSON state file:
@@ -140,7 +158,7 @@ npx simple-agent-orchestrator events retry <delivery-id> \
   [--root <path>] [--config <path>]
 ```
 
-`sessions end` records the end reason, which defaults to `manual`. It does not call sandbox cleanup. If ending a session must remove an external worktree or container, arrange that through a handler or your own maintenance process.
+`sessions end` records the end reason, which defaults to `manual`, and releases the session's retained capacity. It does not call sandbox cleanup or stop external agents. If ending a session must remove an external worktree, container, or agent, arrange that through a handler or your own maintenance process.
 
 `events retry` works only for a delivery whose status is `failed`. It grants one additional attempt, makes it runnable immediately, processes ready work, and prints `retried`. It takes a delivery ID even though the command sits under `events`.
 
@@ -180,7 +198,7 @@ After those event records are removed, sending the same channel and ID can run t
 
 The default local store allows one process at a time to make changes. This is a guard for one machine and one running orchestrator, not coordination between machines.
 
-Read-only commands such as lists, shows, validation, and prune previews can run while `start` is active. `dispatch`, `sessions end`, `events retry`, and prune with `--apply` fail before writing until the running process stops.
+Read-only commands such as lists, shows, `capacity list`, validation, and prune previews can run while `start` is active. `dispatch`, `sessions end`, `capacity release`, `events retry`, and prune with `--apply` fail before writing until the running process stops.
 
 The state file and CLI JSON output can contain event bodies, session state, notes, cursor values, and errors as plaintext. Keep them out of logs and support bundles unless the contents are safe to share.
 

@@ -7,6 +7,7 @@ import type {
   OrchestratorState,
   ProjectContext,
   SessionNote,
+  StoredCapacityReservation,
   StoredDelivery,
   StoredEvent,
   StoredSession,
@@ -48,6 +49,10 @@ export interface TestRuntime {
     list(): Promise<StoredSession[]>;
     get(idOrKey: string): Promise<StoredSession | undefined>;
     notes(idOrKey: string): Promise<SessionNote[]>;
+  };
+  readonly capacity: {
+    list(): Promise<StoredCapacityReservation[]>;
+    release(clientId: string, sessionIdOrKey: string, options?: { drain?: boolean }): Promise<boolean>;
   };
   readonly events: {
     list(): Promise<TestEventRecord[]>;
@@ -113,6 +118,15 @@ export async function createTestRuntime(
       list: () => runtime.listSessions(),
       get: (idOrKey) => runtime.getSession(idOrKey),
       notes: (idOrKey) => runtime.listSessionNotes(idOrKey),
+    },
+    capacity: {
+      list: () => runtime.listCapacityReservations(),
+      async release(clientId, sessionIdOrKey, releaseOptions = {}) {
+        assertRunning();
+        const released = await runtime.releaseCapacity(clientId, sessionIdOrKey);
+        if (released && (releaseOptions.drain ?? true)) await runtime.drain();
+        return released;
+      },
     },
     events: {
       list: () => runtime.listEvents(),

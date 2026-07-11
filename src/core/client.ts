@@ -1,6 +1,7 @@
 import type { ChannelDefinition } from "./channel.js";
 import type { EnvironmentDefinition, EnvironmentInstance } from "./environment.js";
 import type {
+  CapacityOptions,
   ConcurrencyOptions,
   Logger,
   OrchestratorEvent,
@@ -22,6 +23,12 @@ export interface HandlerContext<
   logger: Logger;
   attempt: number;
   signal: AbortSignal;
+  capacity: HandlerCapacity;
+}
+
+export interface HandlerCapacity {
+  readonly reserved: boolean;
+  release(): void;
 }
 
 export type EventHandler<
@@ -56,6 +63,7 @@ export interface RegisteredHandler {
 
 export interface ClientBuilder {
   useEnvironment(environment: EnvironmentDefinition): void;
+  capacity(options: CapacityOptions): void;
   concurrency(options: ConcurrencyOptions): void;
   retries(options: RetryOptions): void;
   timeout(value: number | string): void;
@@ -73,6 +81,7 @@ export interface ClientDefinition {
   readonly id: string;
   readonly handlers: readonly RegisteredHandler[];
   readonly environment?: EnvironmentDefinition | undefined;
+  readonly capacityOptions?: Readonly<CapacityOptions> | undefined;
   readonly concurrencyOptions: Readonly<Required<ConcurrencyOptions>>;
   readonly retryOptions: Readonly<RetryOptions>;
   readonly timeout?: number | string | undefined;
@@ -81,6 +90,7 @@ export interface ClientDefinition {
 export function createClient(id: string, setup: (client: ClientBuilder) => void): ClientDefinition {
   const handlers: RegisteredHandler[] = [];
   let environment: EnvironmentDefinition | undefined;
+  let capacityOptions: CapacityOptions | undefined;
   let concurrencyOptions: Required<ConcurrencyOptions> = { workers: 1, perSession: false };
   let retryOptions: RetryOptions = {};
   let timeout: number | string | undefined;
@@ -88,6 +98,12 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
   const builder: ClientBuilder = {
     useEnvironment(next) {
       environment = next;
+    },
+    capacity(options) {
+      if (!Number.isSafeInteger(options.maxActiveSessions) || options.maxActiveSessions < 1) {
+        throw new Error("Capacity maxActiveSessions must be a positive integer");
+      }
+      capacityOptions = { maxActiveSessions: options.maxActiveSessions };
     },
     concurrency(options) {
       concurrencyOptions = {
@@ -133,6 +149,7 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
     id,
     handlers: [...handlers],
     environment,
+    capacityOptions,
     concurrencyOptions,
     retryOptions,
     timeout,

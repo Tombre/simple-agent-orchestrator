@@ -131,6 +131,13 @@ export interface StoredDelivery {
   sessionId?: string | undefined;
 }
 
+export interface StoredCapacityReservation {
+  id: string;
+  clientId: string;
+  sessionId: string;
+  acquiredAt: string;
+}
+
 export interface SessionNote {
   id: string;
   sessionId: string;
@@ -140,10 +147,11 @@ export interface SessionNote {
 }
 
 export interface OrchestratorState {
-  version: 3;
+  version: 4;
   sessions: StoredSession[];
   events: StoredEvent[];
   deliveries: StoredDelivery[];
+  capacityReservations: StoredCapacityReservation[];
   notes: SessionNote[];
   cursors: Record<string, Record<string, unknown>>;
 }
@@ -163,6 +171,10 @@ export interface RetryOptions {
 export interface ConcurrencyOptions {
   workers?: number;
   perSession?: boolean;
+}
+
+export interface CapacityOptions {
+  maxActiveSessions: number;
 }
 
 export interface ProjectContext {

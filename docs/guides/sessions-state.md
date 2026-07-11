@@ -84,6 +84,8 @@ An attempt isn't successful until `handle`, `onSuccess`, required sandbox cleanu
 
 If handlers for the same session overlap, successful changes to different keys are merged. If they write the same key, whichever attempt completes last wins. Set `perSession: true` on every participating client when you need one-at-a-time processing, and remember that this only coordinates work inside one runtime process. See [control concurrency](clients.md#process-several-events-at-once).
 
+Ending a session also releases every retained capacity reservation attached to it. It does not stop any client's external agent, so end shared sessions only after all attached external work has stopped. Calling `capacity.release()` from a handler is different: it releases only the current client's slot and keeps the session active.
+
 If one handler ends a session while another is finishing, the later completion can't make the ended session active again.
 
 ## Leave a useful history for people

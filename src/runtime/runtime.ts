@@ -25,6 +25,7 @@ import type {
   OrchestratorState,
   ProjectContext,
   SessionNote,
+  StoredCapacityReservation,
   StoredDelivery,
   StoredEvent,
   StoredSession,
@@ -63,6 +64,7 @@ export interface OfflineOperationContext {
   dispatch(channel: ChannelDefinition | string, event: DispatchEvent): Promise<DispatchResult>;
   drain(): Promise<void>;
   endSession(idOrKey: string, reason?: string): Promise<boolean>;
+  releaseCapacity(clientId: string, sessionIdOrKey: string): Promise<boolean>;
   retryDelivery(id: string): Promise<boolean>;
   pruneState(options: StatePruneOptions): Promise<StatePrunePlan>;
 }
@@ -80,6 +82,7 @@ interface RuntimeClient extends ClientDefinition {
 interface ClaimedDelivery {
   delivery: StoredDelivery;
   event: StoredEvent;
+  session: StoredSession;
   handler: RegisteredHandler;
   client: RuntimeClient;
 }
@@ -366,6 +369,7 @@ function snapshotClient(client: ClientDefinition): RuntimeClient {
       retries: { ...handler.retries },
     })),
     ...(client.environment ? { environment: snapshotEnvironment(client.environment) } : {}),
+    ...(client.capacityOptions ? { capacityOptions: { ...client.capacityOptions } } : {}),
     concurrencyOptions: { ...client.concurrencyOptions },
     retryOptions: { ...client.retryOptions },
     ...(client.timeout === undefined ? {} : { timeout: client.timeout }),
@@ -985,6 +989,9 @@ export class OrchestratorRuntime {
           : this.dispatch(channel, event)),
       drain: () => trackContextOperation(() => this.drainOwnedGuarded()),
       endSession: (idOrKey, reason) => trackContextOperation(() => this.endSession(idOrKey, reason)),
+      releaseCapacity: (clientId, sessionIdOrKey) => trackContextOperation(
+        () => this.releaseCapacity(clientId, sessionIdOrKey),
+      ),
       retryDelivery: (id) => trackContextOperation(() => this.retryDelivery(id)),
       pruneState: (options) => trackContextOperation(() => this.pruneState(options)),
     };
@@ -1153,6 +1160,32 @@ export class OrchestratorRuntime {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
+  async listCapacityReservations(): Promise<StoredCapacityReservation[]> {
+    await this.init();
+    const state = await this.store.read();
+    return state.capacityReservations
+      .map((reservation) => ({ ...reservation }))
+      .sort((a, b) => a.acquiredAt.localeCompare(b.acquiredAt));
+  }
+
+  async releaseCapacity(clientId: string, sessionIdOrKey: string): Promise<boolean> {
+    return this.runMutation(async () => {
+      await this.init();
+      return this.mutex.run(async () => {
+        const state = await this.store.read();
+        const reservationIndex = state.capacityReservations.findIndex((reservation) => {
+          if (reservation.clientId !== clientId) return false;
+          const session = state.sessions.find(({ id }) => id === reservation.sessionId);
+          return session?.id === sessionIdOrKey || session?.key === sessionIdOrKey;
+        });
+        if (reservationIndex === -1) return false;
+        state.capacityReservations.splice(reservationIndex, 1);
+        await this.store.write(state);
+        return true;
+      });
+    });
+  }
+
   async endSession(idOrKey: string, reason = "manual"): Promise<boolean> {
     return this.runMutation(async () => {
       await this.init();
@@ -1164,6 +1197,7 @@ export class OrchestratorRuntime {
         session.endedAt = nowIso();
         session.endReason = reason;
         session.updatedAt = nowIso();
+        state.capacityReservations = state.capacityReservations.filter(({ sessionId }) => sessionId !== session.id);
         await this.store.write(state);
         return true;
       });
@@ -1229,6 +1263,11 @@ export class OrchestratorRuntime {
       store: this.store.name,
       channels: this.channels.map((channel) => channel.id),
       clients: this.clients.map((client) => client.id),
+      capacity: this.clients.flatMap((client) => client.capacityOptions ? [{
+        clientId: client.id,
+        maxActiveSessions: client.capacityOptions.maxActiveSessions,
+        activeSessions: state.capacityReservations.filter(({ clientId }) => clientId === client.id).length,
+      }] : []),
       http: {
         enabled: this.options.config.http?.enabled ?? true,
         hostname: this.options.config.http?.hostname ?? DEFAULT_HTTP_HOSTNAME,
@@ -1423,15 +1462,49 @@ export class OrchestratorRuntime {
         const handler = client.handlers.find((candidate) => candidate.id === delivery.handlerId);
         if (!handler) continue;
 
+        let session = state.sessions.find(
+          (candidate) => candidate.key === event.sessionKey && candidate.status === "active",
+        );
+        const existingSessionId = session?.id;
+        let reservation = existingSessionId
+          ? state.capacityReservations.find(
+              (candidate) => candidate.clientId === client.id && candidate.sessionId === existingSessionId,
+            )
+          : undefined;
+        if (client.capacityOptions && !reservation) {
+          const active = state.capacityReservations.filter(({ clientId }) => clientId === client.id).length;
+          if (active >= client.capacityOptions.maxActiveSessions) continue;
+        }
+        if (!session) {
+          session = createStoredSession(event.sessionKey);
+          state.sessions.push(session);
+        }
+        if (client.capacityOptions && !reservation) {
+          reservation = {
+            id: newId("cap"),
+            clientId: client.id,
+            sessionId: session.id,
+            acquiredAt: nowIso(),
+          };
+          state.capacityReservations.push(reservation);
+        }
+
         delivery.status = "processing";
         delivery.attempts += 1;
         delivery.nextAttemptAt = undefined;
         const claimedAt = nowIso();
         delivery.startedAt = claimedAt;
         delivery.updatedAt = claimedAt;
+        delivery.sessionId = session.id;
         await this.store.write(state);
         if (client.concurrencyOptions.perSession) this.processingSessionKeys.add(event.sessionKey);
-        return { delivery: { ...delivery }, event: { ...event }, handler, client };
+        return {
+          delivery: { ...delivery },
+          event: { ...event },
+          session: { ...session, state: { ...session.state } },
+          handler,
+          client,
+        };
       }
       return undefined;
     });
@@ -1442,10 +1515,10 @@ export class OrchestratorRuntime {
     let sessionImpl: SessionImpl | undefined;
     let handlerContext: HandlerContext | undefined;
     let attemptSignal: AttemptSignal | undefined;
+    let releaseCapacity = false;
 
     try {
-      const session = await this.resolveSession(event.sessionKey, delivery.id);
-      sessionImpl = new SessionImpl(session, (sessionInstance, name, factory) =>
+      sessionImpl = new SessionImpl(claimed.session, (sessionInstance, name, factory) =>
         this.coordinateEnsure(sessionInstance, name, factory),
       );
 
@@ -1465,6 +1538,13 @@ export class OrchestratorRuntime {
         logger: this.logger,
         attempt: delivery.attempts,
         signal: attemptSignal.signal,
+        capacity: {
+          reserved: client.capacityOptions !== undefined,
+          release() {
+            if (!client.capacityOptions) throw new Error(`Client ${client.id} does not have retained capacity`);
+            releaseCapacity = true;
+          },
+        },
       };
 
       await handler.handle(handlerContext);
@@ -1478,7 +1558,7 @@ export class OrchestratorRuntime {
       }
 
       attemptSignal.dispose();
-      await this.persistSuccess(delivery.id, sessionImpl);
+      await this.persistSuccess(delivery.id, client.id, sessionImpl, releaseCapacity);
     } catch (error) {
       const failure = attemptSignal?.timeoutError ?? error;
       attemptSignal?.cancelTimeout();
@@ -1512,24 +1592,6 @@ export class OrchestratorRuntime {
       occurredAt: event.occurredAt,
       receivedAt: event.receivedAt,
     };
-  }
-
-  private async resolveSession(sessionKey: string, deliveryId: string): Promise<StoredSession> {
-    return this.mutex.run(async () => {
-      const state = await this.store.read();
-      let session = state.sessions.find((candidate) => candidate.key === sessionKey && candidate.status === "active");
-      if (!session) {
-        session = createStoredSession(sessionKey);
-        state.sessions.push(session);
-      }
-      const delivery = state.deliveries.find((candidate) => candidate.id === deliveryId);
-      if (delivery) {
-        delivery.sessionId = session.id;
-        delivery.updatedAt = nowIso();
-      }
-      await this.store.write(state);
-      return { ...session, state: { ...session.state } };
-    });
   }
 
   private async coordinateEnsure<T>(
@@ -1577,11 +1639,23 @@ export class OrchestratorRuntime {
     }
   }
 
-  private async persistSuccess(deliveryId: string, session: SessionImpl): Promise<void> {
+  private async persistSuccess(
+    deliveryId: string,
+    clientId: string,
+    session: SessionImpl,
+    releaseCapacity: boolean,
+  ): Promise<void> {
     await this.mutex.run(async () => {
       const state = await this.store.read();
-      this.mergeSession(state, session);
+      const storedSession = this.mergeSession(state, session);
       state.notes.push(...session.drainNotes());
+      if (storedSession.status === "ended") {
+        state.capacityReservations = state.capacityReservations.filter(({ sessionId }) => sessionId !== session.id);
+      } else if (releaseCapacity) {
+        state.capacityReservations = state.capacityReservations.filter(
+          (reservation) => reservation.clientId !== clientId || reservation.sessionId !== session.id,
+        );
+      }
       const delivery = state.deliveries.find((candidate) => candidate.id === deliveryId);
       if (delivery) {
         delivery.status = "processed";
@@ -1772,6 +1846,12 @@ export class OrchestratorRuntime {
     if (this.options.config.http?.port !== undefined) parseHttpPort(this.options.config.http.port, "config.http.port");
     for (const client of this.clients) {
       this.assertUnique(client.handlers.map(({ id }) => id), "handler", ` for client ${client.id}`);
+      if (
+        client.capacityOptions &&
+        (!Number.isSafeInteger(client.capacityOptions.maxActiveSessions) || client.capacityOptions.maxActiveSessions < 1)
+      ) {
+        throw new Error("Capacity maxActiveSessions must be a positive integer");
+      }
       if (client.retryOptions.delay !== undefined) parseRetryDelay(client.retryOptions.delay);
       if (client.timeout !== undefined) parseHandlerTimeout(client.timeout);
       for (const handler of client.handlers) {

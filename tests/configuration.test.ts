@@ -8,6 +8,47 @@ import { findConfigFile, findProjectRoot, loadProjectConfig } from "../src/runti
 import { createRuntime } from "./helpers.js";
 
 describe("configuration validation", () => {
+  it("defaults retained capacity off and rejects invalid limits", () => {
+    const defaultClient = createClient("default", () => {});
+    expect(defaultClient.capacityOptions).toBeUndefined();
+    expect(defaultClient.concurrencyOptions).toEqual({ workers: 1, perSession: false });
+
+    for (const maxActiveSessions of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(() => createClient(`invalid-${maxActiveSessions}`, (builder) => {
+        builder.capacity({ maxActiveSessions });
+      })).toThrow("Capacity maxActiveSessions must be a positive integer");
+    }
+  });
+
+  it("validates capacity definitions again when the runtime snapshots them", async () => {
+    const client = createClient("mutable", (builder) => {
+      builder.capacity({ maxActiveSessions: 1 });
+    });
+    (client.capacityOptions as { maxActiveSessions: number }).maxActiveSessions = 0;
+
+    await expect(createRuntime({ clients: [client] }).then((runtime) => runtime.init())).rejects.toThrow(
+      "Capacity maxActiveSessions must be a positive integer",
+    );
+  });
+
+  it("reports configured retained capacity and current usage", async () => {
+    const channel = createChannel("capacity");
+    const client = createClient("agent", (builder) => {
+      builder.capacity({ maxActiveSessions: 3 });
+      builder.handle(channel, () => {});
+    });
+    const runtime = await createRuntime({ clients: [client] });
+    await runtime.dispatch(channel, { id: "event", sessionKey: "work" });
+    await runtime.drain();
+
+    expect((await runtime.printConfig()).capacity).toEqual([{
+      clientId: "agent",
+      maxActiveSessions: 3,
+      activeSessions: 1,
+    }]);
+    await runtime.stop();
+  });
+
   it("registers channels referenced by configured client handlers", async () => {
     const handled: string[] = [];
     const channel = createChannel("inferred");

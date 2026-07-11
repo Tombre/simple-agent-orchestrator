@@ -63,6 +63,8 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - Retry delay is explicit when immediate retries could amplify an outage or rate limit.
 - Handler timeout is explicit when an agent, subprocess, or network operation needs a cooperative deadline.
 - One-shot drains are not expected to wait for delayed pending work.
+- Fire-and-forget agents use `client.capacity(...)` when active external sessions need a durable cost or resource limit.
+- Completion events reuse the original session key and release capacity only after the external agent has stopped.
 - `client.concurrency({ perSession: true })` is used when the target agent/tool cannot safely receive same-session messages concurrently.
 
 ## CLI checks
@@ -73,6 +75,7 @@ npx simple-agent-orchestrator state validate
 npx simple-agent-orchestrator print-config
 npx simple-agent-orchestrator dispatch manual --id smoke-1 --session smoke --input "Smoke test"
 npx simple-agent-orchestrator sessions list
+npx simple-agent-orchestrator capacity list
 npx simple-agent-orchestrator events list --json --limit 25
 npx simple-agent-orchestrator events show <internal-event-id>
 curl http://127.0.0.1:3000/health
@@ -81,7 +84,7 @@ curl http://127.0.0.1:3000/api/v1/status
 curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
 ```
 
-The HTTP smoke commands run while ordinary `start` is active; stop it cleanly afterward. `dispatch`, `sessions end`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. Ordinary `start` opens HTTP unless `--no-http` is passed; drain and inspection commands do not. The inspection commands, including `state validate` and a retention preview without `--apply`, remain available while `start` is active. CLI dispatch requires `--id`; list `--limit` must be positive; missing show/end/retry targets fail. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
+The HTTP smoke commands run while ordinary `start` is active; stop it cleanly afterward. `dispatch`, `sessions end`, `capacity release`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. Ordinary `start` opens HTTP unless `--no-http` is passed; drain and inspection commands do not. The inspection commands, including `capacity list`, `state validate`, and a retention preview without `--apply`, remain available while `start` is active. CLI dispatch requires `--id`; list `--limit` must be positive; missing show/end/retry targets fail. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
 
 ## Common failures
 

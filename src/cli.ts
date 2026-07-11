@@ -31,6 +31,9 @@ const SCHEMAS: Record<string, CommandSchema> = {
   "state validate": schema("state validate [--root <path>] [--config <path>]", 2, 2, COMMON_FLAGS),
   "state prune": schema("state prune --before <timestamp> [--apply] [--drop-dedupe] [--root <path>] [--config <path>]", 2, 2, [...COMMON_FLAGS, "before"], ["apply", "drop-dedupe"], ["before"]),
   dispatch: schema("dispatch <channel> --id <id> [--session <session-key>] [--input <text>] [--type <type>] [--payload-json <json>] [--meta-json <json>] [--root <path>] [--config <path>]", 2, 2, [...COMMON_FLAGS, "id", "session", "input", "type", "payload-json", "meta-json"], [], ["id"]),
+  capacity: schema("capacity <list|release>", 1, 1),
+  "capacity list": schema("capacity list [--json] [--limit <count>] [--root <path>] [--config <path>]", 2, 2, [...COMMON_FLAGS, "limit"], ["json"]),
+  "capacity release": schema("capacity release <client-id> <session-id-or-key> [--root <path>] [--config <path>]", 4, 4, COMMON_FLAGS),
   sessions: schema("sessions <list|show|end>", 1, 1),
   "sessions list": schema("sessions list [--json] [--limit <count>] [--root <path>] [--config <path>]", 2, 2, [...COMMON_FLAGS, "limit"], ["json"]),
   "sessions show": schema("sessions show <id-or-key> [--root <path>] [--config <path>]", 3, 3, COMMON_FLAGS),
@@ -72,6 +75,7 @@ Usage:
   simple-agent-orchestrator state validate [--root <path>] [--config <path>]
   simple-agent-orchestrator sessions list [--json] [--limit <count>]
   simple-agent-orchestrator sessions show <id-or-key>
+  simple-agent-orchestrator capacity list [--json] [--limit <count>]
   simple-agent-orchestrator events list [--json] [--limit <count>]
   simple-agent-orchestrator events show <internal-event-id>
 
@@ -81,6 +85,7 @@ Usage:
   Offline mutation commands (require start to be stopped):
   simple-agent-orchestrator dispatch <channel> --id <id> [--session <session-key>] [--input <text>]
   simple-agent-orchestrator sessions end <id-or-key> [--reason <reason>]
+  simple-agent-orchestrator capacity release <client-id> <session-id-or-key>
   simple-agent-orchestrator events retry <delivery-id>
 
 Run any command or subcommand with --help for its usage.
@@ -91,7 +96,7 @@ function routeFor(argv: string[]): string | undefined {
   const positional = argv.filter((arg) => !arg.startsWith("--"));
   const command = positional[0];
   if (!command) return undefined;
-  if (command === "state" || command === "sessions" || command === "events") {
+  if (command === "state" || command === "sessions" || command === "events" || command === "capacity") {
     const action = positional[1];
     if (action && SCHEMAS[`${command} ${action}`]) return `${command} ${action}`;
   }
@@ -393,6 +398,37 @@ async function sessionsCommand(args: ParsedArgs): Promise<void> {
   console.log("ended");
 }
 
+async function capacityCommand(args: ParsedArgs): Promise<void> {
+  const action = args.positional[1];
+  const limit = action === "list" ? listLimit(args.flags) : undefined;
+  const { runtime } = await loadRuntime(args.flags);
+  if (action === "list") {
+    const reservations = (await runtime.listCapacityReservations()).slice(0, limit);
+    if (booleanFlag(args.flags, "json")) console.log(JSON.stringify(reservations, null, 2));
+    else if (reservations.length === 0) console.log("No capacity reservations found.");
+    else {
+      const sessions = await runtime.listSessions();
+      console.table(reservations.map((reservation) => ({
+        id: reservation.id,
+        client: reservation.clientId,
+        session: sessions.find(({ id }) => id === reservation.sessionId)?.key ?? reservation.sessionId,
+        acquiredAt: reservation.acquiredAt,
+      })));
+    }
+    return;
+  }
+
+  const clientId = args.positional[2]!;
+  const sessionIdOrKey = args.positional[3]!;
+  await runtime.runOffline(async ({ drain, releaseCapacity }) => {
+    if (!await releaseCapacity(clientId, sessionIdOrKey)) {
+      throw new Error(`Capacity reservation not found for client ${clientId} and session ${sessionIdOrKey}`);
+    }
+    await drain();
+  });
+  console.log("released");
+}
+
 async function eventsCommand(args: ParsedArgs): Promise<void> {
   const action = args.positional[1];
   const limit = action === "list" ? listLimit(args.flags) : undefined;
@@ -460,6 +496,8 @@ async function main(): Promise<void> {
     case "state validate":
     case "state prune": await stateCommand(args); break;
     case "dispatch": await dispatchCommand(args); break;
+    case "capacity list":
+    case "capacity release": await capacityCommand(args); break;
     case "sessions list":
     case "sessions show":
     case "sessions end": await sessionsCommand(args); break;

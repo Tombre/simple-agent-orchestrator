@@ -158,6 +158,42 @@ describe("runtime public API", () => {
     await runtime.stop();
   });
 
+  it("does not expose custom-store capacity records by reference", async () => {
+    const state = emptyState();
+    state.sessions.push({
+      id: "session",
+      key: "work",
+      status: "active",
+      state: {},
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    });
+    state.capacityReservations.push({
+      id: "reservation",
+      clientId: "agent",
+      sessionId: "session",
+      acquiredAt: new Date(0).toISOString(),
+    });
+    const store: Store = {
+      name: "aliasing",
+      async init() {},
+      async read() {
+        return state;
+      },
+      async write(next) {
+        Object.assign(state, next);
+      },
+    };
+    const runtime = await createRuntime({ store });
+
+    const reservations = await runtime.listCapacityReservations();
+    reservations[0]!.clientId = "changed";
+
+    expect(state.capacityReservations[0]!.clientId).toBe("agent");
+    await runtime.stop();
+  });
+
+
   it("creates runtimes from object, synchronous, and asynchronous project config", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-create-runtime-"));
     const objectRuntime = await createPublicRuntime({}, { root });
@@ -193,6 +229,7 @@ describe("runtime public API", () => {
         "drain",
         "endSession",
         "pruneState",
+        "releaseCapacity",
         "retryDelivery",
       ]);
       return context.dispatch(channel, { id: "event", sessionKey: "work" })
@@ -273,6 +310,7 @@ describe("runtime public API", () => {
     await expect(context.dispatch(channel, { id: "late" })).rejects.toThrow("no longer active");
     await expect(context.drain()).rejects.toThrow("no longer active");
     await expect(context.endSession("missing")).rejects.toThrow("no longer active");
+    await expect(context.releaseCapacity("client", "missing")).rejects.toThrow("no longer active");
     await expect(context.retryDelivery("missing")).rejects.toThrow("no longer active");
     await expect(context.pruneState({ before: new Date() })).rejects.toThrow("no longer active");
   });

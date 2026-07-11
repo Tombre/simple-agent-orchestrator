@@ -7,7 +7,7 @@ metadata:
   version: "0.1.0"
 ---
 
-Simple Agent Orchestrator is embedded, one-process durable plumbing. Channels ingest events, client handlers receive independent retryable deliveries, sessions preserve continuity, environments own process resources and optional sandboxes, and ordinary startup may host built-in and project-defined HTTP routes.
+Simple Agent Orchestrator is embedded, one-process durable plumbing. Channels ingest events, client handlers receive independent retryable deliveries, sessions preserve continuity, retained client capacity can bound detached agent sessions, environments own process resources and optional sandboxes, and ordinary startup may host built-in and project-defined HTTP routes.
 
 ## Procedure
 
@@ -29,9 +29,9 @@ Simple Agent Orchestrator is embedded, one-process durable plumbing. Channels in
 
 9. **Treat persistence and logs as plaintext.** The JSON store, events, state, notes, cursors, errors, and ordinary project/default logs are plaintext. Do not persist or log credentials, tokens, or sensitive source content without an explicit policy. The generated example logs identifiers only.
 
-10. **Use the right runtime helper.** Prefer `createRuntime(config, options)` for programmatic persistent use; it defaults to the project JSON store. Project loaders discover config. The direct `OrchestratorRuntime` constructor plus `init()` is low-level. Use `runOffline(({ dispatch, drain, endSession, retryDelivery, pruneState }) => ...)` for scoped persistent mutations.
+10. **Use the right runtime helper.** Prefer `createRuntime(config, options)` for programmatic persistent use; it defaults to the project JSON store. Project loaders discover config. The direct `OrchestratorRuntime` constructor plus `init()` is low-level. Use `runOffline(({ dispatch, drain, endSession, releaseCapacity, retryDelivery, pruneState }) => ...)` for scoped persistent mutations.
 
-11. **Test through the public harness.** Call `createTestRuntime(config, options)`, not a nested `{ config }` object. It defaults to isolated memory state, a silent logger, and no HTTP. Prefer dispatch/session/event/delivery helpers and always stop it; `test.runtime` is the public escape hatch for lifecycle behavior.
+11. **Test through the public harness.** Call `createTestRuntime(config, options)`, not a nested `{ config }` object. It defaults to isolated memory state, a silent logger, and no HTTP. Prefer dispatch/session/capacity/event/delivery helpers and always stop it; `test.runtime` is the public escape hatch for lifecycle behavior.
 
 12. **Validate strict CLI usage.** Useful checks:
 
@@ -43,7 +43,7 @@ npx simple-agent-orchestrator events list --json --limit 25
 npx simple-agent-orchestrator sessions list --json --limit 25
 ```
 
-`dispatch --id` is required. Unknown flags, extra arguments, missing values, invalid limits, and missing show/retry/end records fail. Stop a long-running JSON-store runtime before `dispatch`, `sessions end`, `events retry`, or `state prune --apply`. Inspection and prune preview remain available while it runs.
+`dispatch --id` is required. Unknown flags, extra arguments, missing values, invalid limits, and missing show/retry/end records fail. Stop a long-running JSON-store runtime before `dispatch`, `sessions end`, `capacity release`, `events retry`, or `state prune --apply`. Inspection, `capacity list`, and prune preview remain available while it runs.
 
 ## References
 

@@ -112,7 +112,7 @@ Call `session.end()` in the handler when the work is complete. Sandbox cleanup r
 
 Cleanup must also succeed before the delivery is marked processed and the ordinary session changes are saved. If cleanup throws, the attempt fails and follows the handler's retry rules.
 
-Ending a session through `sessions end` or `runtime.endSession()` does not call sandbox cleanup. If you end it administratively, remove the external workspace yourself. Stopping the runtime only unmounts process environments; it doesn't walk through active sessions and clean their sandboxes.
+Ending a session through `sessions end` or `runtime.endSession()` releases its retained capacity but does not call sandbox cleanup or stop external work. If you end it administratively, remove the external workspace and stop the agent yourself. Stopping the runtime only unmounts process environments; it doesn't walk through active sessions and clean their sandboxes.
 
 State pruning also doesn't clean external workspaces. It keeps an ended session while its sandbox marker still says the sandbox is active. Prefer ending through a handler when cleanup is required; if you've already ended it administratively, clean the external resource yourself and don't expect pruning to remove that saved session automatically.
 

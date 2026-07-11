@@ -73,9 +73,9 @@ Import these APIs from `simple-agent-orchestrator`.
 | --- | --- |
 | Config | `DefineConfigContext`, `ConfigFactory`, `HttpConfig`, `HttpDispatch`, `HttpRegistrationContext`, `HttpRegistrationHook`, `OrchestratorConfig` |
 | Channels | `ChannelBuilder`, `ChannelDefinition`, `ChannelRuntimeApi`, `Cursor`, `PollCommitContext`, `PollContext`, `PollDefinition` |
-| Clients | `ClientBuilder`, `ClientDefinition`, `EventHandler`, `HandlerContext`, `HandleOptions` |
+| Clients | `CapacityOptions`, `ClientBuilder`, `ClientDefinition`, `EventHandler`, `HandlerCapacity`, `HandlerContext`, `HandleOptions` |
 | Environments | `EnvironmentBuilder`, `EnvironmentDefinition`, `EnvironmentHookContext`, `EnvironmentInstance`, `SandboxContext`, `SandboxDefinition` |
-| Events and state | `ConcurrencyOptions`, `DispatchEvent`, `DispatchResult`, `JsonRecord`, `JsonValue`, `OrchestratorEvent`, `OrchestratorState`, `ProjectContext`, `RetryOptions`, `SessionNote`, `StoredDelivery`, `StoredEvent`, `StoredSession` |
+| Events and state | `ConcurrencyOptions`, `DispatchEvent`, `DispatchResult`, `JsonRecord`, `JsonValue`, `OrchestratorEvent`, `OrchestratorState`, `ProjectContext`, `RetryOptions`, `SessionNote`, `StoredCapacityReservation`, `StoredDelivery`, `StoredEvent`, `StoredSession` |
 | Keys and logging | `KeyBuilder`, `KeyLike`, `Logger`, `StateKey` |
 | Sessions | `Session`, `SessionEndOptions` |
 | Stores | `StateValidationErrorCode`, `Store` |
@@ -132,7 +132,7 @@ interface OrchestratorConfig {
 | Field | Default | Description |
 | --- | --- | --- |
 | `name` | `undefined` | Optional configuration name. |
-| `store` | Depends on the construction API | Store for events, deliveries, sessions, notes, and cursors. |
+| `store` | Depends on the construction API | Store for events, deliveries, sessions, capacity reservations, notes, and cursors. |
 | `channels` | `[]` | Additional globally unique channel definitions, including channels without client handlers. |
 | `clients` | `[]` | Globally unique client definitions. |
 | `logger` | Console logger | Logger used by the runtime. |
@@ -379,6 +379,7 @@ Client IDs must be globally unique.
 ```ts
 interface ClientBuilder {
   useEnvironment(environment: EnvironmentDefinition): void;
+  capacity(options: CapacityOptions): void;
   concurrency(options: ConcurrencyOptions): void;
   retries(options: RetryOptions): void;
   timeout(value: number | string): void;
@@ -438,10 +439,16 @@ interface HandlerContext<
   logger: Logger;
   attempt: number;
   signal: AbortSignal;
+  capacity: HandlerCapacity;
+}
+
+interface HandlerCapacity {
+  readonly reserved: boolean;
+  release(): void;
 }
 ```
 
-`environment` and `signal` are always present. Without a configured environment, the client receives an empty environment with ID `default`.
+`environment`, `signal`, and `capacity` are always present. Without a configured environment, the client receives an empty environment with ID `default`. `capacity.reserved` is `true` when the client has a retained capacity limit. Calling `release()` without one throws.
 
 ### `OrchestratorEvent`
 
@@ -456,6 +463,20 @@ interface OrchestratorEvent extends DispatchEvent {
   occurredAt?: string;
 }
 ```
+
+### `client.capacity(options)`
+
+```ts
+interface CapacityOptions {
+  maxActiveSessions: number;
+}
+```
+
+Capacity is disabled by default. `maxActiveSessions` must be a positive integer.
+
+For a configured client, the first claim for an active session saves one capacity reservation before the handler runs. Later deliveries for that client and session reuse it. When the limit is full, new-session deliveries remain `pending` with no attempt consumed; drains return without waiting for a release.
+
+Reservations survive handler completion, failure, timeout, shutdown, and restart. `context.capacity.release()` removes the current client's reservation only after the attempt succeeds. `session.end()` removes all reservations for that session after the attempt succeeds. Capacity is client-scoped and does not coordinate separate runtime processes.
 
 ### `client.concurrency(options)`
 
@@ -698,7 +719,7 @@ Saved event, session, note, and cursor values must be JSON-safe. The state file 
 ### State validation
 
 ```ts
-const CURRENT_STATE_VERSION = 3;
+const CURRENT_STATE_VERSION = 4;
 const MINIMUM_STATE_VERSION = 1;
 
 declare function validateAndMigrateState(
@@ -716,16 +737,17 @@ type StateValidationErrorCode =
   | "unsupported-version";
 ```
 
-Valid version 1 and 2 state is migrated in memory to version 3. Inspection does not rewrite the file. The next successful write saves version 3.
+Valid version 1 and 2 state gains immediate retry defaults and an empty capacity reservation collection. Valid version 3 state keeps its retry fields and gains the empty collection. Migration happens in memory; inspection does not rewrite the file. The next successful write saves version 4.
 
 ### Saved records
 
 ```ts
 interface OrchestratorState {
-  version: 3;
+  version: 4;
   sessions: StoredSession[];
   events: StoredEvent[];
   deliveries: StoredDelivery[];
+  capacityReservations: StoredCapacityReservation[];
   notes: SessionNote[];
   cursors: Record<string, Record<string, unknown>>;
 }
@@ -736,6 +758,8 @@ interface OrchestratorState {
 `StoredEvent` contains internal `id`, source `sourceId`, channel ID, dedupe and session keys, body fields, and occurrence and receive timestamps.
 
 `StoredDelivery` contains event, client, and handler IDs; status; attempt counts; retry delay; next time it can run; last error; and session ID. Status is `pending`, `processing`, `processed`, or `failed`.
+
+`StoredCapacityReservation` contains its ID, client ID, session ID, and acquisition time. Only active reservations are stored.
 
 `SessionNote` contains its ID, session ID, message, optional data, and creation time.
 
@@ -815,6 +839,7 @@ declare class OrchestratorRuntime {
   listSessions(): Promise<StoredSession[]>;
   getSession(idOrKey: string): Promise<StoredSession | undefined>;
   listSessionNotes(idOrKey: string): Promise<SessionNote[]>;
+  listCapacityReservations(): Promise<StoredCapacityReservation[]>;
   listEvents(): Promise<Array<{
     event: StoredEvent;
     deliveries: StoredDelivery[];
@@ -830,11 +855,14 @@ Store-backed inspection works after stop. Mutation methods reject after stop.
 ```ts
 declare class OrchestratorRuntime {
   endSession(idOrKey: string, reason?: string): Promise<boolean>;
+  releaseCapacity(clientId: string, sessionIdOrKey: string): Promise<boolean>;
   retryDelivery(deliveryId: string): Promise<boolean>;
 }
 ```
 
-`endSession` returns `false` if no session matches. It does not run sandbox cleanup.
+`endSession` returns `false` if no session matches. It releases every capacity reservation for the session but does not run sandbox cleanup or stop external work.
+
+`releaseCapacity` removes one client's reservation while keeping the session active. It returns `false` if no matching active reservation exists. It does not stop external work.
 
 `retryDelivery` returns `false` unless the delivery exists with status `failed`. On success, it grants one additional attempt that can run now.
 
@@ -860,6 +888,7 @@ interface OfflineOperationContext {
   ): Promise<DispatchResult>;
   drain(): Promise<void>;
   endSession(idOrKey: string, reason?: string): Promise<boolean>;
+  releaseCapacity(clientId: string, sessionIdOrKey: string): Promise<boolean>;
   retryDelivery(deliveryId: string): Promise<boolean>;
   pruneState(options: StatePruneOptions): Promise<StatePrunePlan>;
 }
@@ -999,6 +1028,15 @@ interface TestRuntime {
     notes(idOrKey: string): Promise<SessionNote[]>;
   };
 
+  capacity: {
+    list(): Promise<StoredCapacityReservation[]>;
+    release(
+      clientId: string,
+      sessionIdOrKey: string,
+      options?: { drain?: boolean },
+    ): Promise<boolean>;
+  };
+
   events: {
     list(): Promise<TestEventRecord[]>;
     get(eventId: string): Promise<TestEventRecord | undefined>;
@@ -1012,7 +1050,7 @@ interface TestRuntime {
 }
 ```
 
-`dispatch` and `deliveries.retry` call `drain()` by default. Pass `{ drain: false }` to leave work pending.
+`dispatch`, `capacity.release`, and `deliveries.retry` call `drain()` by default. Pass `{ drain: false }` to leave work pending.
 
 `events.get` accepts the internal event ID. `TestEventRecord` is `{ event: StoredEvent, deliveries: StoredDelivery[] }`; the dispatched source ID is `event.sourceId`.
 
