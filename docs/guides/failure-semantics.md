@@ -11,7 +11,7 @@ This guide shows where retries begin, which session changes survive a failure, a
 These protections answer different questions:
 
 - Event dedupe asks, "Have I already accepted this source event?" A second dispatch with the same channel and `dedupeKey` returns the first event ID and creates no new deliveries.
-- Delivery retry asks, "Did this handler finish successfully?" A failed or interrupted attempt runs that handler again for the event already on record.
+- Delivery retry asks, "Did this delivery finish successfully?" A failed or interrupted phase runs again for the event already on record. Earlier phases that reached their saved checkpoint don't repeat.
 
 Dedupe does not make a handler safe to retry. Once a delivery exists, its external calls may happen more than once.
 
@@ -19,7 +19,7 @@ Dedupe does not make a handler safe to retry. Once a delivery exists, its extern
 
 For each delivery attempt, the runtime follows this order:
 
-1. Find an active session for the event's session key, or create one.
+1. Find an active session for the event's session key, or create one. An `existing-only` handler instead uses only its dispatch-time session ID. If that session is no longer active, the delivery is ignored without running another attempt; a prior failed attempt remains recorded.
 2. Acquire or reuse its client capacity reservation, when configured.
 3. Use the client's mounted environment.
 4. Create or reuse the session sandbox, if the environment defines one.
@@ -28,30 +28,30 @@ For each delivery attempt, the runtime follows this order:
 7. If the handler called `session.end()`, clean up that session's sandbox.
 8. Save the successful session changes and mark the delivery `processed`.
 
-An error in sandbox creation, `handle`, `onSuccess`, sandbox cleanup, or saving the successful result fails the attempt. If attempts remain, the delivery returns to `pending` and starts again at step 1 after its configured delay.
+An error in sandbox creation, `handle`, `onSuccess`, sandbox cleanup, or saving the successful result fails the attempt. If attempts remain, the delivery returns to `pending` after its configured delay and resumes the failed phase. Completed earlier phases do not run again.
 
 `attempts` includes the first run. The default is three attempts with no delay. Attempts and delay are resolved separately: a handler value overrides the client's value captured when that handler was registered, which overrides the config value. Delays are fixed; there is no built-in backoff or jitter. A normal drain runs work whose scheduled time has arrived and doesn't wait for a later retry.
 
 ## Use `onFailure` for reporting, not recovery state
 
-`onFailure` runs when an error occurs after the runtime has built the handler context. It receives the original error. If sandbox creation fails before that context exists, `onFailure` can't run.
+`onFailure` runs when an error occurs after the runtime has built the handler context. It receives the original `error` and a `stage` value: `handling`, `acknowledging`, `cleaning`, or `persisting`. If sandbox creation fails before that context exists, `onFailure` can't run.
 
 An error thrown by `onFailure` is logged but doesn't replace the original delivery error. Normal session changes made there are discarded with the failed attempt, so don't use `onFailure` to save a recovery checkpoint. A completed `session.ensure(...)` is the exception described below.
 
 ## Understand which session changes survive
 
-| What your code does | If the whole attempt succeeds | If the attempt fails |
+| What your code does | After its phase succeeds | If that phase fails before its checkpoint |
 | --- | --- | --- |
-| `session.set(...)` or `session.delete(...)` | Saved | Discarded |
-| `session.note(...)` | Saved | Discarded |
-| `session.end(...)` | Saved | Discarded |
+| `session.set(...)` or `session.delete(...)` | Saved | Staged after successful handling; committed only after all phases finish |
+| `session.note(...)` | Saved | Staged after successful handling; committed only after all phases finish |
+| `session.end(...)` | Saved | Staged after successful handling; committed only after all phases finish |
 | Completed `session.ensure(...)` | Already saved | Kept for the retry |
 | Completed sandbox creation details | Already saved | Kept for the retry |
 | Normal changes in `onFailure` | Not applicable | Discarded |
 
-This split is intentional. Ordinary changes describe a successfully completed attempt, so a failure rolls them back. An `ensure` value usually identifies something already created outside the process; keeping it gives the retry a chance to reuse that same thing. Sandbox creation follows the same rule.
+This split is intentional. Ordinary changes remain attached to the delivery after `handle` succeeds, but other deliveries don't see them until every phase finishes. If `handle` fails before its checkpoint, those changes are discarded. An `ensure` value usually identifies something already created outside the process; keeping it gives the retry a chance to reuse that same thing. Sandbox creation follows the same rule.
 
-There is still a small but important gap: an `ensure` factory or sandbox creator can finish its external work just before the process stops and before the result is recorded. Make those creators safe to run again too.
+There is still a small but important gap: an `ensure` factory or sandbox creator can finish its external work just before the process stops and before final status is recorded. Save external IDs through the sandbox checkpoint API and use `reconcile` to check them before creating again. The external create call still needs a stable key because a process can stop before the first checkpoint write.
 
 ## Give every external action a stable key
 
@@ -93,7 +93,7 @@ If the provider has no idempotency-key feature, choose a stable external identif
 
 Put source acknowledgement in `onSuccess`, after `handle`. If the main work fails, the source hasn't been told that it completed.
 
-That acknowledgement still needs to be safe to repeat. Sandbox cleanup or saving the successful result can fail after `onSuccess`, so the next attempt may call it again.
+That acknowledgement still needs to be safe to repeat if it fails or the process stops before its completion checkpoint. Once `onSuccess` is durably complete, cleanup or persistence retries do not call it again.
 
 Every matching handler receives its own delivery and hooks. If an event fans out to several handlers, there is no package hook that waits for all of them. Pick one handler to acknowledge the source, or coordinate that decision in your application.
 
@@ -113,13 +113,17 @@ If the process stops while a delivery says it is `processing`, the next startup 
 
 The interrupted attempt still counts. If it had used the last configured attempt, recovery grants one replacement attempt so the event isn't left failed merely because the process disappeared mid-run.
 
-The runtime doesn't call `onFailure` for the interrupted run because that process is gone. It also can't know whether the external work completed. The replacement starts the full handler again, so all external actions still need repeat protection.
+The runtime doesn't call `onFailure` for the interrupted run because that process is gone. Recovery resumes the saved next phase. The phase that was running can repeat because the runtime can't know whether its external work completed before the process stopped.
+
+## Handle terminal failure durably
+
+Register `client.onExhausted(...)` when every exhausted primary delivery needs follow-up work such as alerting or dead-letter publication. The runtime creates one saved exhaustion record with the source delivery, failed stage, optional read-only session, and a sanitized failure descriptor. It runs with its own retries and timeout, never creates a sandbox, and cannot recursively create more exhaustion work. This is independent historical work: manually retrying the source does not remove it or require the source delivery to remain failed.
 
 The same uncertainty applies to retained capacity. If a capacity-configured handler fails, times out, or is interrupted after it may have launched an external agent, its session keeps the slot. Confirm that the external work has stopped before releasing that capacity through a completion handler, the runtime API, or the CLI.
 
 ## Retry manually when a person has fixed the cause
 
-Once a delivery reaches `failed`, an operator can retry it through the testing helper, runtime API, or CLI. Manual retry only applies to failed deliveries. It grants one more attempt that can run immediately; it doesn't reset the historical attempt count.
+Once a delivery or exhaustion record reaches `failed`, an operator can retry it through the testing helper, runtime API, or CLI. Manual retry grants that record one more attempt that can run immediately; it doesn't reset the historical attempt count.
 
 Use this after fixing a bad credential, provider outage, or application bug. It isn't a substitute for safe external calls: the manual attempt can repeat the same actions as the earlier attempts.
 
@@ -128,7 +132,7 @@ Use this after fixing a bad credential, provider outage, or application bug. It 
 Creation isn't the only risky edge. The process can stop in any of these gaps:
 
 - An `ensure` factory creates a resource before its ID is recorded.
-- Sandbox creation finishes before its marker is recorded.
+- Sandbox creation finishes before its `active` status is recorded.
 - Sandbox cleanup finishes before the delivery is marked `processed`.
 
 Use stable resource IDs, then check what exists before creating, cleaning up, or recreating anything. See [environments and sandboxes](environments-sandboxes.md#make-creation-and-cleanup-safe-to-repeat).

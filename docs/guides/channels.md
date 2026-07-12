@@ -142,9 +142,10 @@ export const reviewsChannel = createChannel("github.reviews", (channel) => {
     id: "reviews",
     every: "60s",
 
-    async fetch({ cursor, signal }) {
+    async fetch({ cursor, pollStartedAt, signal }) {
       return fetchReviews({
         since: cursor.get(lastUpdatedAt),
+        updatedBefore: pollStartedAt,
         signal,
       });
     },
@@ -170,12 +171,14 @@ export const reviewsChannel = createChannel("github.reviews", (channel) => {
 Each run follows this order:
 
 1. `fetch` returns source items.
-2. `map` converts each item, one at a time and in order, into an event. Return `null` or `undefined` to skip one.
-3. The runtime saves every mapped event and creates matching deliveries.
+2. `map` converts each item, one at a time and in order, into one event or an array of events. Return `null` or `undefined` to skip one.
+3. The runtime flattens mapped arrays and saves each event sequentially in order, creating matching deliveries.
 4. `commit` performs any checkpoint work you add.
 5. Cursor changes are saved.
 
 If `fetch`, `map`, dispatch, or `commit` fails, cursor changes from that run are discarded. Events saved before the failure stay saved. Use stable dedupe keys so the next run safely recognizes those events instead of creating more deliveries.
+
+`pollStartedAt` is an ISO timestamp captured once immediately before `fetch`. The same value reaches `fetch`, every `map` call, and `commit`, so you can use it as a stable upper bound even when a long poll crosses into a later time window.
 
 Keep external work in `commit` safe to repeat. For example, an API checkpoint can succeed just before saving the local cursor fails. The next poll then runs `commit` again.
 
@@ -197,7 +200,7 @@ With `jsonFileStore`, cursor values and event fields must contain valid JSON val
 
 `commit` means the poll fetched and saved events. Handlers may not have started yet, so don't use `commit` to tell a source that processing succeeded.
 
-If the source needs that confirmation, choose one handler and send it from `onSuccess`. Make that call safe to repeat because a retry can run it again. If an event fans out to several handlers, there is no event-wide callback that waits for all of them, so pick the handler whose success is enough to confirm the source. See [acknowledge the source](failure-semantics.md#acknowledge-the-source-at-the-right-time).
+If the source needs that confirmation, choose one handler and send it from `onSuccess`. Make that call safe to repeat if acknowledgement fails or is interrupted before its checkpoint. Later cleanup and persistence retries do not rerun it. If an event fans out to several handlers, there is no event-wide callback that waits for all of them, so pick the handler whose success is enough to confirm the source. See [acknowledge the source](failure-semantics.md#acknowledge-the-source-at-the-right-time).
 
 Channel and poll registrations are captured when the runtime initializes. If you add, remove, or reorder them afterward, create a new runtime to apply the change.
 

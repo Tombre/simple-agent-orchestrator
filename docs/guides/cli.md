@@ -126,7 +126,7 @@ The table gives you both kinds of IDs:
 - `eventId` is the orchestrator's internal ID and is what `events show` expects.
 - `deliveryId` identifies one handler's work and is what `events retry` expects.
 
-Each delivery shows its client, handler, status, attempt count, and the time a delayed retry can run. Use `--json` or `events show` for complete records, including recorded errors.
+Each delivery shows its client, handler, status, attempt count, and the time a delayed retry can run. Exhaustion work appears with handler `onExhausted` and an `exhaustion:` status. Use `--json` or `events show` for complete delivery and exhaustion records.
 
 ## Inspect and release retained capacity
 
@@ -144,7 +144,7 @@ npx simple-agent-orchestrator capacity release <client-id> <session-id-or-key> \
   [--root <path>] [--config <path>]
 ```
 
-Release keeps the session active, processes work that can now run, and prints `released`. It does not stop or cancel the external agent. For a live completion callback, dispatch an event with the original session key to a handler that calls `capacity.release()` instead of trying to modify the JSON state from a second process.
+Release keeps the session active, processes work that can now run, and prints `released`. It does not stop or cancel the external agent. For a live completion callback, dispatch an event with the original session key to a handler configured with `session: "existing-only"` that calls `capacity.release()` instead of trying to modify the JSON state from a second process.
 
 ## End a session or retry failed work
 
@@ -154,13 +154,18 @@ Stop the long-running `start` process before running commands that change the JS
 npx simple-agent-orchestrator sessions end <id-or-key> \
   [--reason <reason>] [--root <path>] [--config <path>]
 
-npx simple-agent-orchestrator events retry <delivery-id> \
+npx simple-agent-orchestrator sessions complete <session-id> \
+  [--reason <reason>] [--root <path>] [--config <path>]
+
+npx simple-agent-orchestrator events retry <delivery-or-exhaustion-id> \
   [--root <path>] [--config <path>]
 ```
 
 `sessions end` records the end reason, which defaults to `manual`, and releases the session's retained capacity. It does not call sandbox cleanup or stop external agents. If ending a session must remove an external worktree, container, or agent, arrange that through a handler or your own maintenance process.
 
-`events retry` works only for a delivery whose status is `failed`. It grants one additional attempt, makes it runnable immediately, processes ready work, and prints `retried`. It takes a delivery ID even though the command sits under `events`.
+`sessions complete` requires the exact active session ID and rejects while pending or processing deliveries target that session or its key. It mounts the environments for recorded sandboxes, requires reconciliation for uncertain resources, and runs cleanup before ending the session or releasing capacity. A cleanup failure leaves the session active and can be retried after the integration can reconcile the resource. The default reason is `completed`.
+
+`events retry` works for a delivery or exhaustion record whose status is `failed`. It grants that record one additional attempt, makes it runnable immediately, processes ready work, and prints `retried`. Pass the delivery or exhaustion record ID even though the command sits under `events`.
 
 ## Preview and prune old history
 
@@ -171,7 +176,7 @@ npx simple-agent-orchestrator state prune \
   --before 2026-01-01T00:00:00Z
 ```
 
-Review the selected IDs and blocked sessions. Pruning can remove processed deliveries older than the cutoff. It removes old ended sessions and their notes only when no kept delivery refers to them and no active sandbox marker remains. Poll cursors stay in place.
+Review the selected IDs and blocked sessions. Pruning can remove processed and ignored deliveries older than the cutoff. Retained exhaustion work keeps its source delivery, event, and optional session. Pruning removes old ended sessions, cleaned sandbox records, and notes only when no kept work refers to them and no unfinished sandbox record or legacy active flag remains. Poll cursors stay in place.
 
 Back up the state file, stop the runtime, and apply the same cutoff:
 
@@ -198,9 +203,9 @@ After those event records are removed, sending the same channel and ID can run t
 
 The default local store allows one process at a time to make changes. This is a guard for one machine and one running orchestrator, not coordination between machines.
 
-Read-only commands such as lists, shows, `capacity list`, validation, and prune previews can run while `start` is active. `dispatch`, `sessions end`, `capacity release`, `events retry`, and prune with `--apply` fail before writing until the running process stops.
+Read-only commands such as lists, shows, `capacity list`, validation, and prune previews can run while `start` is active. `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, and prune with `--apply` fail before writing until the running process stops.
 
-The state file and CLI JSON output can contain event bodies, session state, notes, cursor values, and errors as plaintext. Keep them out of logs and support bundles unless the contents are safe to share.
+The state file and CLI JSON output can contain event bodies, session state, notes, sandbox checkpoints, cursor values, and errors as plaintext. Keep them out of logs and support bundles unless the contents are safe to share.
 
 The parser is intentionally strict. Unknown or repeated flags, missing values, extra arguments, invalid limits, missing records, and changes that don't apply all fail with an error instead of guessing what you meant.
 

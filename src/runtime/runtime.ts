@@ -10,7 +10,14 @@ import type { ChannelDefinition, PollDefinition } from "../core/channel.js";
 import { CursorImpl, pollCursorId } from "../core/channel.js";
 import { bindChannelRuntime, unbindChannelRuntime } from "../core/channel-bindings.js";
 import type { ClientDefinition, HandlerContext, RegisteredHandler } from "../core/client.js";
-import type { EnvironmentDefinition, EnvironmentInstance, SandboxContext } from "../core/environment.js";
+import type {
+  EnvironmentDefinition,
+  EnvironmentInstance,
+  SandboxContext,
+  SandboxCompletionContext,
+  SandboxDeliveryContext,
+  SandboxDisposition,
+} from "../core/environment.js";
 import { createEmptyEnvironment, EnvironmentInstanceImpl } from "../core/environment.js";
 import type { OrchestratorConfig } from "../core/config.js";
 import { HandlerTimeoutError } from "../core/errors.js";
@@ -18,6 +25,7 @@ import { createStoredSession, SessionImpl } from "../core/session.js";
 import type {
   DispatchEvent,
   DispatchResult,
+  FailureStage,
   JsonRecord,
   JsonValue,
   Logger,
@@ -28,6 +36,9 @@ import type {
   StoredCapacityReservation,
   StoredDelivery,
   StoredEvent,
+  StoredExhaustion,
+  StoredFailureDescriptor,
+  StoredSandbox,
   StoredSession,
 } from "../core/types.js";
 import { memoryStore, type Store } from "../stores/index.js";
@@ -64,6 +75,7 @@ export interface OfflineOperationContext {
   dispatch(channel: ChannelDefinition | string, event: DispatchEvent): Promise<DispatchResult>;
   drain(): Promise<void>;
   endSession(idOrKey: string, reason?: string): Promise<boolean>;
+  completeSession(sessionId: string, reason?: string): Promise<boolean>;
   releaseCapacity(clientId: string, sessionIdOrKey: string): Promise<boolean>;
   retryDelivery(id: string): Promise<boolean>;
   pruneState(options: StatePruneOptions): Promise<StatePrunePlan>;
@@ -84,6 +96,15 @@ interface ClaimedDelivery {
   event: StoredEvent;
   session: StoredSession;
   handler: RegisteredHandler;
+  client: RuntimeClient;
+  capacityReserved: boolean;
+}
+
+interface ClaimedExhaustion {
+  work: StoredExhaustion;
+  delivery: StoredDelivery;
+  event: StoredEvent;
+  session?: StoredSession | undefined;
   client: RuntimeClient;
 }
 
@@ -113,11 +134,23 @@ interface DeliveryCounts {
   processing: number;
   processed: number;
   failed: number;
+  ignored: number;
+}
+
+interface WorkCounts {
+  pending: number;
+  processing: number;
+  processed: number;
+  failed: number;
 }
 
 class WebhookValidationError extends Error {}
 
 function emptyDeliveryCounts(): DeliveryCounts {
+  return { pending: 0, processing: 0, processed: 0, failed: 0, ignored: 0 };
+}
+
+function emptyWorkCounts(): WorkCounts {
   return { pending: 0, processing: 0, processed: 0, failed: 0 };
 }
 
@@ -350,6 +383,11 @@ function formatError(error: unknown): string {
   return String(error);
 }
 
+function sanitizeFailure(error: unknown): StoredFailureDescriptor {
+  const name = error instanceof Error && error.name.trim() ? error.name.slice(0, 128) : "Error";
+  return { name, message: "Operation failed." };
+}
+
 function snapshotEnvironment(definition: EnvironmentDefinition | undefined): EnvironmentDefinition | undefined {
   if (!definition) return undefined;
   return {
@@ -373,6 +411,9 @@ function snapshotClient(client: ClientDefinition): RuntimeClient {
     concurrencyOptions: { ...client.concurrencyOptions },
     retryOptions: { ...client.retryOptions },
     ...(client.timeout === undefined ? {} : { timeout: client.timeout }),
+    ...(client.exhaustion === undefined ? {} : {
+      exhaustion: { ...client.exhaustion, retries: { ...client.exhaustion.retries } },
+    }),
   };
 }
 
@@ -396,6 +437,7 @@ export class OrchestratorRuntime {
   private readonly workerPromises: Promise<void>[] = [];
   private readonly pollPromises = new Map<string, Promise<void>>();
   private readonly processingSessionKeys = new Set<string>();
+  private readonly completingSessions = new Set<string>();
   private readonly ensureLocks = new Map<string, Promise<unknown>>();
   private readonly sandboxLocks = new Map<string, Promise<void>>();
   private ownership: RuntimeOwnership | undefined;
@@ -696,6 +738,8 @@ export class OrchestratorRuntime {
         const state = await this.store.read();
         const deliveries = emptyDeliveryCounts();
         for (const delivery of state.deliveries) deliveries[delivery.status] += 1;
+        const exhaustions = emptyWorkCounts();
+        for (const work of state.exhaustions) exhaustions[work.status] += 1;
         return honoContext.json({
           uptimeMs: Math.max(0, Date.now() - (this.runtimeStartedAt ?? Date.now())),
           http: this.httpAddress,
@@ -703,6 +747,7 @@ export class OrchestratorRuntime {
             events: state.events.length,
             sessions: state.sessions.length,
             deliveries,
+            exhaustions,
           },
         });
       } catch (error) {
@@ -731,11 +776,18 @@ export class OrchestratorRuntime {
         );
         const selectedIds = new Set(selectedEvents.map((event) => event.id));
         const countsByEvent = new Map<string, DeliveryCounts>();
+        const exhaustionCountsByEvent = new Map<string, WorkCounts>();
         for (const delivery of state.deliveries) {
           if (!selectedIds.has(delivery.eventId)) continue;
           const counts = countsByEvent.get(delivery.eventId) ?? emptyDeliveryCounts();
           counts[delivery.status] += 1;
           countsByEvent.set(delivery.eventId, counts);
+        }
+        for (const work of state.exhaustions) {
+          if (!selectedIds.has(work.eventId)) continue;
+          const counts = exhaustionCountsByEvent.get(work.eventId) ?? emptyWorkCounts();
+          counts[work.status] += 1;
+          exhaustionCountsByEvent.set(work.eventId, counts);
         }
         const summaries = selectedEvents
           .map((event) => ({
@@ -748,6 +800,7 @@ export class OrchestratorRuntime {
             ...(event.occurredAt === undefined ? {} : { occurredAt: event.occurredAt }),
             receivedAt: event.receivedAt,
             deliveries: countsByEvent.get(event.id) ?? emptyDeliveryCounts(),
+            exhaustions: exhaustionCountsByEvent.get(event.id) ?? emptyWorkCounts(),
           }));
         return honoContext.json({ events: summaries.slice(0, limit), hasMore: selectedEvents.length > limit });
       } catch (error) {
@@ -923,7 +976,8 @@ export class OrchestratorRuntime {
       let processed = false;
       for (const client of this.clients) {
         const didProcess = await this.processNextDelivery(client);
-        processed = processed || didProcess;
+        const didProcessExhaustion = await this.processNextExhaustion(client);
+        processed = processed || didProcess || didProcessExhaustion;
       }
       if (!processed) break;
     }
@@ -989,6 +1043,7 @@ export class OrchestratorRuntime {
           : this.dispatch(channel, event)),
       drain: () => trackContextOperation(() => this.drainOwnedGuarded()),
       endSession: (idOrKey, reason) => trackContextOperation(() => this.endSession(idOrKey, reason)),
+      completeSession: (sessionId, reason) => trackContextOperation(() => this.completeSession(sessionId, reason)),
       releaseCapacity: (clientId, sessionIdOrKey) => trackContextOperation(
         () => this.releaseCapacity(clientId, sessionIdOrKey),
       ),
@@ -1116,18 +1171,27 @@ export class OrchestratorRuntime {
                 delivery.handlerId === handler.id,
             );
             if (duplicateDelivery) continue;
+            const existingOnly = handler.session === "existing-only";
+            const activeSession = existingOnly
+              ? state.sessions.find((session) => session.key === sessionKey && session.status === "active")
+              : undefined;
+            const createdAt = nowIso();
+            const ignored = existingOnly && !activeSession;
             state.deliveries.push({
               id: newId("deliv"),
               eventId: storedEvent.id,
               channelId,
               clientId: client.id,
               handlerId: handler.id,
-              status: "pending",
+              status: ignored ? "ignored" : "pending",
+              phase: ignored ? "completed" : "sandbox",
               attempts: 0,
               maxAttempts: Math.max(1, handler.retries.attempts ?? this.options.config.retries?.attempts ?? 3),
               retryDelayMs: parseRetryDelay(handler.retries.delay ?? this.options.config.retries?.delay ?? 0),
-              createdAt: nowIso(),
-              updatedAt: nowIso(),
+              createdAt,
+              updatedAt: createdAt,
+              ...(activeSession ? { sessionId: activeSession.id } : {}),
+              ...(ignored ? { processedAt: createdAt, ignoredReason: "session-missing" as const } : {}),
             });
           }
         }
@@ -1168,6 +1232,15 @@ export class OrchestratorRuntime {
       .sort((a, b) => a.acquiredAt.localeCompare(b.acquiredAt));
   }
 
+  async listSandboxes(sessionId?: string): Promise<StoredSandbox[]> {
+    await this.init();
+    const state = await this.store.read();
+    return state.sandboxes
+      .filter((sandbox) => sessionId === undefined || sandbox.sessionId === sessionId)
+      .map((sandbox) => ({ ...sandbox, checkpoint: structuredClone(sandbox.checkpoint) }))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
   async releaseCapacity(clientId: string, sessionIdOrKey: string): Promise<boolean> {
     return this.runMutation(async () => {
       await this.init();
@@ -1204,13 +1277,114 @@ export class OrchestratorRuntime {
     });
   }
 
-  async listEvents(): Promise<{ event: StoredEvent; deliveries: StoredDelivery[] }[]> {
+  async completeSession(sessionId: string, reason = "completed"): Promise<boolean> {
+    return this.runMutation(async () => {
+      await this.init();
+      if (this.completingSessions.has(sessionId)) throw new Error(`Session completion is already in progress: ${sessionId}`);
+      this.completingSessions.add(sessionId);
+      try {
+        const snapshot = await this.mutex.run(async () => {
+          const state = await this.store.read();
+          const session = state.sessions.find((candidate) => candidate.id === sessionId && candidate.status === "active");
+          if (!session) throw new Error(`Session completion requires an exact active session ID: ${sessionId}`);
+          const unfinished = this.findUnfinishedDelivery(state, session);
+          if (unfinished) {
+            throw new Error(`Cannot complete session ${sessionId}: unfinished delivery work exists (${unfinished.id})`);
+          }
+          const legacy = Object.entries(session.state).filter(
+            ([key, value]) => key.startsWith("__sao.sandbox.") && key.endsWith(".created") && value === true,
+          );
+          for (const [flag] of legacy) {
+            const environmentId = flag.slice("__sao.sandbox.".length, -".created".length);
+            const owners = this.clients.filter((client) =>
+              client.environment?.id === environmentId && client.environment.sandbox !== undefined
+            );
+            if (owners.length !== 1) {
+              throw new Error(`Cannot complete session ${sessionId}: legacy sandbox ownership cannot be safely assigned to a client`);
+            }
+            const client = owners[0]!;
+            if (!state.sandboxes.some((sandbox) =>
+              sandbox.sessionId === sessionId && sandbox.clientId === client.id && sandbox.environmentId === environmentId
+            )) {
+              const timestamp = nowIso();
+              state.sandboxes.push({
+                sessionId,
+                clientId: client.id,
+                environmentId,
+                status: "active",
+                checkpoint: {},
+                createdAt: timestamp,
+                updatedAt: timestamp,
+              });
+            }
+            delete session.state[flag];
+          }
+          if (legacy.length > 0) await this.store.write(state);
+          return {
+            session: { ...session, state: { ...session.state } },
+            sandboxes: state.sandboxes.filter((sandbox) => sandbox.sessionId === sessionId),
+          };
+        });
+
+        const session = new SessionImpl(snapshot.session, (sessionInstance, name, factory) =>
+          this.coordinateEnsure(sessionInstance, name, factory),
+        );
+        const lockKeys = snapshot.sandboxes.map((sandbox) =>
+          this.sandboxKey(sessionId, sandbox.clientId, sandbox.environmentId)
+        );
+        await this.withSandboxLocks(lockKeys, async () => {
+          for (const sandbox of snapshot.sandboxes) {
+            if (sandbox.status === "cleaned") continue;
+            const client = this.clients.find((candidate) => candidate.id === sandbox.clientId);
+            const definition = client?.environment;
+            if (!client || !definition || definition.id !== sandbox.environmentId || !definition.sandbox) {
+              throw new Error(
+                `Cannot complete session ${sessionId}: sandbox ${sandbox.clientId}/${sandbox.environmentId} is not configured`,
+              );
+            }
+            const environment = await this.getMountedEnvironment(client);
+            await this.completeSandbox(client, environment, session, reason);
+          }
+
+          await this.mutex.run(async () => {
+            const state = await this.store.read();
+            const stored = state.sessions.find((candidate) => candidate.id === sessionId && candidate.status === "active");
+            if (!stored) throw new Error(`Session completion requires an exact active session ID: ${sessionId}`);
+            const unfinished = this.findUnfinishedDelivery(state, stored);
+            if (unfinished) {
+              throw new Error(`Cannot complete session ${sessionId}: unfinished delivery work exists (${unfinished.id})`);
+            }
+            const incomplete = state.sandboxes.find(
+              (sandbox) => sandbox.sessionId === sessionId && sandbox.status !== "cleaned",
+            );
+            if (incomplete) throw new Error(`Sandbox cleanup did not complete for ${incomplete.clientId}/${incomplete.environmentId}`);
+            this.mergeSession(state, session);
+            state.notes.push(...session.pendingNotes());
+            stored.status = "ended";
+            stored.endedAt = nowIso();
+            stored.endReason = reason;
+            stored.updatedAt = nowIso();
+            state.capacityReservations = state.capacityReservations.filter((reservation) => reservation.sessionId !== sessionId);
+            await this.store.write(state);
+          });
+        });
+        session.clearMutations();
+        session.clearNotes();
+        return true;
+      } finally {
+        this.completingSessions.delete(sessionId);
+      }
+    });
+  }
+
+  async listEvents(): Promise<{ event: StoredEvent; deliveries: StoredDelivery[]; exhaustions: StoredExhaustion[] }[]> {
     await this.init();
     const state = await this.store.read();
     return state.events
       .map((event) => ({
         event,
         deliveries: state.deliveries.filter((delivery) => delivery.eventId === event.id),
+        exhaustions: state.exhaustions.filter((work) => work.eventId === event.id),
       }))
       .sort((a, b) => b.event.receivedAt.localeCompare(a.event.receivedAt));
   }
@@ -1226,7 +1400,7 @@ export class OrchestratorRuntime {
       return this.mutex.run(async () => {
         const state = await this.store.read();
         const plan = planStatePrune(state, options);
-        if (plan.deliveryIds.length || plan.sessionIds.length || plan.noteIds.length || plan.eventIds.length) {
+        if (plan.deliveryIds.length || plan.exhaustionIds.length || plan.sessionIds.length || plan.noteIds.length || plan.eventIds.length) {
           applyStatePrune(state, plan);
           await this.store.write(state);
         }
@@ -1241,10 +1415,22 @@ export class OrchestratorRuntime {
       return this.mutex.run(async () => {
         const state = await this.store.read();
         const delivery = state.deliveries.find((candidate) => candidate.id === id);
-        if (!delivery || delivery.status !== "failed") return false;
+        if (!delivery) {
+          const work = state.exhaustions.find((candidate) => candidate.id === id);
+          if (!work || work.status !== "failed") return false;
+          work.status = "pending";
+          work.maxAttempts = Math.max(work.maxAttempts, work.attempts + 1);
+          work.processedAt = undefined;
+          work.nextAttemptAt = undefined;
+          work.updatedAt = nowIso();
+          await this.store.write(state);
+          return true;
+        }
+        if (delivery.status !== "failed") return false;
         delivery.status = "pending";
         delivery.maxAttempts = Math.max(delivery.maxAttempts, delivery.attempts + 1);
         delivery.lastError = undefined;
+        delivery.lastFailureStage = undefined;
         delivery.processedAt = undefined;
         delivery.nextAttemptAt = undefined;
         delivery.updatedAt = nowIso();
@@ -1312,18 +1498,29 @@ export class OrchestratorRuntime {
     const recovered = await this.mutex.run(async () => {
       const state = await this.store.read();
       const interrupted = state.deliveries.filter(({ status }) => status === "processing");
-      if (interrupted.length === 0) return [];
+      const interruptedExhaustions = state.exhaustions.filter(({ status }) => status === "processing");
+      if (interrupted.length === 0 && interruptedExhaustions.length === 0) return [];
 
       const recoveredAt = nowIso();
       for (const delivery of interrupted) {
         delivery.status = "pending";
         delivery.maxAttempts = Math.max(delivery.maxAttempts, delivery.attempts + 1);
-        delivery.lastError = `Interrupted during attempt ${delivery.attempts}; recovered before processing resumed. Handler and external effects may run again.`;
+        delivery.lastError = `Interrupted during attempt ${delivery.attempts}; recovered at ${delivery.phase}.`;
+        if (delivery.phase !== "completed") delivery.lastFailureStage = delivery.phase;
         delivery.nextAttemptAt = undefined;
         delivery.updatedAt = recoveredAt;
       }
+      for (const work of interruptedExhaustions) {
+        work.status = "pending";
+        work.maxAttempts = Math.max(work.maxAttempts, work.attempts + 1);
+        work.nextAttemptAt = undefined;
+        work.updatedAt = recoveredAt;
+      }
       await this.store.write(state);
-      return interrupted.map(({ id, attempts }) => ({ id, interruptedAttempt: attempts }));
+      return [
+        ...interrupted.map(({ id, attempts }) => ({ id, interruptedAttempt: attempts })),
+        ...interruptedExhaustions.map(({ id, attempts }) => ({ id, interruptedAttempt: attempts })),
+      ];
     });
 
     if (recovered.length > 0) {
@@ -1384,16 +1581,26 @@ export class OrchestratorRuntime {
         id: channel.id,
         dispatch: (event: DispatchEvent) => this.dispatch(channel.id, event),
       };
-      const ctx = { channel: channelApi, cursor, project: this.project, logger: this.logger, signal };
+      const pollStartedAt = new Date().toISOString();
+      const ctx = {
+        pollStartedAt,
+        channel: channelApi,
+        cursor,
+        project: this.project,
+        logger: this.logger,
+        signal,
+      };
       const items = await poll.fetch(ctx);
       const events: DispatchEvent[] = [];
 
       if (poll.map) {
         for (const item of items) {
           const mapped = await poll.map(item, ctx);
-          if (mapped) {
-            events.push(mapped);
-            await channelApi.dispatch(mapped);
+          if (!mapped) continue;
+          const mappedEvents: readonly DispatchEvent[] = Array.isArray(mapped) ? mapped : [mapped];
+          for (const event of mappedEvents) {
+            await channelApi.dispatch(event);
+            events.push(event);
           }
         }
       }
@@ -1422,7 +1629,8 @@ export class OrchestratorRuntime {
     const signal = this.abortController.signal;
     while (!signal.aborted) {
       const processed = await this.processNextDelivery(client);
-      if (!processed) {
+      const processedExhaustion = signal.aborted ? false : await this.processNextExhaustion(client);
+      if (!processed && !processedExhaustion) {
         try {
           await delay(500, signal);
         } catch {
@@ -1449,6 +1657,85 @@ export class OrchestratorRuntime {
     return true;
   }
 
+  private async processNextExhaustion(client: RuntimeClient): Promise<boolean> {
+    if (!client.exhaustion) return false;
+    const claimed = await this.mutex.run(async (): Promise<ClaimedExhaustion | undefined> => {
+      const state = await this.store.read();
+      const work = state.exhaustions.find((candidate) =>
+        candidate.clientId === client.id && candidate.status === "pending" &&
+        (candidate.nextAttemptAt === undefined || Date.parse(candidate.nextAttemptAt) <= Date.now())
+      );
+      if (!work) return undefined;
+      const delivery = state.deliveries.find(({ id }) => id === work.sourceDeliveryId);
+      const event = state.events.find(({ id }) => id === work.eventId);
+      if (!delivery || !event) return undefined;
+      work.status = "processing";
+      work.attempts += 1;
+      work.nextAttemptAt = undefined;
+      work.startedAt = nowIso();
+      work.updatedAt = work.startedAt;
+      await this.store.write(state);
+      const session = work.sessionId === undefined ? undefined : state.sessions.find(({ id }) => id === work.sessionId);
+      return {
+        work: structuredClone(work),
+        delivery: structuredClone(delivery),
+        event: structuredClone(event),
+        ...(session === undefined ? {} : { session: structuredClone(session) }),
+        client,
+      };
+    });
+    if (!claimed) return false;
+
+    const timeoutMs = parseHandlerTimeout(client.exhaustion.timeout ?? 0);
+    const attemptSignal = createAttemptSignal(this.abortController.signal, timeoutMs);
+    try {
+      const environment = await this.getMountedEnvironment(client);
+      await client.exhaustion.handle({
+        event: this.toRuntimeEvent(claimed.event),
+        sourceDelivery: claimed.delivery,
+        ...(claimed.session === undefined ? {} : { session: new SessionImpl(claimed.session) }),
+        stage: claimed.work.stage,
+        failure: claimed.work.failure,
+        attempt: claimed.work.attempts,
+        signal: attemptSignal.signal,
+        project: this.project,
+        logger: this.logger,
+        environment,
+        client: client.definition,
+      });
+      attemptSignal.throwIfTimedOut();
+      await this.persistExhaustionResult(claimed.work.id);
+    } catch (error) {
+      attemptSignal.cancelTimeout();
+      await this.persistExhaustionResult(claimed.work.id, attemptSignal.timeoutError ?? error);
+    } finally {
+      attemptSignal.dispose();
+    }
+    return true;
+  }
+
+  private async persistExhaustionResult(id: string, error?: unknown): Promise<void> {
+    await this.mutex.run(async () => {
+      const state = await this.store.read();
+      const work = state.exhaustions.find((candidate) => candidate.id === id);
+      if (!work) return;
+      const timestamp = Date.now();
+      if (error === undefined) {
+        work.status = "processed";
+        work.processedAt = new Date(timestamp).toISOString();
+        work.nextAttemptAt = undefined;
+      } else {
+        const exhausted = work.attempts >= work.maxAttempts;
+        work.status = exhausted ? "failed" : "pending";
+        work.nextAttemptAt = !exhausted && work.retryDelayMs > 0
+          ? new Date(Math.min(MAX_DATE_TIMESTAMP, timestamp + work.retryDelayMs)).toISOString()
+          : undefined;
+      }
+      work.updatedAt = new Date(timestamp).toISOString();
+      await this.store.write(state);
+    });
+  }
+
   private async claimNextDelivery(client: RuntimeClient): Promise<ClaimedDelivery | undefined> {
     return this.mutex.run(async () => {
       const state = await this.store.read();
@@ -1462,16 +1749,30 @@ export class OrchestratorRuntime {
         const handler = client.handlers.find((candidate) => candidate.id === delivery.handlerId);
         if (!handler) continue;
 
-        let session = state.sessions.find(
-          (candidate) => candidate.key === event.sessionKey && candidate.status === "active",
-        );
+        let session = handler.session === "existing-only"
+          ? state.sessions.find((candidate) => candidate.id === delivery.sessionId && candidate.status === "active")
+          : delivery.phase !== "sandbox" && delivery.sessionId
+          ? state.sessions.find((candidate) => candidate.id === delivery.sessionId)
+          : state.sessions.find((candidate) => candidate.key === event.sessionKey && candidate.status === "active");
+        if (session && this.completingSessions.has(session.id)) continue;
+        if (handler.session === "existing-only" && !session) {
+          const ignoredAt = nowIso();
+          delivery.status = "ignored";
+          delivery.phase = "completed";
+          delivery.ignoredReason = "session-ended";
+          delivery.processedAt = ignoredAt;
+          delivery.nextAttemptAt = undefined;
+          delivery.updatedAt = ignoredAt;
+          await this.store.write(state);
+          continue;
+        }
         const existingSessionId = session?.id;
         let reservation = existingSessionId
           ? state.capacityReservations.find(
               (candidate) => candidate.clientId === client.id && candidate.sessionId === existingSessionId,
             )
           : undefined;
-        if (client.capacityOptions && !reservation) {
+        if (handler.session !== "existing-only" && client.capacityOptions && !reservation) {
           const active = state.capacityReservations.filter(({ clientId }) => clientId === client.id).length;
           if (active >= client.capacityOptions.maxActiveSessions) continue;
         }
@@ -1479,7 +1780,7 @@ export class OrchestratorRuntime {
           session = createStoredSession(event.sessionKey);
           state.sessions.push(session);
         }
-        if (client.capacityOptions && !reservation) {
+        if (handler.session !== "existing-only" && client.capacityOptions && !reservation) {
           reservation = {
             id: newId("cap"),
             clientId: client.id,
@@ -1504,6 +1805,7 @@ export class OrchestratorRuntime {
           session: { ...session, state: { ...session.state } },
           handler,
           client,
+          capacityReserved: reservation !== undefined,
         };
       }
       return undefined;
@@ -1516,16 +1818,25 @@ export class OrchestratorRuntime {
     let handlerContext: HandlerContext | undefined;
     let attemptSignal: AttemptSignal | undefined;
     let releaseCapacity = false;
+    let stage: FailureStage = delivery.phase === "completed" ? "persisting" : delivery.phase;
 
     try {
       sessionImpl = new SessionImpl(claimed.session, (sessionInstance, name, factory) =>
         this.coordinateEnsure(sessionInstance, name, factory),
       );
+      if (delivery.staged) {
+        sessionImpl.restoreEffects(delivery.staged);
+        releaseCapacity = delivery.staged.releaseCapacity;
+      }
 
       const environment = await this.getMountedEnvironment(client);
       const timeoutMs = parseHandlerTimeout(handler.timeout ?? this.options.config.timeout ?? 0);
       attemptSignal = createAttemptSignal(this.abortController.signal, timeoutMs);
-      await this.ensureSandbox(client, environment, sessionImpl, event, attemptSignal);
+      if (delivery.phase === "sandbox" && handler.session !== "existing-only") {
+        stage = "sandbox";
+        await this.ensureSandbox(client, environment, sessionImpl, event, attemptSignal);
+        await this.checkpointDelivery(delivery.id, "handling");
+      }
       attemptSignal.throwIfTimedOut();
 
       const orchestratorEvent = this.toRuntimeEvent(event);
@@ -1539,7 +1850,7 @@ export class OrchestratorRuntime {
         attempt: delivery.attempts,
         signal: attemptSignal.signal,
         capacity: {
-          reserved: client.capacityOptions !== undefined,
+          reserved: claimed.capacityReserved,
           release() {
             if (!client.capacityOptions) throw new Error(`Client ${client.id} does not have retained capacity`);
             releaseCapacity = true;
@@ -1547,33 +1858,60 @@ export class OrchestratorRuntime {
         },
       };
 
-      await handler.handle(handlerContext);
-      attemptSignal.throwIfTimedOut();
-      await handler.onSuccess?.(handlerContext);
-      attemptSignal.throwIfTimedOut();
+      if (delivery.phase === "sandbox" || delivery.phase === "handling") {
+        stage = "handling";
+        await handler.handle(handlerContext);
+        attemptSignal.throwIfTimedOut();
+        await this.checkpointDelivery(delivery.id, "acknowledging", sessionImpl.stagedEffects(releaseCapacity));
+      }
+      if (delivery.phase === "sandbox" || delivery.phase === "handling" || delivery.phase === "acknowledging") {
+        stage = "acknowledging";
+        await handler.onSuccess?.(handlerContext);
+        attemptSignal.throwIfTimedOut();
+        await this.checkpointDelivery(delivery.id, "cleaning", sessionImpl.stagedEffects(releaseCapacity));
+      }
 
-      if (sessionImpl.status === "ended") {
+      if (sessionImpl.endRequested()) {
+        stage = "cleaning";
         await this.cleanupSandbox(client, environment, sessionImpl, event, attemptSignal);
         attemptSignal.throwIfTimedOut();
       }
+      await this.checkpointDelivery(delivery.id, "persisting", sessionImpl.stagedEffects(releaseCapacity));
 
       attemptSignal.dispose();
+      stage = "persisting";
       await this.persistSuccess(delivery.id, client.id, sessionImpl, releaseCapacity);
     } catch (error) {
       const failure = attemptSignal?.timeoutError ?? error;
       attemptSignal?.cancelTimeout();
       if (handlerContext) {
         try {
-          await handler.onFailure?.({ ...handlerContext, error: failure });
+          await handler.onFailure?.({ ...handlerContext, error: failure, stage });
         } catch (onFailureError) {
           this.logger.warn("onFailure hook failed", { error: formatError(onFailureError) });
         }
       }
       attemptSignal?.dispose();
-      await this.persistFailure(delivery.id, failure);
+      await this.persistFailure(delivery.id, stage, failure, client);
     } finally {
       attemptSignal?.dispose();
     }
+  }
+
+  private async checkpointDelivery(
+    deliveryId: string,
+    phase: StoredDelivery["phase"],
+    staged?: StoredDelivery["staged"],
+  ): Promise<void> {
+    await this.mutex.run(async () => {
+      const state = await this.store.read();
+      const delivery = state.deliveries.find(({ id }) => id === deliveryId);
+      if (!delivery) return;
+      delivery.phase = phase;
+      if (staged !== undefined) delivery.staged = structuredClone(staged);
+      delivery.updatedAt = nowIso();
+      await this.store.write(state);
+    });
   }
 
   private toRuntimeEvent(event: StoredEvent): OrchestratorEvent {
@@ -1659,17 +1997,25 @@ export class OrchestratorRuntime {
       const delivery = state.deliveries.find((candidate) => candidate.id === deliveryId);
       if (delivery) {
         delivery.status = "processed";
+        delivery.phase = "completed";
         delivery.processedAt = nowIso();
         delivery.updatedAt = nowIso();
         delivery.lastError = undefined;
         delivery.nextAttemptAt = undefined;
+        delivery.lastFailureStage = undefined;
+        delivery.staged = undefined;
       }
       await this.store.write(state);
     });
     session.clearMutations();
   }
 
-  private async persistFailure(deliveryId: string, error: unknown): Promise<void> {
+  private async persistFailure(
+    deliveryId: string,
+    stage: FailureStage,
+    error: unknown,
+    client: RuntimeClient,
+  ): Promise<void> {
     await this.mutex.run(async () => {
       const state = await this.store.read();
       const delivery = state.deliveries.find((candidate) => candidate.id === deliveryId);
@@ -1684,7 +2030,26 @@ export class OrchestratorRuntime {
           delivery.nextAttemptAt = undefined;
         }
         delivery.lastError = formatError(error);
+        delivery.lastFailureStage = stage;
         delivery.updatedAt = new Date(failedAt).toISOString();
+        if (exhausted && client.exhaustion && !state.exhaustions.some(({ sourceDeliveryId }) => sourceDeliveryId === delivery.id)) {
+          const createdAt = new Date(failedAt).toISOString();
+          state.exhaustions.push({
+            id: newId("exh"),
+            sourceDeliveryId: delivery.id,
+            eventId: delivery.eventId,
+            clientId: client.id,
+            ...(delivery.sessionId === undefined ? {} : { sessionId: delivery.sessionId }),
+            stage,
+            failure: sanitizeFailure(error),
+            status: "pending",
+            attempts: 0,
+            maxAttempts: Math.max(1, client.exhaustion.retries.attempts ?? 3),
+            retryDelayMs: parseRetryDelay(client.exhaustion.retries.delay ?? 0),
+            createdAt,
+            updatedAt: createdAt,
+          });
+        }
       }
       await this.store.write(state);
     });
@@ -1779,14 +2144,53 @@ export class OrchestratorRuntime {
   ): Promise<void> {
     const definition = client.environment;
     if (!definition?.sandbox) return;
-    const flag = `__sao.sandbox.${definition.id}.created`;
-    await this.withSandboxLock(`${session.id}:${flag}`, async () => {
-      await this.refreshSessionState(session);
+    await this.withSandboxLock(this.sandboxKey(session.id, client.id, definition.id), async () => {
       attemptSignal.throwIfTimedOut();
-      if (session.getOptional<boolean>(flag)) return;
-      await definition.sandbox!.create(this.sandboxContext(environment, session, event, attemptSignal.signal));
+      const currentSession = await this.getSession(session.id);
+      if (currentSession?.status !== "active") throw new Error(`Session ended before sandbox creation: ${session.id}`);
+      let record = await this.getSandbox(session.id, client.id, definition.id);
+      if (!record) record = await this.adoptLegacySandbox(session.id, client.id, definition.id);
+      if (record?.status === "active") return;
+      if (record && record.status !== "cleaned" && definition.sandbox!.reconcile) {
+        let disposition: SandboxDisposition;
+        try {
+          disposition = await definition.sandbox!.reconcile(
+            this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
+          );
+          if (disposition !== "active" && disposition !== "cleaned" && disposition !== "unknown") {
+            throw new Error(`Invalid sandbox reconciliation disposition: ${String(disposition)}`);
+          }
+        } catch (error) {
+          await this.setSandboxStatus(session.id, client.id, definition.id, record.status, undefined, error);
+          throw error;
+        }
+        attemptSignal.throwIfTimedOut();
+        record = await this.persistSandboxDisposition(record, disposition);
+        if (disposition === "active") return;
+        if (disposition === "unknown") throw new Error(`Sandbox reconciliation remained unknown for ${client.id}/${definition.id}`);
+      }
+      if (record?.status === "cleaning" || record?.status === "unknown") {
+        throw new Error(
+          `Sandbox ${client.id}/${definition.id} is ${record.status} and cannot be used without successful reconciliation`,
+        );
+      }
+      record = await this.setSandboxStatus(
+        session.id,
+        client.id,
+        definition.id,
+        "creating",
+        record?.checkpoint ?? {},
+      );
+      try {
+        await definition.sandbox!.create(
+          this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
+        );
+      } catch (error) {
+        await this.setSandboxStatus(session.id, client.id, definition.id, "creating", undefined, error);
+        throw error;
+      }
       attemptSignal.throwIfTimedOut();
-      session.set(flag, true);
+      await this.setSandboxStatus(session.id, client.id, definition.id, "active");
       await this.persistSessionMutations(session);
     });
   }
@@ -1800,32 +2204,194 @@ export class OrchestratorRuntime {
   ): Promise<void> {
     const definition = client.environment;
     if (!definition?.sandbox?.cleanup) return;
-    const flag = `__sao.sandbox.${definition.id}.created`;
-    await this.withSandboxLock(`${session.id}:${flag}`, async () => {
-      await this.refreshSessionState(session);
+    await this.withSandboxLock(this.sandboxKey(session.id, client.id, definition.id), async () => {
       attemptSignal.throwIfTimedOut();
-      if (!session.getOptional<boolean>(flag)) return;
-      await definition.sandbox!.cleanup!(this.sandboxContext(environment, session, event, attemptSignal.signal));
+      let record = await this.getSandbox(session.id, client.id, definition.id);
+      if (!record || record.status === "cleaned") return;
+      if (record.status !== "active") {
+        if (!definition.sandbox!.reconcile) {
+          throw new Error(
+            `Sandbox ${client.id}/${definition.id} is ${record.status} and cleanup cannot continue without reconciliation`,
+          );
+        }
+        let disposition: SandboxDisposition;
+        try {
+          disposition = await definition.sandbox!.reconcile(
+            this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
+          );
+          if (disposition !== "active" && disposition !== "cleaned" && disposition !== "unknown") {
+            throw new Error(`Invalid sandbox reconciliation disposition: ${String(disposition)}`);
+          }
+        } catch (error) {
+          await this.setSandboxStatus(session.id, client.id, definition.id, record.status, undefined, error);
+          throw error;
+        }
+        attemptSignal.throwIfTimedOut();
+        record = await this.persistSandboxDisposition(record, disposition);
+        if (disposition === "cleaned") return;
+        if (disposition === "unknown") {
+          throw new Error(`Sandbox reconciliation remained unknown for ${client.id}/${definition.id}`);
+        }
+      }
+      await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning");
+      try {
+        await definition.sandbox!.cleanup!(
+          this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
+        );
+      } catch (error) {
+        await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning", undefined, error);
+        throw error;
+      }
       attemptSignal.throwIfTimedOut();
-      session.set(flag, false);
-      await this.persistSandboxFlag(session, flag, false);
+      await this.setSandboxStatus(session.id, client.id, definition.id, "cleaned");
     });
   }
 
+  private async completeSandbox(
+    client: RuntimeClient,
+    environment: EnvironmentInstance,
+    session: SessionImpl,
+    reason: string,
+  ): Promise<void> {
+    const definition = client.environment!;
+    const sandbox = definition.sandbox!;
+    let record = await this.getSandbox(session.id, client.id, definition.id);
+    if (!record || record.status === "cleaned") return;
+    if (record.status !== "active") {
+      if (!sandbox.reconcile) {
+        throw new Error(
+          `Cannot complete session ${session.id}: sandbox ${client.id}/${definition.id} is ${record.status} and cleanup cannot continue without reconciliation`,
+        );
+      }
+      let disposition: SandboxDisposition;
+      try {
+        disposition = await sandbox.reconcile(
+          this.sandboxContext(client, environment, session, undefined, this.abortController.signal, record, {
+            type: "completion",
+            reason,
+          }),
+        );
+        if (disposition !== "active" && disposition !== "cleaned" && disposition !== "unknown") {
+          throw new Error(`Invalid sandbox reconciliation disposition: ${String(disposition)}`);
+        }
+      } catch (error) {
+        await this.setSandboxStatus(session.id, client.id, definition.id, record.status, undefined, error);
+        throw error;
+      }
+      if (disposition === "cleaned") {
+        await this.persistAdministrativeSandboxSuccess(session, client.id, definition.id);
+        return;
+      }
+      record = await this.persistSandboxDisposition(record, disposition);
+      if (disposition === "unknown") throw new Error(`Sandbox reconciliation remained unknown for ${client.id}/${definition.id}`);
+    }
+    if (!sandbox.cleanup) {
+      throw new Error(`Cannot complete session ${session.id}: sandbox ${client.id}/${definition.id} has no cleanup hook`);
+    }
+    await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning");
+    try {
+      await sandbox.cleanup(
+        this.sandboxContext(client, environment, session, undefined, this.abortController.signal, record, {
+          type: "completion",
+          reason,
+        }),
+      );
+    } catch (error) {
+      await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning", undefined, error);
+      throw error;
+    }
+    await this.persistAdministrativeSandboxSuccess(session, client.id, definition.id);
+  }
+
+  private async persistAdministrativeSandboxSuccess(
+    session: SessionImpl,
+    clientId: string,
+    environmentId: string,
+  ): Promise<void> {
+    await this.mutex.run(async () => {
+      const state = await this.store.read();
+      const storedSession = state.sessions.find(({ id }) => id === session.id);
+      if (!storedSession) throw new Error(`Session not found while saving sandbox cleanup: ${session.id}`);
+      for (const mutation of session.pendingMutations()) {
+        if (mutation.type === "set") storedSession.state[mutation.name] = mutation.value;
+        else delete storedSession.state[mutation.name];
+      }
+      storedSession.updatedAt = nowIso();
+      state.notes.push(...session.pendingNotes());
+      const sandbox = state.sandboxes.find((candidate) =>
+        candidate.sessionId === session.id &&
+        candidate.clientId === clientId &&
+        candidate.environmentId === environmentId
+      );
+      if (!sandbox) throw new Error(`Sandbox record not found for ${session.id}/${clientId}/${environmentId}`);
+      sandbox.status = "cleaned";
+      sandbox.lastError = undefined;
+      sandbox.updatedAt = nowIso();
+      await this.store.write(state);
+    });
+    session.clearMutations();
+    session.clearNotes();
+  }
+
+  private findUnfinishedDelivery(state: OrchestratorState, session: StoredSession): StoredDelivery | undefined {
+    const eventIds = new Set(
+      state.events.filter(({ sessionKey }) => sessionKey === session.key).map(({ id }) => id),
+    );
+    return state.deliveries.find((delivery) =>
+      (delivery.status === "pending" || delivery.status === "processing") &&
+      (delivery.sessionId === session.id || eventIds.has(delivery.eventId))
+    );
+  }
+
   private sandboxContext(
+    client: ClientDefinition,
     environment: EnvironmentInstance,
     session: SessionImpl,
     event: StoredEvent,
     signal: AbortSignal,
+    sandbox: StoredSandbox,
+    cause: { type: "delivery" },
+  ): SandboxDeliveryContext;
+  private sandboxContext(
+    client: ClientDefinition,
+    environment: EnvironmentInstance,
+    session: SessionImpl,
+    event: undefined,
+    signal: AbortSignal,
+    sandbox: StoredSandbox,
+    cause: SandboxCompletionContext["cause"],
+  ): SandboxCompletionContext;
+  private sandboxContext(
+    client: ClientDefinition,
+    environment: EnvironmentInstance,
+    session: SessionImpl,
+    event: StoredEvent | undefined,
+    signal: AbortSignal,
+    sandbox: StoredSandbox,
+    cause: SandboxContext["cause"],
   ): SandboxContext {
-    return {
+    let currentCheckpoint = structuredClone(sandbox.checkpoint);
+    const base = {
       environment,
       project: this.project,
       logger: this.logger,
       signal,
       session,
-      event: this.toRuntimeEvent(event),
+      checkpoint: async (update: JsonRecord) => {
+        if (!isRecord(update)) throw new Error("Sandbox checkpoint update must be a JSON object");
+        validateJsonValue(update);
+        currentCheckpoint = { ...currentCheckpoint, ...structuredClone(update) };
+        await this.updateSandboxCheckpoint(session.id, client.id, environment.id, update);
+      },
     };
+    const context = (event
+      ? { ...base, cause: { type: "delivery" }, event: this.toRuntimeEvent(event) }
+      : { ...base, cause: cause.type === "completion" ? cause : { type: "completion" }, event: undefined }) as unknown as SandboxContext;
+    Object.defineProperty(context, "currentCheckpoint", {
+      enumerable: true,
+      get: () => structuredClone(currentCheckpoint),
+    });
+    return context;
   }
 
   private validateConfiguration(): void {
@@ -1854,6 +2420,8 @@ export class OrchestratorRuntime {
       }
       if (client.retryOptions.delay !== undefined) parseRetryDelay(client.retryOptions.delay);
       if (client.timeout !== undefined) parseHandlerTimeout(client.timeout);
+      if (client.exhaustion?.retries.delay !== undefined) parseRetryDelay(client.exhaustion.retries.delay);
+      if (client.exhaustion?.timeout !== undefined) parseHandlerTimeout(client.exhaustion.timeout);
       for (const handler of client.handlers) {
         if (handler.retries.delay !== undefined) parseRetryDelay(handler.retries.delay);
         if (handler.timeout !== undefined) parseHandlerTimeout(handler.timeout);
@@ -1898,23 +2466,130 @@ export class OrchestratorRuntime {
     session.clearMutations();
   }
 
-  private async persistSandboxFlag(session: SessionImpl, flag: string, value: boolean): Promise<void> {
-    await this.mutex.run(async () => {
-      const state = await this.store.read();
-      const stored = state.sessions.find((candidate) => candidate.id === session.id);
-      if (stored) {
-        stored.state[flag] = value;
-        stored.updatedAt = nowIso();
-        await this.store.write(state);
-      }
-    });
-    session.clearMutation(flag);
+  private sandboxKey(sessionId: string, clientId: string, environmentId: string): string {
+    return JSON.stringify([sessionId, clientId, environmentId]);
   }
 
-  private async refreshSessionState(session: SessionImpl): Promise<void> {
-    const state = await this.mutex.run(() => this.store.read());
-    const stored = state.sessions.find((candidate) => candidate.id === session.id);
-    if (stored) session.mergeStoredState(stored.state);
+  private async getSandbox(
+    sessionId: string,
+    clientId: string,
+    environmentId: string,
+  ): Promise<StoredSandbox | undefined> {
+    return this.mutex.run(async () => {
+      const state = await this.store.read();
+      const sandbox = state.sandboxes.find((candidate) =>
+        candidate.sessionId === sessionId &&
+        candidate.clientId === clientId &&
+        candidate.environmentId === environmentId
+      );
+      return sandbox ? { ...sandbox, checkpoint: structuredClone(sandbox.checkpoint) } : undefined;
+    });
+  }
+
+  private async adoptLegacySandbox(
+    sessionId: string,
+    clientId: string,
+    environmentId: string,
+  ): Promise<StoredSandbox | undefined> {
+    return this.mutex.run(async () => {
+      const state = await this.store.read();
+      const session = state.sessions.find((candidate) => candidate.id === sessionId);
+      const flag = `__sao.sandbox.${environmentId}.created`;
+      if (session?.state[flag] !== true) return undefined;
+      const owners = this.clients.filter((client) =>
+        client.environment?.id === environmentId && client.environment.sandbox !== undefined
+      );
+      if (owners.length !== 1 || owners[0]!.id !== clientId) {
+        throw new Error(
+          `Cannot use legacy sandbox ${environmentId} for session ${sessionId}: ownership cannot be safely assigned to a client`,
+        );
+      }
+      const timestamp = nowIso();
+      const sandbox: StoredSandbox = {
+        sessionId,
+        clientId,
+        environmentId,
+        status: "active",
+        checkpoint: {},
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      state.sandboxes.push(sandbox);
+      delete session.state[flag];
+      session.updatedAt = timestamp;
+      await this.store.write(state);
+      return { ...sandbox, checkpoint: {} };
+    });
+  }
+
+  private async setSandboxStatus(
+    sessionId: string,
+    clientId: string,
+    environmentId: string,
+    status: StoredSandbox["status"],
+    checkpoint?: JsonRecord,
+    error?: unknown,
+  ): Promise<StoredSandbox> {
+    return this.mutex.run(async () => {
+      const state = await this.store.read();
+      let sandbox = state.sandboxes.find((candidate) =>
+        candidate.sessionId === sessionId &&
+        candidate.clientId === clientId &&
+        candidate.environmentId === environmentId
+      );
+      const updatedAt = nowIso();
+      if (!sandbox) {
+        sandbox = {
+          sessionId,
+          clientId,
+          environmentId,
+          status,
+          checkpoint: structuredClone(checkpoint ?? {}),
+          createdAt: updatedAt,
+          updatedAt,
+        };
+        state.sandboxes.push(sandbox);
+      } else {
+        sandbox.status = status;
+        if (checkpoint !== undefined) sandbox.checkpoint = structuredClone(checkpoint);
+        sandbox.updatedAt = updatedAt;
+      }
+      sandbox.lastError = error === undefined ? undefined : formatError(error);
+      await this.store.write(state);
+      return { ...sandbox, checkpoint: structuredClone(sandbox.checkpoint) };
+    });
+  }
+
+  private async updateSandboxCheckpoint(
+    sessionId: string,
+    clientId: string,
+    environmentId: string,
+    update: JsonRecord,
+  ): Promise<void> {
+    await this.mutex.run(async () => {
+      const state = await this.store.read();
+      const sandbox = state.sandboxes.find((candidate) =>
+        candidate.sessionId === sessionId &&
+        candidate.clientId === clientId &&
+        candidate.environmentId === environmentId
+      );
+      if (!sandbox) throw new Error(`Sandbox record not found for ${clientId}/${environmentId}`);
+      sandbox.checkpoint = { ...sandbox.checkpoint, ...structuredClone(update) };
+      sandbox.updatedAt = nowIso();
+      await this.store.write(state);
+    });
+  }
+
+  private async persistSandboxDisposition(
+    sandbox: StoredSandbox,
+    disposition: SandboxDisposition,
+  ): Promise<StoredSandbox> {
+    return this.setSandboxStatus(
+      sandbox.sessionId,
+      sandbox.clientId,
+      sandbox.environmentId,
+      disposition,
+    );
   }
 
   private async withSandboxLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -1932,6 +2607,15 @@ export class OrchestratorRuntime {
       release();
       if (this.sandboxLocks.get(key) === tail) this.sandboxLocks.delete(key);
     }
+  }
+
+  private async withSandboxLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
+    const ordered = [...new Set(keys)].sort();
+    const acquire = (index: number): Promise<T> => {
+      const key = ordered[index];
+      return key === undefined ? fn() : this.withSandboxLock(key, () => acquire(index + 1));
+    };
+    return acquire(0);
   }
 }
 

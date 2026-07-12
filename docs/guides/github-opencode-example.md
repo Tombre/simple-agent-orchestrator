@@ -106,7 +106,7 @@ The two event keys do different jobs:
 
 This sample assumes `updatedAt` values are canonical timestamps whose string order matches time order. If GitHub pagination or your query can return equal timestamps, use the source API's cursor rules and a tie-breaker instead.
 
-The poll maps items one at a time and records each event before `commit` updates the cursor. `commit` confirms local event recording, not successful agent work. If a handler later fails, its delivery retries from the saved event.
+The poll maps items one at a time. A map may return one event or an array; the runtime records the flattened events sequentially before `commit` updates the cursor. `commit` confirms local event recording, not successful agent work. If a handler later fails, its delivery retries from the saved event.
 
 ## 3. Start the agent server and prepare worktrees
 
@@ -223,9 +223,9 @@ Here's how those settings affect what you'll see:
 - Each delivery gets up to three attempts, including the first, with a fixed ten-second delay after a failure.
 - The ten-minute timeout covers worktree setup, `handle`, `onSuccess`, and cleanup. Your adapters must observe `signal`; JavaScript can't be forcibly stopped.
 
-`session.ensure(...)` records one external agent session ID for the pull request. A failed attempt keeps a completed `ensure` value, while ordinary session changes from that attempt are discarded.
+`session.ensure(...)` records one external agent session ID for the pull request. A failed `handle` call keeps a completed `ensure` value but discards ordinary changes that didn't reach the handling checkpoint. After `handle` succeeds, ordinary changes stay staged on the delivery until acknowledgement, cleanup, and saving finish.
 
-Both agent calls and `markReviewSeen` can repeat after a timeout, process interruption, cleanup error, or local save error. Their stable idempotency keys must cause your adapters and providers to return the earlier result rather than repeating the effect. Don't include the attempt number in those keys.
+An agent call can repeat if handling fails or is interrupted before its checkpoint. `markReviewSeen` can repeat if acknowledgement fails or is interrupted before its checkpoint. A later cleanup or local-save failure resumes that later phase without repeating either call. Keep stable idempotency keys anyway: the runtime can't atomically save a checkpoint with an outside API response. Don't include the attempt number in those keys.
 
 This example awaits `sendToAgent`, so its two workers limit the calls currently in progress. If your adapter returns immediately while each coding agent keeps running, configure `client.capacity({ maxActiveSessions: 2 })` instead to retain those two slots until a completion event calls `capacity.release()` or ends the session. See [limit active fire-and-forget agents](clients.md#limit-active-fire-and-forget-agents).
 
@@ -276,13 +276,13 @@ For continuous polling and processing, run:
 npx simple-agent-orchestrator start
 ```
 
-The default JSON state file allows only one process to make changes at a time. Don't run `dispatch`, `events retry`, `sessions end`, `capacity release`, or prune with `--apply` beside that process. Lists and shows, including `capacity list`, are safe.
+The default JSON state file allows only one process to make changes at a time. Don't run `dispatch`, `events retry`, `sessions end`, `sessions complete`, `capacity release`, or prune with `--apply` beside that process. Lists and shows, including `capacity list`, are safe.
 
 ## 7. Decide when a pull request is finished
 
 This review-only example intentionally never ends the session, so its worktree remains available for later reviews. In a complete integration, add a pull-request closed or merged event and have its successful handler call `session.end()` after any final agent work. That is what triggers sandbox cleanup.
 
-Running `sessions end` from the CLI marks the session ended but does not invoke `closeWorktree`. If operators need administrative cleanup, provide a separate, repeat-safe cleanup command or send a normal event through a handler that ends the session.
+Running `sessions end` from the CLI marks the session ended but does not invoke `closeWorktree`. Use `sessions complete <session-id>` when operators need the configured sandbox cleanup to finish before the session ends.
 
 ## Check the design before shipping
 

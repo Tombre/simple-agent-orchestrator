@@ -15,7 +15,9 @@ export function emptyState(): OrchestratorState {
     sessions: [],
     events: [],
     deliveries: [],
+    exhaustions: [],
     capacityReservations: [],
+    sandboxes: [],
     notes: [],
     cursors: {},
   };

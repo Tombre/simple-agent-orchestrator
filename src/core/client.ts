@@ -7,8 +7,11 @@ import type {
   OrchestratorEvent,
   ProjectContext,
   RetryOptions,
+  FailureStage,
+  StoredDelivery,
+  StoredFailureDescriptor,
 } from "./types.js";
-import type { Session } from "./session.js";
+import type { ReadonlySession, Session } from "./session.js";
 
 export interface HandlerContext<
   TPayload = unknown,
@@ -43,22 +46,50 @@ export interface HandleOptions<
   TMeta extends Record<string, unknown> = Record<string, unknown>,
 > {
   readonly id?: string;
+  readonly session?: "existing-only";
   readonly retries?: RetryOptions;
   readonly timeout?: number | string;
   readonly handle: EventHandler<TPayload, TInput, TMeta>;
   readonly onSuccess?: (ctx: HandlerContext<TPayload, TInput, TMeta>) => Promise<void> | void;
-  readonly onFailure?: (ctx: HandlerContext<TPayload, TInput, TMeta> & { error: unknown }) => Promise<void> | void;
+  readonly onFailure?: (ctx: HandlerContext<TPayload, TInput, TMeta> & { error: unknown; stage: FailureStage }) => Promise<void> | void;
+}
+
+export interface ExhaustionContext {
+  event: OrchestratorEvent;
+  sourceDelivery: Readonly<StoredDelivery>;
+  session?: ReadonlySession | undefined;
+  stage: FailureStage;
+  failure: Readonly<StoredFailureDescriptor>;
+  attempt: number;
+  signal: AbortSignal;
+  project: ProjectContext;
+  logger: Logger;
+  environment: EnvironmentInstance;
+  client: ClientDefinition;
+}
+
+export interface ExhaustionOptions {
+  readonly retries?: RetryOptions;
+  readonly timeout?: number | string;
+  readonly handle: (ctx: ExhaustionContext) => Promise<void> | void;
+}
+
+export interface RegisteredExhaustionHandler {
+  readonly retries: Readonly<RetryOptions>;
+  readonly timeout?: number | string | undefined;
+  readonly handle: ExhaustionOptions["handle"];
 }
 
 export interface RegisteredHandler {
   readonly id: string;
   readonly channelId: string;
   readonly channel: ChannelDefinition;
+  readonly session?: "existing-only" | undefined;
   readonly retries: Readonly<RetryOptions>;
   readonly timeout?: number | string | undefined;
   readonly handle: EventHandler;
   readonly onSuccess?: ((ctx: HandlerContext) => Promise<void> | void) | undefined;
-  readonly onFailure?: ((ctx: HandlerContext & { error: unknown }) => Promise<void> | void) | undefined;
+  readonly onFailure?: ((ctx: HandlerContext & { error: unknown; stage: FailureStage }) => Promise<void> | void) | undefined;
 }
 
 export interface ClientBuilder {
@@ -67,6 +98,7 @@ export interface ClientBuilder {
   concurrency(options: ConcurrencyOptions): void;
   retries(options: RetryOptions): void;
   timeout(value: number | string): void;
+  onExhausted(options: ExhaustionOptions): void;
   handle<
     TPayload = unknown,
     TInput = unknown,
@@ -85,6 +117,7 @@ export interface ClientDefinition {
   readonly concurrencyOptions: Readonly<Required<ConcurrencyOptions>>;
   readonly retryOptions: Readonly<RetryOptions>;
   readonly timeout?: number | string | undefined;
+  readonly exhaustion?: RegisteredExhaustionHandler | undefined;
 }
 
 export function createClient(id: string, setup: (client: ClientBuilder) => void): ClientDefinition {
@@ -94,6 +127,7 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
   let concurrencyOptions: Required<ConcurrencyOptions> = { workers: 1, perSession: false };
   let retryOptions: RetryOptions = {};
   let timeout: number | string | undefined;
+  let exhaustion: RegisteredExhaustionHandler | undefined;
 
   const builder: ClientBuilder = {
     useEnvironment(next) {
@@ -121,6 +155,17 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
     timeout(value) {
       timeout = value;
     },
+    onExhausted(options) {
+      if (exhaustion) throw new Error(`Client ${id} already has an exhaustion handler`);
+      exhaustion = {
+        retries: {
+          ...(options.retries?.attempts !== undefined ? { attempts: Math.max(1, options.retries.attempts) } : {}),
+          ...(options.retries?.delay !== undefined ? { delay: options.retries.delay } : {}),
+        },
+        timeout: options.timeout,
+        handle: options.handle,
+      };
+    },
     handle(channel, handlerOrOptions) {
       const options = (typeof handlerOrOptions === "function"
         ? { handle: handlerOrOptions }
@@ -130,6 +175,7 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
         id: handlerId,
         channelId: channel.id,
         channel,
+        session: options.session,
         retries: {
           ...retryOptions,
           ...(options.retries?.attempts !== undefined ? { attempts: Math.max(1, options.retries.attempts) } : {}),
@@ -153,5 +199,6 @@ export function createClient(id: string, setup: (client: ClientBuilder) => void)
     concurrencyOptions,
     retryOptions,
     timeout,
+    exhaustion,
   };
 }

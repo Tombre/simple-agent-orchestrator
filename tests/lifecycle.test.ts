@@ -371,7 +371,7 @@ describe("resource lifecycle", () => {
     ]);
   });
 
-  it("repeats uncertain handler work and continues ordinary retries after recovery", async () => {
+  it("resumes final persistence after recovery without repeating completed phases", async () => {
     const backing = memoryStore();
     let failAttemptCompletion = true;
     const interruptedStore: Store = {
@@ -397,7 +397,6 @@ describe("resource lifecycle", () => {
       builder.handle(channel, ({ attempt, event, session }) => {
         effects.push({ attempt, key: `effect:${event.channelId}:${event.dedupeKey}` });
         session.set("committedAttempt", attempt);
-        if (attempt === 2) throw new Error("ordinary retry after recovery");
       });
     });
     const interruptedRuntime = await createRuntime({ channels: [channel], clients: [client], store: interruptedStore });
@@ -410,15 +409,11 @@ describe("resource lifecycle", () => {
     await interruptedRuntime.drain();
     await interruptedRuntime.stop();
 
-    expect(effects).toEqual([
-      { attempt: 1, key: "effect:recovery:event" },
-      { attempt: 2, key: "effect:recovery:event" },
-      { attempt: 3, key: "effect:recovery:event" },
-    ]);
-    expect(await interruptedRuntime.getSession("work")).toMatchObject({ state: { committedAttempt: 3 } });
+    expect(effects).toEqual([{ attempt: 1, key: "effect:recovery:event" }]);
+    expect(await interruptedRuntime.getSession("work")).toMatchObject({ state: { committedAttempt: 1 } });
     expect((await interruptedRuntime.listEvents())[0]!.deliveries[0]).toMatchObject({
       status: "processed",
-      attempts: 3,
+      attempts: 2,
       maxAttempts: 3,
     });
   });
@@ -466,6 +461,85 @@ describe("resource lifecycle", () => {
     expect(processed).not.toHaveProperty("nextAttemptAt");
   });
 
+  it("recovers interrupted exhaustion work on JSON-store restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-exhaustion-recovery-"));
+    const statePath = join(root, "state.json");
+    const backing = jsonFileStore(statePath);
+    let interruptClaim = true;
+    const interruptedStore: Store = {
+      name: "interrupted-exhaustion-claim",
+      runtimeLockPath: backing.runtimeLockPath!,
+      init: () => backing.init(),
+      read: () => backing.read(),
+      async write(state) {
+        await backing.write(state);
+        if (interruptClaim && state.exhaustions.some(({ status }) => status === "processing")) {
+          interruptClaim = false;
+          throw new Error("process exited after exhaustion claim");
+        }
+      },
+    };
+    const channel = createChannel("exhaustion-recovery");
+    const attempts: number[] = [];
+    const client = createClient("client", (builder) => {
+      builder.onExhausted({
+        retries: { attempts: 1, delay: "1h" },
+        handle({ attempt }) {
+          attempts.push(attempt);
+        },
+      });
+      builder.handle(channel, { retries: { attempts: 1 }, handle() { throw new Error("failed"); } });
+    });
+    const interrupted = await createRuntime({ channels: [channel], clients: [client], store: interruptedStore });
+    await interrupted.dispatch(channel, { id: "event" });
+
+    await expect(interrupted.drain()).rejects.toThrow("process exited after exhaustion claim");
+    expect((await backing.read()).exhaustions[0]).toMatchObject({ status: "processing", attempts: 1, maxAttempts: 1 });
+    await interrupted.stop();
+
+    const replacement = await createRuntime({ channels: [channel], clients: [client], store: backing });
+    await replacement.drain();
+    await replacement.stop();
+
+    expect(attempts).toEqual([2]);
+    expect((await backing.read()).exhaustions[0]).toMatchObject({ status: "processed", attempts: 2, maxAttempts: 2 });
+  });
+
+  it("preserves delayed exhaustion eligibility across restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-exhaustion-delay-"));
+    const statePath = join(root, "state.json");
+    const channel = createChannel("exhaustion-delay");
+    const attempts: number[] = [];
+    const client = createClient("client", (builder) => {
+      builder.onExhausted({
+        retries: { attempts: 2, delay: "1h" },
+        handle({ attempt }) {
+          attempts.push(attempt);
+          if (attempt === 1) throw new Error("notification failed");
+        },
+      });
+      builder.handle(channel, { retries: { attempts: 1 }, handle() { throw new Error("failed"); } });
+    });
+    const first = await createRuntime({ channels: [channel], clients: [client], store: jsonFileStore(statePath) });
+    await first.dispatch(channel, { id: "event" });
+    await first.drain();
+    await first.stop();
+
+    const secondStore = jsonFileStore(statePath);
+    const second = await createRuntime({ channels: [channel], clients: [client], store: secondStore });
+    await second.drain();
+    expect(attempts).toEqual([1]);
+
+    const due = await secondStore.read();
+    due.exhaustions[0]!.nextAttemptAt = new Date(0).toISOString();
+    await secondStore.write(due);
+    await second.drain();
+    await second.stop();
+
+    expect(attempts).toEqual([1, 2]);
+    expect((await secondStore.read()).exhaustions[0]).toMatchObject({ status: "processed", attempts: 2 });
+  });
+
   it("recovers through an offline drain and exposes the interrupted attempt while processing", async () => {
     const store = memoryStore();
     const channel = createChannel("recovery");
@@ -486,7 +560,7 @@ describe("resource lifecycle", () => {
     await runtime.runOffline(async ({ drain }) => drain());
 
     expect(observedLastError).toBe(
-      "Interrupted during attempt 1; recovered before processing resumed. Handler and external effects may run again.",
+      "Interrupted during attempt 1; recovered at sandbox.",
     );
     expect((await runtime.listEvents())[0]!.deliveries[0]).toMatchObject({ status: "processed", attempts: 2 });
   });
@@ -905,6 +979,7 @@ describe("resource lifecycle", () => {
         clientId: "client",
         handlerId: "source:0",
         status: "pending",
+        phase: "sandbox",
         attempts: 1,
         maxAttempts: 1,
         retryDelayMs: 0,
@@ -1146,6 +1221,379 @@ describe("resource lifecycle", () => {
     await test.stop();
   });
 
+  it("persists sandbox checkpoints eagerly and reconciles uncertain creation before retrying create", async () => {
+    const channel = createChannel("sandbox-reconcile");
+    const seen: string[] = [];
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({
+        async create({ checkpoint }) {
+          seen.push("create");
+          await checkpoint({ workspaceId: "ws-1" });
+          throw new Error("response lost");
+        },
+        reconcile({ currentCheckpoint, cause }) {
+          seen.push(`reconcile:${cause.type}:${String(currentCheckpoint.workspaceId)}`);
+          return "active";
+        },
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, {
+        retries: { attempts: 2 },
+        handle() {
+          seen.push("handle");
+        },
+      });
+    });
+    const store = memoryStore();
+    const runtime = await createRuntime({ channels: [channel], clients: [client], store });
+
+    await runtime.dispatch(channel, { id: "event", sessionKey: "work" });
+    await runtime.drain();
+
+    expect(seen).toEqual(["create", "reconcile:delivery:ws-1", "handle"]);
+    expect((await store.read()).sandboxes).toMatchObject([{
+      clientId: "client",
+      environmentId: "workspace",
+      status: "active",
+      checkpoint: { workspaceId: "ws-1" },
+    }]);
+    await runtime.stop();
+  });
+
+  it("does not treat a cleaning sandbox without reconciliation as usable", async () => {
+    const channel = createChannel("sandbox-cleaning-blocked");
+    const handled: string[] = [];
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({
+        create() {},
+        cleanup() {
+          throw new Error("cleanup uncertain");
+        },
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, {
+        retries: { attempts: 1 },
+        handle({ event, session }) {
+          handled.push(event.id);
+          if (event.id === "first") session.end();
+        },
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+    await test.dispatch(channel, { id: "first", sessionKey: "work" });
+
+    await test.dispatch(channel, { id: "second", sessionKey: "work" });
+
+    expect(handled).toEqual(["first"]);
+    expect((await test.events.list()).find(({ event }) => event.sourceId === "second")?.deliveries[0]).toMatchObject({
+      status: "failed",
+      phase: "sandbox",
+      attempts: 1,
+    });
+    expect(await test.runtime.listSandboxes()).toMatchObject([{ status: "cleaning" }]);
+  });
+
+  it("completes an exact active session only after retryable administrative sandbox cleanup succeeds", async () => {
+    const channel = createChannel("sandbox-complete");
+    let cleanups = 0;
+    const causes: string[] = [];
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({
+        async create({ checkpoint }) {
+          await checkpoint({ workspaceId: "ws-1" });
+        },
+        async cleanup({ cause, event, session, currentCheckpoint, checkpoint }) {
+          causes.push(`${cause.type}:${event === undefined}:${String(currentCheckpoint.workspaceId)}`);
+          await checkpoint({ cleanupAttempt: cleanups + 1 });
+          cleanups += 1;
+          if (cleanups === 1) throw new Error("cleanup failed");
+          session.note("Administrative cleanup completed");
+        },
+        reconcile() {
+          return "active";
+        },
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.handle(channel, () => {});
+    });
+    const store = memoryStore();
+    const runtime = await createRuntime({ channels: [channel], clients: [client], store });
+    await runtime.dispatch(channel, { id: "event", sessionKey: "work" });
+    await runtime.drain();
+    const session = (await runtime.listSessions())[0]!;
+
+    await expect(runtime.completeSession("work", "operator")).rejects.toThrow("exact active session ID");
+    await expect(runtime.completeSession(session.id, "operator")).rejects.toThrow("cleanup failed");
+    expect(await runtime.getSession(session.id)).toMatchObject({ status: "active" });
+    expect((await store.read()).capacityReservations).toHaveLength(1);
+    expect((await store.read()).sandboxes).toMatchObject([{
+      status: "cleaning",
+      checkpoint: { workspaceId: "ws-1", cleanupAttempt: 1 },
+    }]);
+
+    await expect(runtime.completeSession(session.id, "operator")).resolves.toBe(true);
+    expect(causes).toEqual(["completion:true:ws-1", "completion:true:ws-1"]);
+    expect(await runtime.getSession(session.id)).toMatchObject({ status: "ended", endReason: "operator" });
+    expect((await store.read()).capacityReservations).toEqual([]);
+    expect((await store.read()).sandboxes).toMatchObject([{
+      status: "cleaned",
+      checkpoint: { workspaceId: "ws-1", cleanupAttempt: 2 },
+    }]);
+    expect(await runtime.listSessionNotes(session.id)).toMatchObject([{
+      message: "Administrative cleanup completed",
+    }]);
+    await runtime.stop();
+  });
+
+  it("does not turn metadata-only session ending into resumed sandbox cleanup", async () => {
+    const channel = createChannel("metadata-end-resume");
+    const cleanup = vi.fn();
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({ create() {}, cleanup });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, () => {});
+    });
+    const now = new Date().toISOString();
+    const store = memoryStore({
+      sessions: [{ id: "session", key: "work", status: "ended", state: {}, createdAt: now, updatedAt: now, endedAt: now }],
+      events: [{ id: "event", channelId: channel.id, sourceId: "source", dedupeKey: `${channel.id}:source`, sessionKey: "work", receivedAt: now }],
+      deliveries: [{
+        id: "delivery",
+        eventId: "event",
+        channelId: channel.id,
+        clientId: client.id,
+        handlerId: client.handlers[0]!.id,
+        status: "pending",
+        phase: "cleaning",
+        attempts: 1,
+        maxAttempts: 3,
+        retryDelayMs: 0,
+        sessionId: "session",
+        staged: { mutations: [], notes: [], releaseCapacity: false },
+        createdAt: now,
+        updatedAt: now,
+      }],
+      sandboxes: [{
+        sessionId: "session",
+        clientId: client.id,
+        environmentId: environment.id,
+        status: "active",
+        checkpoint: {},
+        createdAt: now,
+        updatedAt: now,
+      }],
+    });
+    const runtime = await createRuntime({ channels: [channel], clients: [client], store });
+
+    await runtime.drain();
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect((await store.read()).deliveries[0]).toMatchObject({ status: "processed", phase: "completed" });
+    expect((await store.read()).sandboxes[0]).toMatchObject({ status: "active" });
+    await runtime.stop();
+  });
+
+  it("blocks administrative cleanup of an uncertain sandbox without reconciliation", async () => {
+    const channel = createChannel("sandbox-complete-uncertain");
+    const cleanup = vi.fn();
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({ create() {}, cleanup });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, () => {});
+    });
+    const store = memoryStore();
+    const runtime = await createRuntime({ channels: [channel], clients: [client], store });
+    await runtime.dispatch(channel, { id: "event", sessionKey: "work" });
+    await runtime.drain();
+    const session = (await runtime.listSessions())[0]!;
+    const uncertain = await store.read();
+    uncertain.sandboxes[0]!.status = "cleaning";
+    await store.write(uncertain);
+
+    await expect(runtime.completeSession(session.id)).rejects.toThrow("cleanup cannot continue without reconciliation");
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(await runtime.getSession(session.id)).toMatchObject({ status: "active" });
+    expect((await store.read()).sandboxes).toMatchObject([{ status: "cleaning" }]);
+    await runtime.stop();
+  });
+
+  it("keeps successful cleanup effects when a later sandbox cleanup fails", async () => {
+    const channel = createChannel("sandbox-complete-effects");
+    let secondCleanups = 0;
+    const firstEnvironment = createEnvironment("first-workspace", (builder) => {
+      builder.useSandbox({
+        create() {},
+        cleanup({ session }) {
+          session.set("first-cleaned", true);
+          session.note("First sandbox cleaned");
+        },
+      });
+    });
+    const secondEnvironment = createEnvironment("second-workspace", (builder) => {
+      builder.useSandbox({
+        create() {},
+        cleanup() {
+          secondCleanups += 1;
+          if (secondCleanups === 1) throw new Error("second cleanup failed");
+        },
+        reconcile() {
+          return "active";
+        },
+      });
+    });
+    const firstClient = createClient("first-client", (builder) => {
+      builder.useEnvironment(firstEnvironment);
+      builder.handle(channel, () => {});
+    });
+    const secondClient = createClient("second-client", (builder) => {
+      builder.useEnvironment(secondEnvironment);
+      builder.handle(channel, () => {});
+    });
+    const runtime = await createRuntime({ channels: [channel], clients: [firstClient, secondClient] });
+    await runtime.dispatch(channel, { id: "event", sessionKey: "work" });
+    await runtime.drain();
+    const session = (await runtime.listSessions())[0]!;
+
+    await expect(runtime.completeSession(session.id)).rejects.toThrow("second cleanup failed");
+    expect(await runtime.getSession(session.id)).toMatchObject({
+      status: "active",
+      state: { "first-cleaned": true },
+    });
+    expect(await runtime.listSessionNotes(session.id)).toMatchObject([{ message: "First sandbox cleaned" }]);
+
+    await expect(runtime.completeSession(session.id)).resolves.toBe(true);
+    expect(await runtime.listSessionNotes(session.id)).toHaveLength(1);
+    await runtime.stop();
+  });
+
+  it("rejects session completion while a claimed delivery is running", async () => {
+    const channel = createChannel("completion-running");
+    const started = deferred();
+    const release = deferred();
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, async ({ event }) => {
+        if (event.id === "initial") return;
+        started.resolve();
+        await release.promise;
+      });
+    });
+    const runtime = await createRuntime({ channels: [channel], clients: [client] });
+    await runtime.dispatch(channel, { id: "initial", sessionKey: "work" });
+    await runtime.start({ prettyStartupLog: false });
+    await waitFor(async () => {
+      expect((await runtime.listEvents()).find(({ event }) => event.sourceId === "initial")?.deliveries[0]?.status).toBe("processed");
+    });
+    const session = (await runtime.listSessions())[0]!;
+    await runtime.dispatch(channel, { id: "running", sessionKey: "work" });
+    await started.promise;
+
+    await expect(runtime.completeSession(session.id)).rejects.toThrow("unfinished delivery work");
+    expect(await runtime.getSession(session.id)).toMatchObject({ status: "active" });
+
+    release.resolve();
+    await runtime.stop();
+  });
+
+  it("rejects session completion for persisted pending and interrupted phase work", async () => {
+    const channel = createChannel("completion-persisted");
+    const client = createClient("client", (builder) => builder.handle(channel, () => {}));
+    const store = memoryStore();
+    const runtime = await createRuntime({ channels: [channel], clients: [client], store });
+    await runtime.dispatch(channel, { id: "initial", sessionKey: "work" });
+    await runtime.drain();
+    const session = (await runtime.listSessions())[0]!;
+    await runtime.dispatch(channel, { id: "pending", sessionKey: "work" });
+
+    await expect(runtime.completeSession(session.id)).rejects.toThrow("unfinished delivery work");
+
+    const interrupted = await store.read();
+    const delivery = interrupted.deliveries.find(({ status }) => status === "pending")!;
+    delivery.status = "processing";
+    delivery.attempts = 1;
+    delivery.sessionId = session.id;
+    delivery.startedAt = new Date().toISOString();
+    await store.write(interrupted);
+
+    await expect(runtime.completeSession(session.id)).rejects.toThrow("unfinished delivery work");
+    expect(await runtime.getSession(session.id)).toMatchObject({ status: "active" });
+    await runtime.stop();
+  });
+
+  it("adopts a legacy sandbox flag only when its configured client owner is unambiguous", async () => {
+    const cleaned: string[] = [];
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({
+        create() {},
+        cleanup({ session }) {
+          cleaned.push(session.id);
+        },
+      });
+    });
+    const client = createClient("client", (builder) => builder.useEnvironment(environment));
+    const state = emptyState();
+    state.sessions.push({
+      id: "session",
+      key: "work",
+      status: "active",
+      state: { "__sao.sandbox.workspace.created": true },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    });
+    const store = memoryStore(state);
+    const runtime = await createRuntime({ clients: [client], store });
+
+    await runtime.completeSession("session");
+
+    expect(cleaned).toEqual(["session"]);
+    expect(await runtime.getSession("session")).toMatchObject({ status: "ended", state: {} });
+    expect((await store.read()).sandboxes).toMatchObject([{
+      sessionId: "session",
+      clientId: "client",
+      environmentId: "workspace",
+      status: "cleaned",
+    }]);
+    await runtime.stop();
+  });
+
+  it("rejects ambiguous legacy sandbox ownership without cleanup or session end", async () => {
+    const cleanup = vi.fn();
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({ create() {}, cleanup });
+    });
+    const first = createClient("first", (builder) => builder.useEnvironment(environment));
+    const second = createClient("second", (builder) => builder.useEnvironment(environment));
+    const state = emptyState();
+    state.sessions.push({
+      id: "session",
+      key: "work",
+      status: "active",
+      state: { "__sao.sandbox.workspace.created": true },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    });
+    const store = memoryStore(state);
+    const runtime = await createRuntime({ clients: [first, second], store });
+
+    await expect(runtime.completeSession("session")).rejects.toThrow("cannot be safely assigned to a client");
+
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(await runtime.getSession("session")).toMatchObject({ status: "active" });
+    expect((await store.read()).sandboxes).toEqual([]);
+    await runtime.stop();
+  });
+
   it("does not persist sandbox creation when its hook cooperatively times out", async () => {
     vi.useFakeTimers();
     try {
@@ -1251,7 +1699,7 @@ describe("resource lifecycle", () => {
     }
   });
 
-  it("retries the whole attempt when sandbox cleanup fails", async () => {
+  it("retries cleanup without rerunning handling or acknowledgement", async () => {
     const channel = createChannel("sandbox");
     let creates = 0;
     let cleanups = 0;
@@ -1264,6 +1712,10 @@ describe("resource lifecycle", () => {
         cleanup() {
           cleanups += 1;
           if (cleanups === 1) throw new Error("cleanup uncertain");
+        },
+        reconcile() {
+          calls.push("reconcile:active");
+          return "active";
         },
       });
     });
@@ -1293,14 +1745,80 @@ describe("resource lifecycle", () => {
       "handle:1",
       "success:1",
       "failure:1:cleanup uncertain",
-      "handle:2",
-      "success:2",
+      "reconcile:active",
     ]);
     expect(await test.sessions.get("work")).toMatchObject({ status: "ended" });
     await test.stop();
   });
 
-  it("keeps the eager sandbox marker when cleanup cooperatively times out", async () => {
+  it("skips repeated delivery cleanup when reconciliation reports cleaned", async () => {
+    const channel = createChannel("sandbox-cleaned-reconcile");
+    let cleanups = 0;
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({
+        create() {},
+        cleanup() {
+          cleanups += 1;
+          throw new Error("response lost");
+        },
+        reconcile() {
+          return "cleaned";
+        },
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, {
+        retries: { attempts: 2 },
+        handle({ session }) { session.end(); },
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    await test.dispatch(channel, { id: "event" });
+
+    expect(cleanups).toBe(1);
+    expect((await test.deliveries.list())[0]).toMatchObject({ status: "processed", attempts: 2 });
+    expect(await test.runtime.listSandboxes()).toMatchObject([{ status: "cleaned" }]);
+  });
+
+  it("blocks delivery cleanup when reconciliation remains unknown", async () => {
+    const channel = createChannel("sandbox-unknown-reconcile");
+    let cleanups = 0;
+    const environment = createEnvironment("workspace", (builder) => {
+      builder.useSandbox({
+        create() {},
+        cleanup() {
+          cleanups += 1;
+          throw new Error("cleanup uncertain");
+        },
+        reconcile() {
+          return "unknown";
+        },
+      });
+    });
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, {
+        retries: { attempts: 2 },
+        handle({ session }) { session.end(); },
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    await test.dispatch(channel, { id: "event" });
+
+    expect(cleanups).toBe(1);
+    expect((await test.deliveries.list())[0]).toMatchObject({
+      status: "failed",
+      phase: "cleaning",
+      attempts: 2,
+      lastError: expect.stringContaining("remained unknown"),
+    });
+    expect(await test.runtime.listSandboxes()).toMatchObject([{ status: "unknown" }]);
+  });
+
+  it("keeps the durable sandbox record when cleanup cooperatively times out", async () => {
     vi.useFakeTimers();
     try {
       const channel = createChannel("sandbox-cleanup-timeout");
@@ -1339,8 +1857,9 @@ describe("resource lifecycle", () => {
       expect(failures).toBe(1);
       expect(await test.sessions.get("work")).toMatchObject({
         status: "active",
-        state: { "__sao.sandbox.workspace.created": true },
+        state: {},
       });
+      expect(await test.runtime.listSandboxes()).toMatchObject([{ status: "cleaning" }]);
       expect((await test.deliveries.list())[0]).toMatchObject({ status: "failed", attempts: 1 });
       await test.stop();
     } finally {
@@ -1448,6 +1967,109 @@ describe("resource lifecycle", () => {
 
     expect(seenPages).toEqual([undefined, 1]);
     expect(dispatchedBeforeCommit).toBe(true);
+  });
+
+  it("dispatches mapped fan-out events sequentially and commits the flattened order", async () => {
+    const committedEvents: string[] = [];
+    const channel = createChannel("poll", (builder) => {
+      builder.poll({
+        every: "1h",
+        fetch: () => ["first", "skip", "last"],
+        map(item) {
+          if (item === "skip") return null;
+          if (item === "first") {
+            return [
+              { id: "first-a" },
+              { id: "first-b" },
+            ] as const;
+          }
+          return { id: "last" };
+        },
+        commit({ events }) {
+          committedEvents.push(...events.map(({ id }) => id));
+        },
+      });
+    });
+    const runtime = await createRuntime({ channels: [channel] });
+
+    await runtime.start({ drain: true, prettyStartupLog: false });
+
+    expect((await runtime.listEvents()).map(({ event }) => event.sourceId)).toEqual([
+      "first-a",
+      "first-b",
+      "last",
+    ]);
+    expect(committedEvents).toEqual(["first-a", "first-b", "last"]);
+  });
+
+  it("keeps dispatched fan-out events but rolls back the cursor when a later dispatch fails", async () => {
+    const backing = memoryStore();
+    const store: Store = {
+      name: "fail-second-poll-dispatch",
+      init: () => backing.init(),
+      read: () => backing.read(),
+      async write(state) {
+        if (state.events.length > 1) throw new Error("second dispatch failed");
+        await backing.write(state);
+      },
+    };
+    const page = cursorKey<number>("page");
+    let committed = false;
+    const channel = createChannel("poll", (builder) => {
+      builder.poll({
+        every: "1h",
+        fetch: () => ["item"],
+        map(_item, { cursor }) {
+          cursor.set(page, 1);
+          return [{ id: "saved" }, { id: "not-saved" }];
+        },
+        commit() {
+          committed = true;
+        },
+      });
+    });
+    const runtime = await createRuntime({ channels: [channel], store });
+
+    await runtime.start({ drain: true, prettyStartupLog: false });
+
+    expect((await runtime.listEvents()).map(({ event }) => event.sourceId)).toEqual(["saved"]);
+    expect((await store.read()).cursors["poll:0"]).toEqual({});
+    expect(committed).toBe(false);
+  });
+
+  it("shares one pre-fetch poll timestamp with fetch, map, and commit", async () => {
+    vi.useFakeTimers();
+    try {
+      const startedAt = "2026-07-12T10:00:00.000Z";
+      const later = "2026-07-12T10:05:00.000Z";
+      vi.setSystemTime(startedAt);
+      const seen: string[] = [];
+      const channel = createChannel("poll", (builder) => {
+        builder.poll({
+          every: "1h",
+          fetch(context) {
+            seen.push(context.pollStartedAt);
+            vi.setSystemTime(later);
+            return ["item"];
+          },
+          map(_item, context) {
+            seen.push(context.pollStartedAt);
+            return { id: "event" };
+          },
+          commit(context) {
+            seen.push(context.pollStartedAt);
+          },
+        });
+      });
+      const runtime = await createRuntime({ channels: [channel] });
+
+      await runtime.start({ drain: true, prettyStartupLog: false });
+
+      expect(seen).toEqual([startedAt, startedAt, startedAt]);
+      expect(seen[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps a named poll cursor when poll registrations are reordered", async () => {
@@ -1708,12 +2330,12 @@ describe("resource lifecycle", () => {
     await runtime.dispatch("sandbox", { id: "event", sessionKey: "work" });
     await runtime.drain();
 
-    expect(ordinaryBeforeWrite).toEqual([undefined, undefined]);
-    expect(creates).toBe(2);
-    expect(cleanups).toBe(2);
+    expect(ordinaryBeforeWrite).toEqual([undefined]);
+    expect(creates).toBe(1);
+    expect(cleanups).toBe(1);
     expect(await runtime.getSession("work")).toMatchObject({
       status: "ended",
-      state: { workspaceId: "workspace-2", ordinary: 2 },
+      state: { workspaceId: "workspace-1", ordinary: 1 },
     });
     expect((await runtime.listEvents())[0]!.deliveries[0]).toMatchObject({ status: "processed", attempts: 2 });
     await runtime.stop();

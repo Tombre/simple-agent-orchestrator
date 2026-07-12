@@ -52,7 +52,8 @@ For a complete first run, including a useful handler and an HTTP request, follow
 - A **delivery** records one handler's attempts to process one event, including retries.
 - A **session** lets related events share state and notes, such as all comments on one pull request.
 - A client's optional **capacity** limit keeps only a configured number of long-running external agent sessions active while new sessions wait.
-- An **environment** gives a client process-local resources and can manage a session-specific sandbox, such as a worktree.
+- An **existing-only handler** can target the exact active session present at dispatch and durably ignore late callbacks without creating or rebinding work.
+- An **environment** gives a client process-local resources and can manage a session-specific sandbox, such as a worktree. Sandbox status and checkpoints survive retries, and administrative completion can reconcile and clean them before ending the session.
 - The **runtime** runs all of this in one process and can also serve HTTP.
 
 Set up channels, clients, and environments before initializing the runtime. It reads their setup once during `init()`, so code that changes them later won't reconfigure that runtime; create and start a new runtime instead.
@@ -77,7 +78,7 @@ Set up channels, clients, and environments before initializing the runtime. It r
 - **Treat files and logs as plaintext.** Event data, session state, notes, and errors may contain sensitive information. See [local saved data](docs/guides/project-integration.md#handle-local-saved-data-carefully).
 - **Use one process per JSON state file.** The [CLI guide](docs/guides/cli.md#work-safely-with-the-json-state-file) explains which commands can run beside `start`.
 
-The package requires Node.js 20 or newer and uses ESM. Most code imports from `simple-agent-orchestrator`; lower-level runtime and testing helpers are available from `simple-agent-orchestrator/runtime` and `simple-agent-orchestrator/testing`.
+The package requires Node.js 20 or newer and uses ESM. Most code imports from `simple-agent-orchestrator`; lower-level runtime, managed-process, and testing helpers are available from `simple-agent-orchestrator/runtime`, `simple-agent-orchestrator/node`, and `simple-agent-orchestrator/testing`.
 
 ## License
 

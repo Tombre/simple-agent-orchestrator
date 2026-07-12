@@ -5,7 +5,7 @@ Your handler may need an API client shared by all its work, or a separate worktr
 - An **environment** holds values and resources for one client while the runtime process is running, such as an API client or local server.
 - A **sandbox** creates and tracks one external resource for each session, such as a worktree or remote workspace, so retries can reuse it.
 
-Environment values disappear when the process stops. Sandbox creation details are saved with the session so a later retry can see that creation completed; with the project JSON store, that information is also available after a restart.
+Environment values disappear when the process stops. Each sandbox has its own saved record, identified by session, client, and environment. It keeps lifecycle status and JSON-safe checkpoint data across retries and restarts.
 
 ## Share a process resource with your handlers
 
@@ -72,7 +72,7 @@ const worktreeId = sessionKey<string>("worktree.id");
 
 export const codingEnvironment = createEnvironment("coding", (environment) => {
   environment.useSandbox({
-    async create({ session, event, project, signal }) {
+    async create({ session, event, project, signal, checkpoint }) {
       const branch = event.meta?.branch;
       if (typeof branch !== "string" || branch.trim() === "") {
         throw new Error("Expected event.meta.branch");
@@ -85,18 +85,25 @@ export const codingEnvironment = createEnvironment("coding", (environment) => {
         signal,
       });
 
+      await checkpoint({ worktreeId: id });
       session.set(worktreeId, id);
     },
 
-    async cleanup({ session, signal }) {
-      const id = session.getOptional(worktreeId);
-      if (id) await closeWorktree(id, { signal });
+    async reconcile({ currentCheckpoint, session, signal }) {
+      const id = currentCheckpoint.worktreeId;
+      if (typeof id !== "string") return "unknown";
+      return await worktreeExists(id, { signal }) ? "active" : "cleaned";
+    },
+
+    async cleanup({ currentCheckpoint, signal }) {
+      const id = currentCheckpoint.worktreeId;
+      if (typeof id === "string") await closeWorktree(id, { signal });
     },
   });
 });
 ```
 
-A **delivery** is one handler's saved work record for an event, including its attempts and result. The runtime calls `create` before the handler on the first delivery that uses this environment for the session. When `create` finishes, its session changes and a marker saying creation completed are saved immediately. If the handler later fails, a retry reuses that information instead of intentionally creating another sandbox.
+A **delivery** is one handler's saved work record for an event, including its attempts and result. Before calling `create`, the runtime saves a `creating` sandbox record. `checkpoint(update)` merges JSON-safe data into that record immediately, even if the hook later fails. When `create` finishes, the status becomes `active` and its session changes are saved immediately. If creation was interrupted, the optional `reconcile` hook runs before another create attempt and reports whether the resource is `active`, `cleaned`, or still `unknown`.
 
 Only one sandbox can be configured on an environment. A later `useSandbox` call replaces the earlier one.
 
@@ -110,11 +117,11 @@ Call `session.end()` in the handler when the work is complete. Sandbox cleanup r
 2. `onSuccess` succeeds.
 3. The handler called `session.end()`.
 
-Cleanup must also succeed before the delivery is marked processed and the ordinary session changes are saved. If cleanup throws, the attempt fails and follows the handler's retry rules.
+Cleanup must also succeed before the delivery is marked processed and the staged ordinary session changes are committed. If cleanup throws, the attempt fails and retries cleanup without rerunning `handle` or `onSuccess`.
 
-Ending a session through `sessions end` or `runtime.endSession()` releases its retained capacity but does not call sandbox cleanup or stop external work. If you end it administratively, remove the external workspace and stop the agent yourself. Stopping the runtime only unmounts process environments; it doesn't walk through active sessions and clean their sandboxes.
+Ending a session through `sessions end` or `runtime.endSession()` is still metadata-only: it releases retained capacity without sandbox cleanup. Use `sessions complete <session-id>` or `runtime.completeSession(sessionId)` when the runtime should mount the recorded environments, reconcile uncertain sandbox state, and run cleanup. Completion requires the exact active session ID and rejects while pending or processing deliveries target that session or its key. It ends the session only after every cleanup succeeds. A failed cleanup leaves the session active and retains capacity; a later attempt needs `reconcile` to decide whether cleanup should repeat.
 
-State pruning also doesn't clean external workspaces. It keeps an ended session while its sandbox marker still says the sandbox is active. Prefer ending through a handler when cleanup is required; if you've already ended it administratively, clean the external resource yourself and don't expect pruning to remove that saved session automatically.
+State pruning also doesn't clean external workspaces. It keeps an ended session while any sandbox record is not `cleaned`, and it conservatively keeps legacy active flags whose client owner is unknown.
 
 ## Make creation and cleanup safe to repeat
 
@@ -124,14 +131,14 @@ Plan for these cases:
 
 | If this happens | Expect this consequence | What your code should do |
 | --- | --- | --- |
-| The worktree is created, then the process stops before saving | `create` may run again | Find or create by a stable key such as `worktree:${session.id}`. |
-| Cleanup succeeds, then the process stops before saving the attempt | A retry may create a replacement sandbox | Treat an already-missing worktree as cleaned, and make replacement creation safe. |
+| The worktree is created, then the process stops before saving `active` | The record remains `creating` | Save its ID with `checkpoint`, then have `reconcile` check whether it exists. |
+| Cleanup succeeds, then the process stops before saving `cleaned` | The record remains `cleaning` | Have `reconcile` report `cleaned`; without reconciliation, the runtime blocks rather than repeating cleanup. |
 | Cleanup changes part of the resource and then fails | `cleanup` may run again | Check the current external state and finish the desired cleanup. |
 | The process exits during either function | Local records may not match the provider | Look up the resource by the stable key before changing it. |
 
 Locks prevent two deliveries from creating or cleaning the same session sandbox at once only inside one runtime process. They don't coordinate separate processes.
 
-Sandbox markers use the environment ID, not the client ID. If two clients can handle the same session and use environments with the same ID, their markers can collide. Give those environments different IDs.
+Sandbox records include the client ID as well as the environment ID, so two clients can use the same environment ID for one session without sharing lifecycle state.
 
 ## Respond to timeouts and shutdown
 

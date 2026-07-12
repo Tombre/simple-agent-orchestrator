@@ -22,6 +22,11 @@
       "import": "./dist/runtime/index.js",
       "default": "./dist/runtime/index.js"
     },
+    "./node": {
+      "types": "./dist/node/index.d.ts",
+      "import": "./dist/node/index.js",
+      "default": "./dist/node/index.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js",

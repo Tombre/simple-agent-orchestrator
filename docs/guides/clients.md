@@ -35,6 +35,19 @@ client.handle(reviewsChannel, async ({ event, session, signal }) => {
 
 A **session** is the saved context for events with the same `sessionKey`. It lets a later delivery continue the same pull request, conversation, or task. Session changes made with `set`, `delete`, `note`, or `end` are saved only if the entire attempt succeeds.
 
+Use `session: "existing-only"` in the object form for callbacks that are meaningful only while that session is still active:
+
+```ts
+client.handle(agentCompletedChannel, {
+  session: "existing-only",
+  handle({ capacity }) {
+    capacity.release();
+  },
+});
+```
+
+Dispatch binds this delivery to the exact active session ID. If no active session exists then, the delivery is saved as `ignored` with reason `session-missing`. If that session ends or disappears before claim, it becomes `ignored` with reason `session-ended`; a replacement session with the same key is never used. Work ignored before its first claim consumes no attempts. An automatic retry ignored after the session ends keeps its prior attempt and failure metadata; manual retry clears failure fields first. Ignored work does not create a session, reserve capacity, create a sandbox, or call `handle`, `onSuccess`, or `onFailure`. There is no `onIgnored` hook.
+
 An **environment** holds values such as an API client or local server for this client while the process runs. A **sandbox** is an optional worktree, remote workspace, or similar resource created separately for each session. You can start without either; the handler still receives an empty environment named `default`.
 
 Every handler receives:
@@ -77,18 +90,32 @@ client.handle(reviewsChannel, {
     });
   },
 
-  onFailure({ event, error, logger }) {
+  onFailure({ event, error, stage, logger }) {
     logger.error("Review delivery failed", {
       sourceId: event.id,
       error: sanitizeError(error),
+      stage,
     });
   },
 });
 ```
 
-The runtime calls `handle` first and `onSuccess` second. Once the handler context exists, a failure in the attempt calls `onFailure` with the original error. A setup failure before that context exists can't call it. If `onFailure` throws too, that new error is logged but doesn't replace the delivery's original error.
+The runtime calls `handle` first and `onSuccess` second. Once the handler context exists, a failure calls `onFailure` with the original error and failed stage. A setup failure before that context exists can't call it. If `onFailure` throws too, that new error is logged but doesn't replace the delivery's original error.
 
-Retries can repeat `handle` or `onSuccess`, including external work that completed just before an error or process exit. Use provider idempotency keys, lookup-before-create logic, or another source-specific safeguard for every external effect.
+Retries resume the failed saved phase, so cleanup and final-save failures do not repeat `handle` or `onSuccess`. The phase running during a failure or process exit can still repeat. Use provider idempotency keys, lookup-before-create logic, or another source-specific safeguard for every external effect.
+
+For durable terminal-failure work, register one client-level handler:
+
+```ts
+client.onExhausted({
+  retries: { attempts: 5, delay: "30s" },
+  async handle({ event, sourceDelivery, stage, failure, signal }) {
+    await publishDeadLetter({ event, sourceDelivery, stage, failure, signal });
+  },
+});
+```
+
+This work has its own retry budget. It receives the mounted environment when available, but the runtime does not create or ensure a sandbox for it. Its persisted failure descriptor is sanitized; raw primary delivery errors remain plaintext and should still be sanitized before you throw them.
 
 If an event fans out to several handlers, each delivery runs its own hooks. There is no event-wide `onSuccess` that waits for every delivery, so assign source confirmation to one handler whose success represents the result you need.
 
@@ -128,7 +155,7 @@ A delayed retry remains `pending` with a future `nextAttemptAt`. A continuously 
 
 If a process stops while a delivery is `processing`, startup or the next drain returns it to `pending` immediately and keeps the interrupted attempt in its count. If that interruption used the last configured attempt, the runtime grants one replacement attempt so the work isn't stranded.
 
-After all automatic attempts fail, an operator can manually retry a failed delivery. That grants one additional attempt that can run immediately; it doesn't apply to pending, processing, or processed deliveries. See [end a session or retry failed work](cli.md#end-a-session-or-retry-failed-work).
+After all automatic attempts fail, an operator can manually retry a failed delivery. That grants one additional attempt that can run immediately; it doesn't apply to pending, processing, processed, or ignored deliveries. See [end a session or retry failed work](cli.md#end-a-session-or-retry-failed-work).
 
 ## Stop an attempt that's taking too long
 
@@ -164,12 +191,15 @@ The reservation remains after the handler returns and after failures, restarts, 
 Use a completion channel on the same client when the external agent reports that it is done:
 
 ```ts
-client.handle(agentCompletedChannel, ({ capacity }) => {
-  capacity.release();
+client.handle(agentCompletedChannel, {
+  session: "existing-only",
+  handle({ capacity }) {
+    capacity.release();
+  },
 });
 ```
 
-The completion event must use the original `sessionKey`. It can run while capacity is full because that client and session already hold a slot. `capacity.release()` is saved only when the completion attempt succeeds. It keeps the session active, so a later event can reserve capacity again.
+The completion event must use the original `sessionKey`. `existing-only` prevents a late or misrouted completion from creating or binding to a replacement session. It can run while capacity is full because it never reserves a new slot; `capacity.reserved` reports whether this client already holds one for the bound session. `capacity.release()` is saved only when the completion attempt succeeds. It keeps the session active, so a later event can reserve capacity again.
 
 Calling `session.end()` after successful work releases every client's capacity reservation for that session. It does not stop any of those clients' external agents, so end a shared session only after all attached external work has stopped. Operators can also release one client's slot through the runtime API or offline CLI without ending the session.
 

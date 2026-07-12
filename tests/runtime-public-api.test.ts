@@ -225,6 +225,7 @@ describe("runtime public API", () => {
 
     const result = await runtime.runOffline((context) => {
       expect(Object.keys(context).sort()).toEqual([
+        "completeSession",
         "dispatch",
         "drain",
         "endSession",

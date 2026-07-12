@@ -61,9 +61,9 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
     id: "reviews",
     every: "60s",
 
-    async fetch({ cursor }) {
+    async fetch({ cursor, pollStartedAt }) {
       const since = cursor.get<string>("lastUpdatedAt");
-      return fetchRecentReviewCandidates({ since });
+      return fetchRecentReviewCandidates({ since, updatedBefore: pollStartedAt });
     },
 
     async map(review) {
@@ -91,6 +91,8 @@ export const githubReviewsChannel = createChannel("github.reviews", (channel) =>
 ```
 
 Use a stable `id` for any poll whose cursor must survive registration reordering. Unnamed polls use their registration index. Duplicate resolved identities fail configuration validation. Changing an ID selects another cursor key rather than migrating state; a never-used key starts empty, while a historical ID restores its existing cursor.
+
+`pollStartedAt` is a required ISO timestamp captured immediately before `fetch` and shared unchanged with `fetch`, every `map`, and `commit`. A poll map can return one `DispatchEvent`, a readonly array of events, or `null`/`undefined`. Arrays are flattened and dispatched sequentially in order; `commit.events` contains the same flattened order. A failure keeps events already dispatched but rolls back cursor changes.
 
 Event fields:
 
@@ -150,6 +152,8 @@ Timeout resolves from handler `timeout`, the `client.timeout(...)` value capture
 
 Retained capacity is disabled by default. `client.capacity({ maxActiveSessions: 5 })` reserves one durable slot per client and active session before the handler starts. New sessions stay pending without consuming an attempt when full; existing reserved sessions continue. Reservations survive handler return, failures, shutdown, and restart. A successful `capacity.release()` releases the current client's slot while `session.end()` releases all client slots for that session. Neither action stops external work.
 
+Set `session: "existing-only"` on an object handler for completion work that must target an already-active session. Dispatch binds its exact session ID. Missing sessions are durably `ignored` with `session-missing`; sessions that end or disappear before a later claim are `ignored` with `session-ended`, without rebinding a replacement or running another phase. Work ignored before its first claim consumes no attempt. An ignored retry keeps prior attempt metadata and staged but uncommitted effects. Ignored work creates no session, capacity reservation, or sandbox. There is no `onIgnored`.
+
 Handler context:
 
 ```ts
@@ -165,6 +169,8 @@ type HandlerContext = {
   capacity: { readonly reserved: boolean; release(): void };
 };
 ```
+
+Exhaustion context provides an optional `ReadonlySession` with only `id`, `key`, `status`, `get`, `getOptional`, and `has`. Exhaustion records are independent historical work and remain valid if their source delivery is manually retried to another status.
 
 Use `error instanceof HandlerTimeoutError` in `onFailure` to distinguish a deadline. The timeout error exposes `timeoutMs`; a timeout failure hook receives the already-aborted attempt signal.
 
@@ -187,9 +193,9 @@ session.note("Sent review to agent", { reviewId: event.payload.id });
 session.end({ reason: "github.pr.merged" });
 ```
 
-Use `session.ensure` when retries should reuse a persisted value. Its external factory can repeat if creation succeeds before local persistence, so use provider idempotency or reconciliation. Use an environment sandbox when an external resource also needs cleanup; sandbox create and cleanup hooks have the same retry requirement.
+Use `session.ensure` when retries should reuse a persisted value. Its external factory can repeat if creation succeeds before local persistence, so use provider idempotency or reconciliation. Use an environment sandbox when an external resource also needs cleanup. Sandbox records are keyed by session, client, and environment; `checkpoint(update)` eagerly saves JSON-safe resource data, and optional `reconcile` returns `active`, `cleaned`, or `unknown` before uncertain work continues.
 
-Ordinary handler/hook state, notes, and `session.end()` persist only after the complete attempt succeeds. Ensured values and state mutations made during sandbox creation persist eagerly. Cleanup followed by final-persistence failure can require sandbox recreation. Processing is retryable, not exactly once.
+Ordinary handler/hook state, notes, `session.end()`, and capacity-release intent are staged on the delivery after handling and acknowledgement, then committed only after cleanup and final persistence. A retry resumes the saved next phase and reconstructs the session from staged effects. Ensured values and state mutations made during sandbox creation remain eager. Processing is retryable, not exactly once.
 
 ## Environments and sandboxes
 
@@ -213,7 +219,7 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
   });
 
   environment.useSandbox({
-    async create({ event, session, project }) {
+    async create({ event, session, project, checkpoint }) {
       const branch = event.meta?.branch;
       if (typeof branch !== "string" || branch.trim() === "") {
         throw new Error("Expected event.meta.branch");
@@ -224,12 +230,19 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
         rootDirectory: project.root,
         branch,
       });
+      await checkpoint({ worktreeId });
       session.set("worktree.id", worktreeId);
     },
 
-    async cleanup({ session }) {
-      const worktreeId = session.getOptional<string>("worktree.id");
-      if (worktreeId) await closeWorktreeIdempotently(worktreeId);
+    async reconcile({ currentCheckpoint }) {
+      const id = currentCheckpoint.worktreeId;
+      if (typeof id !== "string") return "unknown";
+      return await worktreeExists(id) ? "active" : "cleaned";
+    },
+
+    async cleanup({ currentCheckpoint }) {
+      const id = currentCheckpoint.worktreeId;
+      if (typeof id === "string") await closeWorktreeIdempotently(id);
     },
   });
 });
@@ -261,11 +274,11 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 4 is current; valid version 1 and 2 state gains immediate retry defaults and an empty capacity collection, while version 3 keeps its retry fields and gains the empty collection. The next successful write persists version 4; invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
+Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 7 is current; valid versions 1 through 6 migrate in memory. Version 7 adds delivery phases, staged effects, and durable exhaustion records. Unfinished legacy deliveries resume at `sandbox`; processed and ignored deliveries become `completed`. Legacy sandbox flags are preserved because migration cannot infer their client owner. The next successful write persists version 7; invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
 
-Use `runtime.previewStatePrune({ before })` to inspect conservative retention and `runtime.runOffline(({ pruneState }) => pruneState({ before }))` to apply it. The CLI equivalents are `state prune --before <timestamp>` and the same command with `--apply`. Processed deliveries and safely unreferenced ended sessions/notes are eligible; operational records, cursors, and active sandbox markers are preserved. Events remain as dedupe history unless `dropDedupe: true`/`--drop-dedupe` is explicit, which allows old source identities to dispatch again.
+Use `runtime.previewStatePrune({ before })` to inspect conservative retention and `runtime.runOffline(({ pruneState }) => pruneState({ before }))` to apply it. The CLI equivalents are `state prune --before <timestamp>` and the same command with `--apply`. Processed and ignored deliveries and safely unreferenced ended sessions/notes are eligible; retained exhaustion work protects its source delivery, event, and optional session, while cursors, unfinished sandbox records, and legacy active flags are preserved. Events remain as dedupe history unless `dropDedupe: true`/`--drop-dedupe` is explicit, which allows old source identities to dispatch again.
 
-The JSON store rejects a second active runtime or offline operation for the same state file and reclaims ownership left by a dead PID. Atomic first-run initialization and runtime ownership require a local filesystem with atomic hard-link support and fail explicitly when unavailable. CLI `dispatch`, `sessions end`, `capacity release`, `events retry`, and `state prune --apply` acquire ownership and fail before writing while `start` is active; inspection commands, including `capacity list`, and retention preview remain available. Direct library mutations require an explicit `runtime.runOffline(...)` scope. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.
+The JSON store rejects a second active runtime or offline operation for the same state file and reclaims ownership left by a dead PID. Atomic first-run initialization and runtime ownership require a local filesystem with atomic hard-link support and fail explicitly when unavailable. CLI `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, and `state prune --apply` acquire ownership and fail before writing while `start` is active; inspection commands, including `capacity list`, and retention preview remain available. Direct library mutations require an explicit `runtime.runOffline(...)` scope. Custom stores can opt into the same enforcement with `runtimeLockPath`; omitting it is appropriate only for process-isolated state or a store that independently rejects additional active runtimes, not coordinated multi-runtime execution through the snapshot `Store` API.
 
 ## Runtime creation and offline work
 
@@ -287,6 +300,7 @@ await runtime.runOffline(async ({
   dispatch,
   drain,
   endSession,
+  completeSession,
   releaseCapacity,
   retryDelivery,
   pruneState,
@@ -297,6 +311,23 @@ await runtime.runOffline(async ({
 ```
 
 The context is valid only during the callback. `runOffline` requires an unused one-shot runtime, owns persistent state for the complete scope, and always shuts down. `drain` processes eligible work and recovers interruptions; mutation-only scopes do not recover unless they drain.
+
+## Managed Node processes
+
+```ts
+import { spawnManagedProcess } from "simple-agent-orchestrator/node";
+
+const child = spawnManagedProcess(process.execPath, ["agent-server.mjs"], {
+  cwd: project.root,
+  termGraceMs: 5_000,
+  ownsProcess: async (pid) => processRecordStillMatches(pid),
+});
+
+await child.waitUntilReady(() => agentClient.isReady(), { signal, timeoutMs: 30_000 });
+await child.stop();
+```
+
+The helper always uses detached mode, ignored standard streams, `unref()`, and `shell: false`. On POSIX, stop sends TERM and then KILL to the detached process group, with direct-child fallback when the group does not exist. Windows uses direct-child signaling. Stop is idempotent; the first call fixes its grace option. An optional async `ownsProcess(pid)` check runs once and authorizes graceful shutdown plus any required escalation. Readiness is application-defined: the helper does not add restart, port, HTTP, persistence, or provider behavior.
 
 ## Testing
 
@@ -310,11 +341,12 @@ await test.capacity.list();
 await test.capacity.release("client-id", "session-key"); // drains by default
 await test.events.list();
 await test.deliveries.list();
+await test.exhaustions.list();
 await test.readState();
 await test.stop();
 ```
 
-Pass config as the first argument rather than nesting it in an options object. Defaults are isolated memory state, silent logging, and disabled HTTP; options may override store/logger/HTTP and select either `root` or `project`. Event helpers return `{ event, deliveries }` records; delivery helpers expose stored deliveries directly. `test.runtime` is the public low-level escape hatch.
+Pass config as the first argument rather than nesting it in an options object. Defaults are isolated memory state, silent logging, and disabled HTTP; options may override store/logger/HTTP and select either `root` or `project`. Event helpers return `{ event, deliveries, exhaustions }` records; delivery and exhaustion helpers expose their stored records directly. `test.runtime` is the public low-level escape hatch.
 
 ## CLI reminders
 

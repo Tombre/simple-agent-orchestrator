@@ -10,6 +10,7 @@ export interface Cursor {
 }
 
 export interface PollContext {
+  pollStartedAt: string;
   channel: ChannelRuntimeApi;
   cursor: Cursor;
   project: ProjectContext;
@@ -30,7 +31,11 @@ export interface PollDefinition<TRaw = unknown> {
   readonly map?: (
     item: TRaw,
     ctx: PollContext,
-  ) => Promise<DispatchEvent | null | undefined> | DispatchEvent | null | undefined;
+  ) => Promise<DispatchEvent | readonly DispatchEvent[] | null | undefined>
+    | DispatchEvent
+    | readonly DispatchEvent[]
+    | null
+    | undefined;
   readonly commit?: (ctx: PollCommitContext<TRaw>) => Promise<void> | void;
 }
 

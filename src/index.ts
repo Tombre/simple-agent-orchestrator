@@ -25,6 +25,8 @@ export type {
   ClientBuilder,
   ClientDefinition,
   EventHandler,
+  ExhaustionContext,
+  ExhaustionOptions,
   HandlerCapacity,
   HandlerContext,
   HandleOptions,
@@ -38,13 +40,20 @@ export type {
   EnvironmentHookContext,
   EnvironmentInstance,
   SandboxContext,
+  SandboxCompletionContext,
   SandboxDefinition,
+  SandboxDeliveryContext,
+  SandboxDisposition,
 } from "./core/environment.js";
 
 export { defineKey, cursorKey, envKey, sessionKey } from "./core/types.js";
 export type {
   CapacityOptions,
   ConcurrencyOptions,
+  DeliveryIgnoredReason,
+  DeliveryStatus,
+  DeliveryPhase,
+  FailureStage,
   DispatchEvent,
   DispatchResult,
   JsonRecord,
@@ -57,14 +66,20 @@ export type {
   ProjectContext,
   RetryOptions,
   SessionNote,
+  SandboxStatus,
   StateKey,
   StoredDelivery,
+  StoredDeliveryEffects,
   StoredCapacityReservation,
   StoredEvent,
+  StoredExhaustion,
+  StoredFailureDescriptor,
   StoredSession,
+  StoredSandbox,
+  WorkStatus,
 } from "./core/types.js";
 
-export type { Session, SessionEndOptions } from "./core/session.js";
+export type { ReadonlySession, Session, SessionEndOptions } from "./core/session.js";
 
 export {
   CURRENT_STATE_VERSION,

@@ -1,8 +1,13 @@
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createChannel,
   createClient,
+  createEnvironment,
   HandlerTimeoutError,
+  jsonFileStore,
   memoryStore,
   type OrchestratorEvent,
 } from "../src/index.js";
@@ -30,6 +35,252 @@ afterEach(async () => {
 });
 
 describe("runtime behavior", () => {
+  it("leaves ordinary pending deliveries free of ignored terminal fields", async () => {
+    const channel = createChannel("manual");
+    const client = createClient("worker", (builder) => {
+      builder.handle(channel, () => {});
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    const result = await test.dispatch(channel, { id: "ordinary" }, { drain: false });
+
+    expect((await test.deliveries.list()).find(({ eventId }) => eventId === result.eventId)).toEqual(
+      expect.not.objectContaining({
+        ignoredReason: expect.anything(),
+        processedAt: expect.anything(),
+      }),
+    );
+  });
+
+  it("durably ignores existing-only deliveries when no active session exists at dispatch", async () => {
+    const channel = createChannel("completion");
+    const handled = vi.fn();
+    const failed = vi.fn();
+    const client = createClient("agent", (builder) => {
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.handle(channel, {
+        session: "existing-only",
+        retries: { attempts: 3 },
+        handle: handled,
+        onFailure: failed,
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    const result = await test.dispatch(channel, { id: "orphan", sessionKey: "missing" }, { drain: false });
+
+    expect(await test.events.get(result.eventId)).toMatchObject({
+      deliveries: [{
+        status: "ignored",
+        ignoredReason: "session-missing",
+        attempts: 0,
+        processedAt: expect.any(String),
+      }],
+    });
+    await test.drain();
+    expect(handled).not.toHaveBeenCalled();
+    expect(failed).not.toHaveBeenCalled();
+    expect(await test.sessions.list()).toEqual([]);
+    expect(await test.capacity.list()).toEqual([]);
+  });
+
+  it("binds existing-only work to the dispatch-time session and ignores it if that session ends before claim", async () => {
+    const start = createChannel("start");
+    const completion = createChannel("completion");
+    const sandboxCreate = vi.fn();
+    const handled = vi.fn();
+    const failed = vi.fn();
+    const environment = createEnvironment("agent-environment", (builder) => {
+      builder.useSandbox({ create: sandboxCreate });
+    });
+    const starter = createClient("starter", (builder) => {
+      builder.handle(start, () => {});
+    });
+    const agent = createClient("agent", (builder) => {
+      builder.useEnvironment(environment);
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.handle(completion, {
+        session: "existing-only",
+        retries: { attempts: 3 },
+        handle: handled,
+        onFailure: failed,
+      });
+    });
+    const test = await createTestRuntime({ channels: [start, completion], clients: [starter, agent] });
+    await test.dispatch(start, { id: "initial", sessionKey: "work" });
+    const original = await test.sessions.get("work");
+
+    const result = await test.dispatch(completion, { id: "completed", sessionKey: "work" }, { drain: false });
+    expect((await test.deliveries.list()).find(({ eventId }) => eventId === result.eventId)).toMatchObject({
+      status: "pending",
+      attempts: 0,
+      sessionId: original?.id,
+    });
+
+    await test.runtime.endSession(original!.id, "finished elsewhere");
+    await test.dispatch(start, { id: "replacement", sessionKey: "work" }, { drain: false });
+    await test.drain();
+
+    const replacement = (await test.sessions.list()).find((session) => session.status === "active");
+    expect(replacement?.id).not.toBe(original?.id);
+    expect((await test.deliveries.list()).find(({ eventId }) => eventId === result.eventId)).toMatchObject({
+      status: "ignored",
+      ignoredReason: "session-ended",
+      attempts: 0,
+      sessionId: original?.id,
+      processedAt: expect.any(String),
+    });
+    expect(handled).not.toHaveBeenCalled();
+    expect(failed).not.toHaveBeenCalled();
+    expect(sandboxCreate).not.toHaveBeenCalled();
+    expect(await test.capacity.list()).toEqual([]);
+  });
+
+  it("durably ignores existing-only work if its bound session disappears before claim", async () => {
+    const start = createChannel("start");
+    const completion = createChannel("completion");
+    const handled = vi.fn();
+    const starter = createClient("starter", (builder) => {
+      builder.handle(start, () => {});
+    });
+    const agent = createClient("agent", (builder) => {
+      builder.handle(completion, {
+        session: "existing-only",
+        handle: handled,
+      });
+    });
+    const test = await createTestRuntime({ channels: [start, completion], clients: [starter, agent] });
+    await test.dispatch(start, { id: "initial", sessionKey: "work" });
+    const result = await test.dispatch(completion, { id: "completed", sessionKey: "work" }, { drain: false });
+    const state = await test.readState();
+    state.sessions = [];
+    await test.store.write(state);
+
+    await test.drain();
+
+    expect(await test.deliveries.get(state.deliveries.find(({ eventId }) => eventId === result.eventId)!.id)).toMatchObject({
+      status: "ignored",
+      ignoredReason: "session-ended",
+      attempts: 0,
+      sessionId: expect.any(String),
+    });
+    expect(handled).not.toHaveBeenCalled();
+  });
+
+  it("terminally ignores an attempted existing-only retry through the JSON store", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sao-existing-only-retry-"));
+    const store = jsonFileStore(join(root, "state.json"));
+    const start = createChannel("start-existing-retry");
+    const completion = createChannel("completion-existing-retry");
+    const handled = vi.fn(({ session }: { session: { set(name: string, value: unknown): void } }) => {
+      session.set("uncommitted", true);
+    });
+    const acknowledged = vi.fn(() => { throw new Error("ack failed"); });
+    const starter = createClient("starter", (builder) => builder.handle(start, () => {}));
+    const agent = createClient("agent", (builder) => {
+      builder.handle(completion, {
+        session: "existing-only",
+        retries: { attempts: 2, delay: "1h" },
+        handle: handled,
+        onSuccess: acknowledged,
+      });
+    });
+    const test = await createTestRuntime({ channels: [start, completion], clients: [starter, agent] }, { store });
+    await test.dispatch(start, { id: "initial", sessionKey: "work" });
+    const session = await test.sessions.get("work");
+    await test.dispatch(completion, { id: "completion", sessionKey: "work" });
+    const attempted = (await test.events.list()).find(({ event }) => event.sourceId === "completion")!.deliveries[0]!;
+    expect(attempted).toMatchObject({ status: "pending", phase: "acknowledging", attempts: 1, staged: expect.any(Object) });
+
+    await test.runtime.endSession(session!.id, "ended elsewhere");
+    const due = await store.read();
+    due.deliveries.find(({ id }) => id === attempted.id)!.nextAttemptAt = new Date(0).toISOString();
+    await store.write(due);
+    await test.drain();
+
+    const ignored = await test.deliveries.get(attempted.id);
+    expect(ignored).toMatchObject({
+      status: "ignored",
+      phase: "completed",
+      ignoredReason: "session-ended",
+      attempts: 1,
+      lastFailureStage: "acknowledging",
+      staged: expect.any(Object),
+    });
+    expect(handled).toHaveBeenCalledTimes(1);
+    expect(acknowledged).toHaveBeenCalledTimes(1);
+    expect(await test.sessions.get(session!.id)).toMatchObject({ status: "ended", state: {} });
+    await expect(store.read()).resolves.toBeDefined();
+  });
+
+  it("times out and retries exhaustion handling independently", async () => {
+    vi.useFakeTimers();
+    try {
+      const channel = createChannel("exhaustion-timeout");
+      const starts = [deferred(), deferred()];
+      const client = createClient("client", (builder) => {
+        builder.onExhausted({
+          timeout: "10ms",
+          retries: { attempts: 2 },
+          async handle({ attempt, signal }) {
+            starts[attempt - 1]!.resolve();
+            if (attempt === 1) {
+              await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+            }
+          },
+        });
+        builder.handle(channel, { retries: { attempts: 1 }, handle() { throw new Error("failed"); } });
+      });
+      const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+      const dispatch = test.dispatch(channel, { id: "event" });
+      await starts[0]!.promise;
+      await vi.advanceTimersByTimeAsync(10);
+      await starts[1]!.promise;
+      await dispatch;
+
+      expect((await test.exhaustions.list())[0]).toMatchObject({ status: "processed", attempts: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs existing-only work for its bound active session without creating capacity or a sandbox", async () => {
+    const start = createChannel("start");
+    const completion = createChannel("completion");
+    const sandboxCreate = vi.fn();
+    const received: Array<{ sessionId: string; reserved: boolean }> = [];
+    const starter = createClient("starter", (builder) => {
+      builder.handle(start, () => {});
+    });
+    const agent = createClient("agent", (builder) => {
+      builder.capacity({ maxActiveSessions: 1 });
+      builder.useEnvironment(createEnvironment("agent-environment", (environment) => {
+        environment.useSandbox({ create: sandboxCreate });
+      }));
+      builder.handle(completion, {
+        session: "existing-only",
+        handle({ session, capacity }) {
+          received.push({ sessionId: session.id, reserved: capacity.reserved });
+        },
+      });
+    });
+    const test = await createTestRuntime({ channels: [start, completion], clients: [starter, agent] });
+    await test.dispatch(start, { id: "initial", sessionKey: "work" });
+    const session = await test.sessions.get("work");
+
+    await test.dispatch(completion, { id: "completed", sessionKey: "work" });
+
+    expect(received).toEqual([{ sessionId: session?.id, reserved: false }]);
+    expect(sandboxCreate).not.toHaveBeenCalled();
+    expect(await test.capacity.list()).toEqual([]);
+    expect((await test.events.list()).find(({ event }) => event.sourceId === "completed")?.deliveries[0]).toMatchObject({
+      status: "processed",
+      attempts: 1,
+      sessionId: session?.id,
+    });
+  });
+
   it("retains client capacity after handlers return until the session capacity is released", async () => {
     const startChannel = createChannel("start");
     const completionChannel = createChannel("complete");
@@ -399,22 +650,109 @@ describe("runtime behavior", () => {
       "handle:1",
       "success:1",
       "failure:1:acknowledgement uncertain",
-      "handle:2",
       "success:2",
     ]);
-    expect(operationKeys).toEqual([
-      "agent-message:retry:event",
-      "agent-message:retry:event",
-    ]);
+    expect(operationKeys).toEqual(["agent-message:retry:event"]);
     expect(await test.sessions.get("work")).toMatchObject({
-      state: { ordinary: 2 },
+      state: { ordinary: 1 },
     });
-    expect(await test.sessions.notes("work")).toMatchObject([{ message: "attempt 2" }]);
+    expect(await test.sessions.notes("work")).toMatchObject([{ message: "attempt 1" }]);
     expect((await test.deliveries.list())[0]).toMatchObject({
       status: "processed",
       attempts: 2,
       lastError: undefined,
     });
+  });
+
+  it("records the failed stage and exposes it to onFailure", async () => {
+    const channel = createChannel("stages");
+    const stages: string[] = [];
+    const client = createClient("client", (builder) => {
+      builder.handle(channel, {
+        retries: { attempts: 1 },
+        handle() {},
+        onSuccess() {
+          throw new Error("ack failed");
+        },
+        onFailure({ stage }) {
+          stages.push(stage);
+        },
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    await test.dispatch(channel, { id: "event" });
+
+    expect(stages).toEqual(["acknowledging"]);
+    expect((await test.deliveries.list())[0]).toMatchObject({
+      status: "failed",
+      phase: "acknowledging",
+      lastFailureStage: "acknowledging",
+    });
+  });
+
+  it("runs durable exhaustion work once after primary retry exhaustion", async () => {
+    const channel = createChannel("exhaustion");
+    const seen: Array<Record<string, unknown>> = [];
+    const client = createClient("client", (builder) => {
+      builder.onExhausted({
+        retries: { attempts: 2 },
+        handle({ sourceDelivery, stage, failure, attempt, session }) {
+          seen.push({ sourceDelivery, stage, failure, attempt, sessionId: session?.id });
+          if (attempt === 1) throw new Error("notify failed");
+        },
+      });
+      builder.handle(channel, {
+        retries: { attempts: 1 },
+        handle() {
+          throw new TypeError("secret token abc");
+        },
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    await test.dispatch(channel, { id: "event", sessionKey: "work" });
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toMatchObject({ stage: "handling", attempt: 1 });
+    expect(seen[0]!.failure).toEqual({ name: "TypeError", message: "Operation failed." });
+    expect((await test.exhaustions.list())[0]).toMatchObject({
+      status: "processed",
+      attempts: 2,
+      sourceDeliveryId: expect.any(String),
+      stage: "handling",
+    });
+    expect((await test.events.list())[0]!.exhaustions).toHaveLength(1);
+  });
+
+  it("manually retries terminal exhaustion work without retrying the source delivery", async () => {
+    const channel = createChannel("exhaustion-retry");
+    let allowExhaustion = false;
+    let primaryCalls = 0;
+    const client = createClient("client", (builder) => {
+      builder.onExhausted({
+        retries: { attempts: 1 },
+        handle() {
+          if (!allowExhaustion) throw new Error("notification failed");
+        },
+      });
+      builder.handle(channel, {
+        retries: { attempts: 1 },
+        handle() {
+          primaryCalls += 1;
+          throw new Error("primary failed");
+        },
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+    await test.dispatch(channel, { id: "event" });
+    const [work] = await test.exhaustions.list();
+
+    allowExhaustion = true;
+    expect(await test.exhaustions.retry(work!.id)).toBe(true);
+
+    expect(primaryCalls).toBe(1);
+    expect(await test.exhaustions.get(work!.id)).toMatchObject({ status: "processed", attempts: 2 });
   });
 
   it("keeps the original delivery error when the failure hook throws", async () => {

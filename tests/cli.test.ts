@@ -214,6 +214,18 @@ describe("CLI", { timeout: 15_000 }, () => {
     expect(await runCli("sessions", "show", "work-1", "--root", root)).toContain('"endReason": "operator"');
   });
 
+  it("completes a session by exact ID through the offline CLI command", async () => {
+    const { root } = await createFixture();
+    await runCli("dispatch", "manual", "--root", root, "--id", "event", "--session", "work");
+    const session = JSON.parse(await runCli("sessions", "show", "work", "--root", root)) as { id: string };
+
+    expect(await runCli("sessions", "complete", session.id, "--root", root, "--reason", "operator")).toContain("completed");
+    expect(await runCli("sessions", "show", session.id, "--root", root)).toContain('"endReason": "operator"');
+    const byKey = await runCliResult("sessions", "complete", "work", "--root", root);
+    expect(byKey.failed).toBe(true);
+    expect(byKey.stderr).toContain("exact active session ID");
+  });
+
   it("lists and releases retained capacity before draining queued sessions", async () => {
     const { root } = await createCapacityFixture();
     await runCli("dispatch", "manual", "--root", root, "--id", "first", "--session", "session-1");
@@ -250,7 +262,12 @@ describe("CLI", { timeout: 15_000 }, () => {
     const { root, stateFile } = await createFixture();
     await runCli("doctor", "--root", root);
     const state = JSON.parse(await readFile(stateFile, "utf8")) as Record<string, unknown>;
-    const { capacityReservations: _capacityReservations, ...historicalState } = state;
+    const {
+      capacityReservations: _capacityReservations,
+      sandboxes: _sandboxes,
+      exhaustions: _exhaustions,
+      ...historicalState
+    } = state;
     const versionOne = `${JSON.stringify({ ...historicalState, version: 1 }, null, 2)}\n`;
     await writeFile(stateFile, versionOne, "utf8");
 
@@ -285,6 +302,34 @@ describe("CLI", { timeout: 15_000 }, () => {
 
     expect(output).toContain("1/2");
     expect(output).toContain(nextAttemptAt);
+  });
+
+  it("shows terminal ignored reasons in event inspection", async () => {
+    const { root, stateFile } = await createFixture();
+    await runCli("dispatch", "manual", "--root", root, "--id", "ignored");
+    const state = JSON.parse(await readFile(stateFile, "utf8")) as {
+      deliveries: Array<Record<string, unknown>>;
+      sessions: Array<Record<string, unknown>>;
+    };
+    const processedAt = new Date().toISOString();
+    Object.assign(state.deliveries[0]!, {
+      status: "ignored",
+      phase: "completed",
+      attempts: 0,
+      processedAt,
+      updatedAt: processedAt,
+      ignoredReason: "session-ended",
+    });
+    delete state.deliveries[0]!.startedAt;
+    delete state.deliveries[0]!.lastError;
+    Object.assign(state.sessions[0]!, {
+      status: "ended",
+      endedAt: processedAt,
+      updatedAt: processedAt,
+    });
+    await writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    expect(await runCli("events", "list", "--root", root)).toContain("session-ended");
   });
 
   it("prints empty states and fails missing or inapplicable operations", async () => {
@@ -422,7 +467,7 @@ describe("CLI", { timeout: 15_000 }, () => {
       expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeGreaterThan(inspectionHeading);
       expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeLessThan(mutationHeading);
     }
-    for (const command of ["dispatch", "sessions end", "events retry"]) {
+    for (const command of ["dispatch", "sessions end", "sessions complete", "events retry"]) {
       expect(output.indexOf(`simple-agent-orchestrator ${command}`)).toBeGreaterThan(mutationHeading);
     }
     expect(output).toContain("simple-agent-orchestrator state prune --before <timestamp> [--apply] [--drop-dedupe]");

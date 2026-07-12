@@ -38,9 +38,10 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 
 - Shared runtime resources start in `environment.onMount`, not at module import time.
 - Cleanup is registered through `environment.onUnmount`.
-- Sandbox creation receives `{ event, session, project, environment }`, so branch/repo metadata comes from the triggering event.
+- Sandbox creation receives `{ event, session, project, environment, currentCheckpoint, checkpoint }`, so branch/repo metadata comes from the triggering event and resource IDs can be saved eagerly.
+- A sandbox with uncertain create or cleanup state implements `reconcile`; it reports `active`, `cleaned`, or `unknown` before the runtime chooses another action.
 - Sandbox cleanup checks whether the resource exists before closing it.
-- Sandbox lifecycle logic can reconcile create, cleanup, and recreate if final delivery persistence fails after cleanup.
+- Sandbox lifecycle logic treats persisted cleanup as complete; a retry of final delivery persistence does not recreate the sandbox.
 
 ## HTTP ingress
 
@@ -64,7 +65,7 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 - Handler timeout is explicit when an agent, subprocess, or network operation needs a cooperative deadline.
 - One-shot drains are not expected to wait for delayed pending work.
 - Fire-and-forget agents use `client.capacity(...)` when active external sessions need a durable cost or resource limit.
-- Completion events reuse the original session key and release capacity only after the external agent has stopped.
+- Completion events reuse the original session key, use `session: "existing-only"` when they must not create or rebind a session, and release capacity only after the external agent has stopped.
 - `client.concurrency({ perSession: true })` is used when the target agent/tool cannot safely receive same-session messages concurrently.
 
 ## CLI checks
@@ -84,7 +85,7 @@ curl http://127.0.0.1:3000/api/v1/status
 curl 'http://127.0.0.1:3000/api/v1/events?limit=25'
 ```
 
-The HTTP smoke commands run while ordinary `start` is active; stop it cleanly afterward. `dispatch`, `sessions end`, `capacity release`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. Ordinary `start` opens HTTP unless `--no-http` is passed; drain and inspection commands do not. The inspection commands, including `capacity list`, `state validate`, and a retention preview without `--apply`, remain available while `start` is active. CLI dispatch requires `--id`; list `--limit` must be positive; missing show/end/retry targets fail. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
+The HTTP smoke commands run while ordinary `start` is active; stop it cleanly afterward. `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, and `state prune --apply` are offline mutations and require the long-running runtime to be stopped. Ordinary `start` opens HTTP unless `--no-http` is passed; drain and inspection commands do not. The inspection commands, including `capacity list`, `state validate`, and a retention preview without `--apply`, remain available while `start` is active. CLI dispatch requires `--id`; `sessions complete` requires an exact active session ID; list `--limit` must be positive; missing show/end/retry targets fail. Before pruning, back up persistent state and inspect the exact IDs; `--drop-dedupe` permits old source identities to run again.
 
 ## Common failures
 

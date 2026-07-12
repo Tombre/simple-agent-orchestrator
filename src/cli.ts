@@ -34,14 +34,15 @@ const SCHEMAS: Record<string, CommandSchema> = {
   capacity: schema("capacity <list|release>", 1, 1),
   "capacity list": schema("capacity list [--json] [--limit <count>] [--root <path>] [--config <path>]", 2, 2, [...COMMON_FLAGS, "limit"], ["json"]),
   "capacity release": schema("capacity release <client-id> <session-id-or-key> [--root <path>] [--config <path>]", 4, 4, COMMON_FLAGS),
-  sessions: schema("sessions <list|show|end>", 1, 1),
+  sessions: schema("sessions <list|show|end|complete>", 1, 1),
   "sessions list": schema("sessions list [--json] [--limit <count>] [--root <path>] [--config <path>]", 2, 2, [...COMMON_FLAGS, "limit"], ["json"]),
   "sessions show": schema("sessions show <id-or-key> [--root <path>] [--config <path>]", 3, 3, COMMON_FLAGS),
   "sessions end": schema("sessions end <id-or-key> [--reason <reason>] [--root <path>] [--config <path>]", 3, 3, [...COMMON_FLAGS, "reason"]),
+  "sessions complete": schema("sessions complete <session-id> [--reason <reason>] [--root <path>] [--config <path>]", 3, 3, [...COMMON_FLAGS, "reason"]),
   events: schema("events <list|show|retry>", 1, 1),
   "events list": schema("events list [--json] [--limit <count>] [--root <path>] [--config <path>]", 2, 2, [...COMMON_FLAGS, "limit"], ["json"]),
   "events show": schema("events show <internal-event-id> [--root <path>] [--config <path>]", 3, 3, COMMON_FLAGS),
-  "events retry": schema("events retry <delivery-id> [--root <path>] [--config <path>]", 3, 3, COMMON_FLAGS),
+  "events retry": schema("events retry <delivery-or-exhaustion-id> [--root <path>] [--config <path>]", 3, 3, COMMON_FLAGS),
 };
 
 function schema(
@@ -85,8 +86,9 @@ Usage:
   Offline mutation commands (require start to be stopped):
   simple-agent-orchestrator dispatch <channel> --id <id> [--session <session-key>] [--input <text>]
   simple-agent-orchestrator sessions end <id-or-key> [--reason <reason>]
+  simple-agent-orchestrator sessions complete <session-id> [--reason <reason>]
   simple-agent-orchestrator capacity release <client-id> <session-id-or-key>
-  simple-agent-orchestrator events retry <delivery-id>
+  simple-agent-orchestrator events retry <delivery-or-exhaustion-id>
 
 Run any command or subcommand with --help for its usage.
 `);
@@ -386,7 +388,16 @@ async function sessionsCommand(args: ParsedArgs): Promise<void> {
   if (action === "show") {
     const session = await runtime.getSession(id);
     if (!session) throw new Error(`Session not found: ${id}`);
-    console.log(JSON.stringify({ ...session, notes: await runtime.listSessionNotes(session.id) }, null, 2));
+    console.log(JSON.stringify({
+      ...session,
+      sandboxes: await runtime.listSandboxes(session.id),
+      notes: await runtime.listSessionNotes(session.id),
+    }, null, 2));
+    return;
+  }
+  if (action === "complete") {
+    await runtime.runOffline(({ completeSession }) => completeSession(id, flagString(args.flags, "reason") ?? "completed"));
+    console.log("completed");
     return;
   }
   await runtime.runOffline(async ({ endSession }) => {
@@ -440,8 +451,8 @@ async function eventsCommand(args: ParsedArgs): Promise<void> {
     } else if (events.length === 0) {
       console.log("No events found.");
     } else {
-      console.table(events.flatMap(({ event, deliveries }) => deliveries.length
-        ? deliveries.map((delivery) => ({
+      console.table(events.flatMap(({ event, deliveries, exhaustions }) => [
+        ...deliveries.map((delivery) => ({
             eventId: event.id,
             sourceId: event.sourceId,
             channel: event.channelId,
@@ -450,10 +461,25 @@ async function eventsCommand(args: ParsedArgs): Promise<void> {
             client: delivery.clientId,
             handler: delivery.handlerId,
             status: delivery.status,
+            ignoredReason: delivery.ignoredReason ?? "",
             attempts: `${delivery.attempts}/${delivery.maxAttempts}`,
             nextAttemptAt: delivery.nextAttemptAt ?? "",
-          }))
-        : [{ eventId: event.id, sourceId: event.sourceId, channel: event.channelId, sessionKey: event.sessionKey, deliveryId: "", client: "", handler: "", status: "no-delivery", attempts: "0/0", nextAttemptAt: "" }]));
+          })),
+        ...exhaustions.map((work) => ({
+          eventId: event.id,
+          sourceId: event.sourceId,
+          channel: event.channelId,
+          sessionKey: event.sessionKey,
+          deliveryId: work.id,
+          client: work.clientId,
+          handler: "onExhausted",
+          status: `exhaustion:${work.status}`,
+          ignoredReason: "",
+          attempts: `${work.attempts}/${work.maxAttempts}`,
+          nextAttemptAt: work.nextAttemptAt ?? "",
+        })),
+        ...(deliveries.length === 0 && exhaustions.length === 0 ? [{ eventId: event.id, sourceId: event.sourceId, channel: event.channelId, sessionKey: event.sessionKey, deliveryId: "", client: "", handler: "", status: "no-delivery", ignoredReason: "", attempts: "0/0", nextAttemptAt: "" }] : []),
+      ]));
     }
     return;
   }
@@ -465,9 +491,12 @@ async function eventsCommand(args: ParsedArgs): Promise<void> {
     return;
   }
   await runtime.runOffline(async ({ drain, retryDelivery }) => {
-    const delivery = (await runtime.listEvents()).flatMap(({ deliveries }) => deliveries).find((candidate) => candidate.id === id);
-    if (!delivery) throw new Error(`Delivery not found: ${id}`);
-    if (delivery.status !== "failed") throw new Error(`Delivery is not failed: ${id}`);
+    const records = await runtime.listEvents();
+    const delivery = records.flatMap(({ deliveries }) => deliveries).find((candidate) => candidate.id === id);
+    const exhaustion = records.flatMap(({ exhaustions }) => exhaustions).find((candidate) => candidate.id === id);
+    if (!delivery && !exhaustion) throw new Error(`Delivery or exhaustion work not found: ${id}`);
+    if (delivery && delivery.status !== "failed") throw new Error(`Delivery is not failed: ${id}`);
+    if (exhaustion && exhaustion.status !== "failed") throw new Error(`Exhaustion work is not failed: ${id}`);
     await retryDelivery(id);
     await drain();
   });
@@ -500,7 +529,8 @@ async function main(): Promise<void> {
     case "capacity release": await capacityCommand(args); break;
     case "sessions list":
     case "sessions show":
-    case "sessions end": await sessionsCommand(args); break;
+    case "sessions end":
+    case "sessions complete": await sessionsCommand(args); break;
     case "events list":
     case "events show":
     case "events retry": await eventsCommand(args); break;

@@ -126,7 +126,7 @@ A `202` response means, "I've saved this event and queued its handlers." It does
 
 This request goes straight to the package's event route. The server doesn't authenticate callers or verify provider signatures. If you make it reachable beyond your machine or trusted network, add middleware that checks every request first; use TLS, rate limiting, and other protections appropriate to your deployment.
 
-When you're finished, press `Ctrl+C` in the terminal running `start` and let it shut down. Stop that process before running CLI commands that change the default JSON state file, including `dispatch`, `sessions end`, `capacity release`, `events retry`, and `state prune --apply`. Only one process may write that file at a time.
+When you're finished, press `Ctrl+C` in the terminal running `start` and let it shut down. Stop that process before running CLI commands that change the default JSON state file, including `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, and `state prune --apply`. Only one process may write that file at a time.
 
 ## What you just built
 

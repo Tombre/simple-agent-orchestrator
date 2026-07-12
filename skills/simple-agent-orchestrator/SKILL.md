@@ -21,19 +21,25 @@ Simple Agent Orchestrator is embedded, one-process durable plumbing. Channels in
 
 5. **Dispatch deliberately.** `channel.dispatch(event)` works only while exactly one initialized runtime is bound to that exact channel object. It throws with no binding or multiple bindings. Use `runtime.dispatch(channel, event)` to select by exact object or `runtime.dispatch(channelId, event)` to select by registered ID.
 
-6. **Make every external effect retry-safe.** Event dedupe is not exactly-once handling. `handle`, `onSuccess`, sandbox work, and interrupted attempts can repeat. Use stable operation-specific idempotency keys or reconciliation, never `attempt`. Use `session.ensure` for eager durable identifiers, but keep its external factory retry-safe. Pass `signal` to cancellation-aware work; timeout is cooperative.
+6. **Make every external effect retry-safe.** Event dedupe is not exactly-once handling. A delivery saves its next phase (`sandbox`, `handling`, `acknowledging`, `cleaning`, or `persisting`) and does not rerun completed earlier phases, but the phase interrupted before its checkpoint can repeat. Use stable operation-specific idempotency keys or reconciliation, never `attempt`. Use `session.ensure` for eager durable identifiers, but keep its external factory retry-safe. Pass `signal` to cancellation-aware work; timeout is cooperative.
 
-7. **Acknowledge sources after handling.** Put source acknowledgement in one designated `onSuccess`, not polling or the start of `handle`. It can still repeat after cleanup or persistence failure. Poll `commit` is an ingestion checkpoint, not delivery success.
+For completion callbacks that must not create or rebind a session, use the object handler option `session: "existing-only"`. It binds the exact active session at dispatch. A missing session is ignored without an attempt. If the session ends before a retry, the delivery is terminally ignored without running another phase and keeps its prior attempt metadata and uncommitted staged effects. Ignored work creates no new capacity or sandbox; inspect `ignoredReason` as `session-missing` or `session-ended`. There is no `onIgnored` hook.
 
-8. **Keep HTTP ownership clear.** Built-in normalized webhook and operational routes belong to the runtime. Provider parsing, authentication, signature verification, CORS, rate limiting, TLS, and exposure policy belong to project middleware/routes. Built-in operational summaries omit sensitive bodies/state/errors, but project handlers and logs have no categorical redaction guarantee.
+7. **Acknowledge sources after handling.** Put source acknowledgement in one designated `onSuccess`, not polling or the start of `handle`. It can repeat if acknowledgement itself fails or is interrupted, but cleanup and persistence retries resume after it. Poll `commit` is an ingestion checkpoint, not delivery success.
 
-9. **Treat persistence and logs as plaintext.** The JSON store, events, state, notes, cursors, errors, and ordinary project/default logs are plaintext. Do not persist or log credentials, tokens, or sensitive source content without an explicit policy. The generated example logs identifiers only.
+8. **Use durable exhaustion work for terminal reporting.** Register at most one `client.onExhausted({ retries?, timeout?, handle })`. It receives the event, source delivery, optional read-only session, failed stage, sanitized failure descriptor, attempt, signal, project, logger, client, and mounted environment. It is independent historical work with its own retry budget, remains after a source delivery is manually retried, does not create a sandbox, and never recursively creates exhaustion work.
 
-10. **Use the right runtime helper.** Prefer `createRuntime(config, options)` for programmatic persistent use; it defaults to the project JSON store. Project loaders discover config. The direct `OrchestratorRuntime` constructor plus `init()` is low-level. Use `runOffline(({ dispatch, drain, endSession, releaseCapacity, retryDelivery, pruneState }) => ...)` for scoped persistent mutations.
+9. **Keep HTTP ownership clear.** Built-in normalized webhook and operational routes belong to the runtime. Provider parsing, authentication, signature verification, CORS, rate limiting, TLS, and exposure policy belong to project middleware/routes. Built-in operational summaries omit sensitive bodies/state/errors, but project handlers and logs have no categorical redaction guarantee.
 
-11. **Test through the public harness.** Call `createTestRuntime(config, options)`, not a nested `{ config }` object. It defaults to isolated memory state, a silent logger, and no HTTP. Prefer dispatch/session/capacity/event/delivery helpers and always stop it; `test.runtime` is the public escape hatch for lifecycle behavior.
+10. **Treat persistence and logs as plaintext.** The JSON store, events, state, notes, cursors, errors, and ordinary project/default logs are plaintext. Do not persist or log credentials, tokens, or sensitive source content without an explicit policy. The generated example logs identifiers only.
 
-12. **Validate strict CLI usage.** Useful checks:
+11. **Use the right runtime helper.** Prefer `createRuntime(config, options)` for programmatic persistent use; it defaults to the project JSON store. Project loaders discover config. The direct `OrchestratorRuntime` constructor plus `init()` is low-level. Use `runOffline(({ dispatch, drain, endSession, completeSession, releaseCapacity, retryDelivery, pruneState }) => ...)` for scoped persistent mutations. `endSession` is metadata-only; `completeSession` requires an exact active session ID, rejects while that session has pending or processing deliveries, and cleans recorded sandboxes before ending or releasing capacity.
+
+12. **Test through the public harness.** Call `createTestRuntime(config, options)`, not a nested `{ config }` object. It defaults to isolated memory state, a silent logger, and no HTTP. Prefer dispatch/session/capacity/event/delivery/exhaustion helpers and always stop it; `test.runtime` is the public escape hatch for lifecycle behavior.
+
+13. **Manage detached local processes narrowly.** Import `spawnManagedProcess` from `simple-agent-orchestrator/node` when an environment needs a shell-free detached child. Use `waitUntilReady` for an application-defined readiness check and call idempotent `stop()` during cleanup. On POSIX, stop targets the detached process group with TERM then KILL; on Windows and when no POSIX group exists, it targets the direct child. Add `ownsProcess` when persisted or external identity data can verify ownership before signaling. This helper has no restart, port, HTTP, persistence, or provider policy.
+
+14. **Validate strict CLI usage.** Useful checks:
 
 ```bash
 npx simple-agent-orchestrator doctor
@@ -43,7 +49,7 @@ npx simple-agent-orchestrator events list --json --limit 25
 npx simple-agent-orchestrator sessions list --json --limit 25
 ```
 
-`dispatch --id` is required. Unknown flags, extra arguments, missing values, invalid limits, and missing show/retry/end records fail. Stop a long-running JSON-store runtime before `dispatch`, `sessions end`, `capacity release`, `events retry`, or `state prune --apply`. Inspection, `capacity list`, and prune preview remain available while it runs.
+`dispatch --id` is required. Unknown flags, extra arguments, missing values, invalid limits, and missing show/retry/end records fail. Stop a long-running JSON-store runtime before `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, or `state prune --apply`. Inspection, `capacity list`, and prune preview remain available while it runs.
 
 ## References
 

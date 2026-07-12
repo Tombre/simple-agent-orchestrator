@@ -29,11 +29,11 @@ Read [the design principles](docs/design-principles.md) before changing project 
 - **Poll and cursor**: a poll fetches source items and optionally maps them to dispatch events. Its durable cursor records source progress.
 - **Event**: the durable input unit. Source IDs, dedupe keys, and session keys are separate identities and must be chosen deliberately.
 - **Delivery**: one event's processing record for one matching client handler. Fan-out creates multiple independent deliveries.
-- **Client**: a globally identified consumer that registers handlers, optional retained session capacity, concurrency policy, retry defaults, and at most one environment.
+- **Client**: a globally identified consumer that registers handlers, optional durable exhaustion handling, retained session capacity, concurrency policy, retry defaults, and at most one environment.
 - **Handler**: a client's subscription to a channel. It owns `handle`, `onSuccess`, `onFailure`, and an optional retry override.
 - **Session**: durable continuity for a `sessionKey`. It stores typed state and notes across related deliveries; only active sessions are reused.
 - **Environment**: process-local resources mounted for a client. Values are not durable and environment definitions may own one sandbox lifecycle.
-- **Sandbox**: an optional session-scoped resource created and cleaned up by an environment. The package tracks lifecycle state; integrations own the actual resource.
+- **Sandbox**: an optional session-scoped resource created and cleaned up by an environment. A durable record keyed by session ID, client ID, and environment ID tracks lifecycle status and JSON-safe checkpoints; integrations own the actual resource and reconciliation disposition.
 - **Store**: a full runtime-state snapshot adapter. The package ships isolated memory storage and a local JSON-file store.
 - **Runtime**: the one-shot, in-process coordinator for dispatch, polling, workers, lifecycle, locking, and persistence.
 - **HTTP server**: the optional project/runtime-scoped Hono listener started by ordinary `start()` for health, normalized webhook ingestion, bounded read-only operational summaries, and project routes; it is not a client environment.
@@ -45,6 +45,7 @@ Canonical API details live in [the API reference](docs/api-reference.md), not in
 - `src/core/`: public definitions for channels, clients, environments, sessions, keys, events, and config.
 - `src/runtime/runtime.ts`: dispatch, polling, delivery claiming, retries, concurrency, lifecycle, and persistence.
 - `src/runtime/project.ts`: project-root discovery and TypeScript/JavaScript config loading.
+- `src/node/`: shell-free detached Node.js process lifecycle helper.
 - `src/stores/`: full-state store contract plus memory and JSON-file implementations.
 - `src/cli.ts`: initialization, execution, dispatch, inspection, and retry commands.
 - `src/testing/`: public in-memory test harness.
@@ -55,7 +56,7 @@ Canonical API details live in [the API reference](docs/api-reference.md), not in
 - `skills/simple-agent-orchestrator/`: coding-agent integration guidance shipped with the project.
 - `tasks/`: proposed reliability work; these documents are plans, not implemented behavior.
 
-Public package subpaths are `.`, `./runtime`, and `./testing`. The package is ESM-only.
+Public package subpaths are `.`, `./runtime`, `./node`, and `./testing`. The package is ESM-only.
 
 ## Guides And Skill
 
@@ -77,13 +78,15 @@ The installable coding-agent skill is [skills/simple-agent-orchestrator/SKILL.md
 1. A channel poll, CLI command, or project integration calls `runtime.dispatch(channelOrId, event)`; `channel.dispatch(event)` delegates only when exactly one initialized runtime is bound.
 2. Dispatch defaults `dedupeKey` to `event.id` and `sessionKey` to `${channelId}:${event.id}`.
 3. Dedupe is scoped to `channelId + dedupeKey`.
-4. A new event creates one pending delivery for every matching client handler.
-5. A worker claims a delivery, resolves or creates its active session, atomically acquires or reuses configured client capacity, and increments the attempt.
+4. A new event creates one delivery for every matching client handler. An `existing-only` handler with no active session gets a terminal ignored delivery; other matching work starts pending.
+5. A worker claims pending work, resolves or creates its active session as allowed by the handler, atomically acquires or reuses configured client capacity, and increments the attempt.
 6. The runtime ensures the client environment is mounted and creates its sandbox if needed.
-7. The runtime calls `handle`, then `onSuccess`.
-8. Success persists session mutations, notes, and requested capacity release and marks the delivery `processed`.
-9. Failure calls `onFailure`, records the error, and returns the delivery to `pending` or marks it `failed`; retained capacity remains reserved.
-10. Ended sessions remain as history and release their capacity reservations; a later event with the same key creates a new active session.
+7. The delivery advances through framework-owned `sandbox`, `handling`, `acknowledging`, `cleaning`, and `persisting` phases; its stored `phase` is the next phase.
+8. Successful handling and acknowledgement durably stage ordinary session mutations, notes, session-end intent, and capacity-release intent on the delivery without committing them to session state.
+9. Failure calls `onFailure` with the failed stage when context exists, records that stage, and returns the delivery to `pending` or marks it `failed`; retries resume the failed phase.
+10. Exhaustion atomically creates one independent durable client exhaustion record with a sanitized failure descriptor; exhaustion work has its own retries and never creates further exhaustion work.
+11. Final persistence merges staged effects, preserves administrative session end, and marks the delivery `processed`.
+12. Ended sessions remain as history and release their capacity reservations; a later event with the same key creates a new active session.
 
 ## Behavioral Invariants
 
@@ -102,6 +105,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - HTTP shutdown stops acceptance and closes idle connections before waiting for workers or releasing store ownership, and accepted dispatch work settles before ownership release.
 - Duplicate dispatch returns the original internal event ID and creates no new deliveries.
 - Events fan out across clients and across handlers on one client.
+- An `existing-only` handler binds the exact active session ID at dispatch. Missing sessions and bound sessions that end or disappear become terminal ignored deliveries without another attempt, new capacity, sandbox creation, or hooks; replacement sessions are never used. An ignored retry preserves truthful prior attempt metadata and staged but uncommitted effects.
 - Channel and client IDs are globally unique. Handler IDs are unique within a client.
 - Retry fields resolve independently through handler override, client default captured at handler registration, config default, then three attempts and zero delay.
 - Handler timeout resolves through handler override, client default captured at handler registration, config default, then zero (disabled); an explicit zero disables inheritance.
@@ -111,31 +115,32 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Capacity reservations survive handler return, failure, timeout, interruption, shutdown, and restart. Successful `capacity.release()` releases the current client's reservation, while successful or administrative session end releases every reservation for that session.
 - Capacity release never cancels external work. Integrations must confirm that a detached agent has stopped before releasing its slot.
 - `handle` runs before `onSuccess`. An error from either fails the attempt.
-- `onFailure` runs when a handler context exists; an error from `onFailure` is logged and does not replace the delivery error.
-- Manual retry applies only to `failed` deliveries and grants one immediately eligible additional attempt.
-- Startup and drain recover persisted `processing` deliveries to immediately eligible `pending`, preserve the interrupted attempt, and grant a replacement attempt if the interruption exhausted the retry budget.
+- `onFailure` runs when a handler context exists and receives `stage`; an error from `onFailure` is logged and does not replace the delivery error.
+- Manual retry applies to failed primary deliveries and failed exhaustion records and grants one immediately eligible additional attempt.
+- Startup and drain recover persisted `processing` deliveries and exhaustion work to immediately eligible `pending`, preserve the interrupted attempt, and grant a replacement attempt if the interruption exhausted the retry budget. Delivery recovery resumes its stored next phase.
 - Ordinary session mutations and notes persist only after a successful attempt.
 - `session.ensure` values persist eagerly and survive a failed attempt.
-- Sandbox creation state persists eagerly so handler retries reuse the same sandbox.
-- Sandbox cleanup is part of the delivery attempt: it runs after `handle` and `onSuccess`, but before final success persistence. Cleanup failure fails the attempt.
+- Sandbox lifecycle status and checkpoints persist eagerly so handler retries reuse or reconcile the same sandbox. Hook execution stays outside the runtime mutex; record writes stay inside it.
+- Sandbox records use `creating`, `active`, `cleaning`, `cleaned`, or `unknown`. Optional reconciliation runs before uncertain creation or cleanup continues and reports `active`, `cleaned`, or `unknown`.
+- Sandbox cleanup is a delivery phase after `handle` and `onSuccess`. Cleanup failure retries cleanup without rerunning completed handling or acknowledgement.
 - `session.get` throws when a value is absent; use `getOptional`, `has`, or `ensure` when absence is valid.
 - `session.end()` preserves history and cannot be undone by a concurrently completing handler.
 - Concurrent deliveries merge mutations to different session-state keys.
 - Concurrent writes to the same state key use completion-order last-write-wins behavior.
 - Executions of the same poll do not overlap within one runtime process.
 - `jsonFileStore` permits one active runtime or `runOffline()` scope per state file, releases ownership on `stop()`, and reclaims locks whose owning PID has exited.
-- Poll mapping is sequential. Mapped events are durably dispatched before `commit`.
+- A poll captures one ISO `pollStartedAt` immediately before `fetch` and shares it through `map` and `commit`. Poll mapping and flattened fan-out dispatch are sequential; `commit.events` preserves flattened order.
 - Cursor mutations made during a poll persist only after `fetch`, `map`, dispatch, and `commit` complete.
 - A named poll's cursor identity is `${channelId}:${pollId}` and remains stable when registrations move. An unnamed poll uses `${channelId}:${pollRegistrationIndex}`; reordering unnamed polls can reinterpret persisted cursors.
 - `memoryStore` isolates reads and writes by cloning.
 - `jsonFileStore` validates the full snapshot before runtime work and writes, does not replace invalid state, and writes via temporary file plus rename.
-- State version 4 is current. Structurally valid version 1 and 2 snapshots migrate deterministically in memory with immediate retry defaults and an empty capacity collection; version 3 retains its retry fields and gains the empty collection. The next successful write persists version 4; inspection does not rewrite older state.
-- Persisted event, session, note, and cursor values must be JSON-safe when using `jsonFileStore`.
+- State version 7 is current. Structurally valid version 1 through 6 snapshots migrate deterministically in memory; unfinished legacy deliveries resume at `sandbox`, processed and ignored deliveries become `completed`, and the exhaustion collection starts empty. Existing retry, capacity, ignored-delivery, sandbox, and legacy-flag migration rules remain intact. The next successful write persists version 7; inspection does not rewrite older state.
+- Persisted event, session, note, cursor, and sandbox checkpoint values must be JSON-safe when using `jsonFileStore`.
 - Dispatch may return `queued` with no matching handlers. Sessions are created only when a delivery is processed.
-- State pruning is explicit and preview-first. It removes only old processed deliveries and safely unreferenced ended sessions/notes, preserves cursors and operational records, preserves sessions with active sandbox markers, and retains event dedupe unless the operator explicitly drops it.
-- CLI parsing is schema-strict. Dispatch requires `--id`; session/event lists support positive `--limit` and `--json`; missing show/end/retry targets fail.
+- State pruning is explicit and preview-first. It removes only old processed or ignored deliveries and safely unreferenced ended sessions/notes/cleaned sandbox records, preserves cursors and operational records, preserves sessions with unfinished sandbox records or legacy active flags, and retains event dedupe unless the operator explicitly drops it.
+- CLI parsing is schema-strict. Dispatch requires `--id`; session/event lists support positive `--limit` and `--json`; missing show/end/complete/retry targets fail.
 - `init` discovers the nearest package by default, requires an existing regular valid object-valued `package.json`, never edits the host manifest, and with `--force` overwrites only known template files while preserving unknown files.
-- `createRuntime(config, options)` defaults to the project JSON store. Direct construction plus `init()` is the low-level memory-default path. `createTestRuntime(config, options)` defaults to isolated memory, silent logging, and disabled HTTP and exposes grouped event records, delivery helpers, cleanup, and `test.runtime`.
+- `createRuntime(config, options)` defaults to the project JSON store. Direct construction plus `init()` is the low-level memory-default path. `createTestRuntime(config, options)` defaults to isolated memory, silent logging, and disabled HTTP and exposes grouped event and exhaustion records, delivery/exhaustion helpers, cleanup, and `test.runtime`.
 
 ## Lifecycle And Concurrency
 
@@ -154,10 +159,11 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - `perSession: true` serializes same-session deliveries for that client only within one runtime process; every participating client must opt in for runtime-wide same-session serialization.
 - Retained capacity limits active sessions for one client in the saved state; it is separate from currently executing workers and has no automatic expiry.
 - Session merging, `session.ensure`, sandbox locks, poll locks, and `StoreMutex` provide only in-process coordination.
-- Sandbox creation and cleanup are serialized per session/environment in one process.
+- Sandbox creation and cleanup are serialized per session/client/environment in one process.
 - Sandbox cleanup runs only after `handle` and `onSuccess` succeed and the handler called `session.end()`.
 - Keep external side effects idempotent because delivery state and external systems are not one transaction.
-- CLI `dispatch`, `sessions end`, `capacity release`, `events retry`, and `state prune --apply` are offline operations that fail before writing while a `jsonFileStore` runtime owns the state. Inspection, `capacity list`, and retention preview remain available; direct library mutations need an explicit `runtime.runOffline(...)` scope.
+- `completeSession(sessionId, reason?)` and CLI `sessions complete` require an exact active session ID, reject while pending or processing deliveries target that session or key, mount recorded environments, reconcile and clean every recorded sandbox, and release capacity and end only after all cleanup succeeds. Failures remain durable and retryable. `endSession`/`sessions end` remain metadata-only.
+- CLI `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, and `state prune --apply` are offline operations that fail before writing while a `jsonFileStore` runtime owns the state. Inspection, `capacity list`, and retention preview remain available; direct library mutations need an explicit `runtime.runOffline(...)` scope.
 
 ## Accepted Limitations
 
@@ -172,9 +178,9 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Handler timeouts are cooperative. JavaScript that ignores cancellation cannot be forcefully terminated and external side effects may already have occurred.
 - Only memory and JSON-file stores ship.
 - There is no automatic retention, archival, or background compaction policy.
-- Sandbox creation has a crash window between external creation and marker persistence.
+- Sandbox creation has a crash window between external creation and checkpoint or active-status persistence.
 - `session.ensure` has the same crash window between external factory work and value persistence; factories must be retry-safe.
-- Sandbox markers are keyed by environment ID, not client ID, and can collide when clients with the same environment ID share a session.
+- Legacy sandbox flags do not identify a client. The runtime adopts one only when the configured environment has exactly one possible client owner; otherwise sandbox use and administrative completion reject conservatively.
 - Administrative `sessions end` does not invoke sandbox cleanup.
 - Runtime shutdown unmounts environments but does not clean every active session sandbox.
 - Poll dispatch, source acknowledgement, cursor commit, and external effects are not transactionally coupled.
@@ -194,7 +200,7 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Keep public exports explicit in `src/index.ts`, `src/runtime/index.ts`, and `src/testing/index.ts`.
 - Follow existing formatting: two spaces, double quotes, semicolons, and trailing commas.
 - There is no lint or formatter command; do not claim lint passed.
-- Keep durable identifiers stable. Changing channel IDs, handler IDs, poll IDs, unnamed poll order, keys, or sandbox markers can reinterpret persisted state.
+- Keep durable identifiers stable. Changing channel IDs, client IDs, environment IDs, handler IDs, poll IDs, unnamed poll order, keys, or sandbox identities can reinterpret persisted state.
 - Keep state mutations and read-modify-write sequences inside the runtime mutex. Read-only snapshot inspection may remain outside it.
 - Do not make ordinary session writes eager; failed attempts intentionally roll them back.
 - Do not make `session.ensure` or sandbox bookkeeping success-only; retries rely on eager persistence.

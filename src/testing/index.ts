@@ -10,6 +10,7 @@ import type {
   StoredCapacityReservation,
   StoredDelivery,
   StoredEvent,
+  StoredExhaustion,
   StoredSession,
 } from "../core/types.js";
 import { createProjectContext } from "../runtime/project.js";
@@ -31,6 +32,7 @@ export type TestRuntimeOptions = TestProjectOptions & {
 export interface TestEventRecord {
   event: StoredEvent;
   deliveries: StoredDelivery[];
+  exhaustions: StoredExhaustion[];
 }
 
 export interface TestRuntime {
@@ -61,6 +63,11 @@ export interface TestRuntime {
   readonly deliveries: {
     list(): Promise<StoredDelivery[]>;
     get(id: string): Promise<StoredDelivery | undefined>;
+    retry(id: string, options?: { drain?: boolean }): Promise<boolean>;
+  };
+  readonly exhaustions: {
+    list(): Promise<StoredExhaustion[]>;
+    get(id: string): Promise<StoredExhaustion | undefined>;
     retry(id: string, options?: { drain?: boolean }): Promise<boolean>;
   };
 }
@@ -140,6 +147,20 @@ export async function createTestRuntime(
       },
       async get(id) {
         return (await readState()).deliveries.find((delivery) => delivery.id === id);
+      },
+      async retry(id, retryOptions = {}) {
+        assertRunning();
+        const retried = await runtime.retryDelivery(id);
+        if (retried && (retryOptions.drain ?? true)) await runtime.drain();
+        return retried;
+      },
+    },
+    exhaustions: {
+      async list() {
+        return (await readState()).exhaustions;
+      },
+      async get(id) {
+        return (await readState()).exhaustions.find((work) => work.id === id);
       },
       async retry(id, retryOptions = {}) {
         assertRunning();

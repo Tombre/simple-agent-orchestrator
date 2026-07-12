@@ -128,12 +128,15 @@ Retry gives a failed delivery one additional attempt and runs ready work by defa
 | Inspect or release retained capacity | `test.capacity.list/release` |
 | Inspect events together with their deliveries | `test.events.list/get` |
 | Inspect or retry individual deliveries | `test.deliveries.list/get/retry` |
+| Inspect or retry exhaustion work | `test.exhaustions.list/get/retry` |
 | Read the complete in-memory state | `test.readState()` |
 | Use the selected project or store | `test.project` and `test.store` |
 | Call lower-level runtime methods | `test.runtime` |
 | Clean up environments and stop the runtime | `test.stop()` |
 
 `test.capacity.release(clientId, sessionIdOrKey)` drains newly available work by default. Pass `{ drain: false }` when you want to inspect the pending delivery before it runs.
+
+The event and delivery helpers return ignored deliveries unchanged, including `ignoredReason`, bound `sessionId` when present, prior attempts when a retry was ignored, and terminal timestamps. Use `{ drain: false }` to inspect an `existing-only` delivery before its bound session ends.
 
 Prefer these helpers over reaching into `test.runtime`. For concurrency, cancellation, or timeout tests, coordinate code with deferred promises, barriers, or fake timers rather than sleeps. That lets the test control exactly when work continues.
 

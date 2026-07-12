@@ -1,4 +1,4 @@
-import type { DispatchEvent, KeyLike, Logger, ProjectContext } from "./types.js";
+import type { DispatchEvent, JsonRecord, KeyLike, Logger, ProjectContext } from "./types.js";
 import { keyName } from "./types.js";
 import type { Session } from "./session.js";
 
@@ -18,13 +18,28 @@ export interface EnvironmentHookContext {
   signal: AbortSignal;
 }
 
-export interface SandboxContext extends EnvironmentHookContext {
+interface SandboxContextBase extends EnvironmentHookContext {
   session: Session;
+  readonly currentCheckpoint: Readonly<JsonRecord>;
+  checkpoint(update: JsonRecord): Promise<void>;
+}
+
+export interface SandboxDeliveryContext extends SandboxContextBase {
+  readonly cause: { readonly type: "delivery" };
   event: DispatchEvent;
 }
 
+export interface SandboxCompletionContext extends SandboxContextBase {
+  readonly cause: { readonly type: "completion"; readonly reason?: string | undefined };
+  event?: undefined;
+}
+
+export type SandboxContext = SandboxDeliveryContext | SandboxCompletionContext;
+export type SandboxDisposition = "active" | "cleaned" | "unknown";
+
 export interface SandboxDefinition {
-  readonly create: (ctx: SandboxContext) => Promise<void> | void;
+  readonly create: (ctx: SandboxDeliveryContext) => Promise<void> | void;
+  readonly reconcile?: (ctx: SandboxContext) => Promise<SandboxDisposition> | SandboxDisposition;
   readonly cleanup?: (ctx: SandboxContext) => Promise<void> | void;
 }
 

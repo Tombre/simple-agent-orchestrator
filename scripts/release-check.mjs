@@ -93,6 +93,8 @@ function assertPackageContents(packResult, shippedFiles) {
     "dist/index.d.ts",
     "dist/runtime/index.js",
     "dist/runtime/index.d.ts",
+    "dist/node/index.js",
+    "dist/node/index.d.ts",
     "dist/testing/index.js",
     "dist/testing/index.d.ts",
     ...shippedFiles,
@@ -181,9 +183,11 @@ async function verifyConsumer(consumerRoot, archive) {
   await writeFile(
     join(consumerRoot, "verify-types.ts"),
     `import { CURRENT_STATE_VERSION, createClient, createManualChannel, defineConfig, memoryStore, validateAndMigrateState } from "simple-agent-orchestrator";
-import type { DispatchResult, HttpRegistrationContext, OrchestratorState, StateValidationErrorCode } from "simple-agent-orchestrator";
+import type { DispatchResult, HttpRegistrationContext, OrchestratorState, ReadonlySession, StateValidationErrorCode, StoredDeliveryEffects, WorkStatus } from "simple-agent-orchestrator";
 import { createRuntime, loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
 import type { OfflineOperationContext } from "simple-agent-orchestrator/runtime";
+import { spawnManagedProcess } from "simple-agent-orchestrator/node";
+import type { ManagedProcess } from "simple-agent-orchestrator/node";
 import { createTestRuntime } from "simple-agent-orchestrator/testing";
 import type { TestRuntime } from "simple-agent-orchestrator/testing";
 
@@ -196,8 +200,14 @@ const config = { channels: [channel], clients: [client], http: { enabled: false,
 void defineConfig(config);
 const runtimePromise = createRuntime({ ...config, store: memoryStore() }, { root: "." });
 const testRuntimePromise: Promise<TestRuntime> = createTestRuntime(config, { root: "." });
+const managedProcess: ManagedProcess = spawnManagedProcess("node", ["-e", "process.exit(0)"]);
 declare const offline: OfflineOperationContext;
 const dispatchResult: Promise<DispatchResult> = offline.dispatch(channel, { id: "typed" });
+declare const readonlySession: ReadonlySession;
+const workStatus: WorkStatus = "pending";
+const effects: StoredDeliveryEffects = { mutations: [], notes: [], releaseCapacity: false };
+// @ts-expect-error Exhaustion sessions do not expose mutations.
+readonlySession.set("key", "value");
 // @ts-expect-error Public channel definitions are readonly.
 channel.id = "changed";
 // @ts-expect-error Public poll collections are readonly.
@@ -208,7 +218,11 @@ const state: OrchestratorState = validateAndMigrateState({ version: CURRENT_STAT
 const validationCode: StateValidationErrorCode = "invalid-state";
 void runtimePromise;
 void testRuntimePromise;
+void managedProcess.exit;
 void dispatchResult;
+void readonlySession.id;
+void workStatus;
+void effects;
 void state;
 void validationCode;
 void loadProjectOrchestrator({ root: "." });

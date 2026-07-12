@@ -1,4 +1,4 @@
-import type { KeyLike, SessionNote, StoredSession } from "./types.js";
+import type { KeyLike, SessionNote, StoredDeliveryEffects, StoredSession } from "./types.js";
 import { keyName } from "./types.js";
 import { newId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
@@ -7,14 +7,17 @@ export interface SessionEndOptions {
   reason?: string;
 }
 
-export interface Session {
+export interface ReadonlySession {
   readonly id: string;
   readonly key: string;
   readonly status: StoredSession["status"];
   get<T = unknown>(key: KeyLike<T>): T;
   getOptional<T = unknown>(key: KeyLike<T>): T | undefined;
-  set<T = unknown>(key: KeyLike<T>, value: T): void;
   has(key: KeyLike): boolean;
+}
+
+export interface Session extends ReadonlySession {
+  set<T = unknown>(key: KeyLike<T>, value: T): void;
   delete(key: KeyLike): void;
   ensure<T = unknown>(key: KeyLike<T>, factory: () => Promise<T> | T): Promise<T>;
   note(message: string, data?: unknown): void;
@@ -152,6 +155,43 @@ export class SessionImpl implements Session {
     const drained = [...this.notes];
     this.notes.length = 0;
     return drained;
+  }
+
+  pendingNotes(): SessionNote[] {
+    return [...this.notes];
+  }
+
+  clearNotes(): void {
+    this.notes.length = 0;
+  }
+
+  endRequested(): boolean {
+    return this.ended;
+  }
+
+  stagedEffects(releaseCapacity: boolean): StoredDeliveryEffects {
+    const stored = this.toStored();
+    return {
+      mutations: this.pendingMutations(),
+      notes: [...this.notes],
+      ...(this.ended ? { end: { endedAt: stored.endedAt!, ...(this.endReason === undefined ? {} : { reason: this.endReason }) } } : {}),
+      releaseCapacity,
+    };
+  }
+
+  restoreEffects(effects: StoredDeliveryEffects): void {
+    for (const mutation of effects.mutations) {
+      if (mutation.type === "set") this.set(mutation.name, mutation.value);
+      else this.delete(mutation.name);
+    }
+    this.notes.push(...effects.notes);
+    if (effects.end) {
+      this.ended = true;
+      this.endReason = effects.end.reason;
+      this.stored.status = "ended";
+      this.stored.endedAt = effects.end.endedAt;
+      this.stored.endReason = effects.end.reason;
+    }
   }
 }
 

@@ -11,6 +11,7 @@ export interface StatePrunePlan {
   before: string;
   dropDedupe: boolean;
   deliveryIds: string[];
+  exhaustionIds: string[];
   sessionIds: string[];
   noteIds: string[];
   eventIds: string[];
@@ -69,12 +70,29 @@ export function planStatePrune(state: OrchestratorState, options: StatePruneOpti
   const cutoff = normalizeCutoff(options.before);
   const dropDedupe = options.dropDedupe ?? false;
   const deliveryIds = state.deliveries
-    .filter((delivery) => delivery.status === "processed" && isBefore(delivery.processedAt, cutoff.timestamp))
+    .filter((delivery) =>
+      (delivery.status === "processed" || delivery.status === "ignored") &&
+      isBefore(delivery.processedAt, cutoff.timestamp)
+    )
     .map(({ id }) => id);
+  const exhaustionIds = state.exhaustions
+    .filter((work) => (work.status === "processed" || work.status === "failed") && isBefore(work.updatedAt, cutoff.timestamp))
+    .map(({ id }) => id);
+  const removedExhaustions = new Set(exhaustionIds);
+  const retainedExhaustions = state.exhaustions.filter(({ id }) => !removedExhaustions.has(id));
+  const exhaustionSourceDeliveryIds = new Set(retainedExhaustions.map(({ sourceDeliveryId }) => sourceDeliveryId));
   const removedDeliveries = new Set(deliveryIds);
+  for (const id of exhaustionSourceDeliveryIds) removedDeliveries.delete(id);
+  const safeDeliveryIds = deliveryIds.filter((id) => removedDeliveries.has(id));
   const retainedDeliveries = state.deliveries.filter(({ id }) => !removedDeliveries.has(id));
-  const retainedSessionIds = new Set(retainedDeliveries.flatMap(({ sessionId }) => sessionId ? [sessionId] : []));
-  const retainedEventIds = new Set(retainedDeliveries.map(({ eventId }) => eventId));
+  const retainedSessionIds = new Set([
+    ...retainedDeliveries.flatMap(({ sessionId }) => sessionId ? [sessionId] : []),
+    ...retainedExhaustions.flatMap(({ sessionId }) => sessionId ? [sessionId] : []),
+  ]);
+  const retainedEventIds = new Set([
+    ...retainedDeliveries.map(({ eventId }) => eventId),
+    ...retainedExhaustions.map(({ eventId }) => eventId),
+  ]);
 
   const sessionIds: string[] = [];
   const blockedSessions: StatePrunePlan["blockedSessions"] = [];
@@ -82,7 +100,10 @@ export function planStatePrune(state: OrchestratorState, options: StatePruneOpti
     if (session.status !== "ended" || !isBefore(session.endedAt, cutoff.timestamp)) continue;
     if (retainedSessionIds.has(session.id)) {
       blockedSessions.push({ id: session.id, reason: "retained-delivery" });
-    } else if (hasActiveSandbox(session.state)) {
+    } else if (
+      hasActiveSandbox(session.state) ||
+      state.sandboxes.some((sandbox) => sandbox.sessionId === session.id && sandbox.status !== "cleaned")
+    ) {
       blockedSessions.push({ id: session.id, reason: "active-sandbox" });
     } else {
       sessionIds.push(session.id);
@@ -98,7 +119,8 @@ export function planStatePrune(state: OrchestratorState, options: StatePruneOpti
   return {
     before: cutoff.iso,
     dropDedupe,
-    deliveryIds,
+    deliveryIds: safeDeliveryIds,
+    exhaustionIds,
     sessionIds,
     noteIds,
     eventIds: dropDedupe ? eventCandidates.map(({ id }) => id) : [],
@@ -109,11 +131,14 @@ export function planStatePrune(state: OrchestratorState, options: StatePruneOpti
 
 export function applyStatePrune(state: OrchestratorState, plan: StatePrunePlan): void {
   const deliveryIds = new Set(plan.deliveryIds);
+  const exhaustionIds = new Set(plan.exhaustionIds);
   const sessionIds = new Set(plan.sessionIds);
   const noteIds = new Set(plan.noteIds);
   const eventIds = new Set(plan.eventIds);
   state.deliveries = state.deliveries.filter(({ id }) => !deliveryIds.has(id));
+  state.exhaustions = state.exhaustions.filter(({ id }) => !exhaustionIds.has(id));
   state.sessions = state.sessions.filter(({ id }) => !sessionIds.has(id));
+  state.sandboxes = state.sandboxes.filter(({ sessionId }) => !sessionIds.has(sessionId));
   state.notes = state.notes.filter(({ id }) => !noteIds.has(id));
   state.events = state.events.filter(({ id }) => !eventIds.has(id));
 }

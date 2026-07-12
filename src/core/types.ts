@@ -84,7 +84,11 @@ export interface OrchestratorEvent<
   occurredAt?: string | undefined;
 }
 
-export type DeliveryStatus = "pending" | "processing" | "processed" | "failed";
+export type DeliveryStatus = "pending" | "processing" | "processed" | "failed" | "ignored";
+export type DeliveryIgnoredReason = "session-missing" | "session-ended";
+export type DeliveryPhase = "sandbox" | "handling" | "acknowledging" | "cleaning" | "persisting" | "completed";
+export type FailureStage = Exclude<DeliveryPhase, "completed">;
+export type WorkStatus = "pending" | "processing" | "processed" | "failed";
 export type SessionStatus = "active" | "ended" | "failed" | "paused";
 
 export interface StoredSession {
@@ -129,6 +133,44 @@ export interface StoredDelivery {
   processedAt?: string | undefined;
   lastError?: string | undefined;
   sessionId?: string | undefined;
+  ignoredReason?: DeliveryIgnoredReason | undefined;
+  phase: DeliveryPhase;
+  lastFailureStage?: FailureStage | undefined;
+  staged?: StoredDeliveryEffects | undefined;
+}
+
+export interface StoredDeliveryEffects {
+  mutations: Array<
+    | { type: "set"; name: string; value: unknown }
+    | { type: "delete"; name: string }
+  >;
+  notes: SessionNote[];
+  end?: { reason?: string | undefined; endedAt: string } | undefined;
+  releaseCapacity: boolean;
+}
+
+export interface StoredFailureDescriptor {
+  name: string;
+  message?: string | undefined;
+}
+
+export interface StoredExhaustion {
+  id: string;
+  sourceDeliveryId: string;
+  eventId: string;
+  clientId: string;
+  sessionId?: string | undefined;
+  stage: FailureStage;
+  failure: StoredFailureDescriptor;
+  status: WorkStatus;
+  attempts: number;
+  maxAttempts: number;
+  retryDelayMs: number;
+  createdAt: string;
+  updatedAt: string;
+  nextAttemptAt?: string | undefined;
+  startedAt?: string | undefined;
+  processedAt?: string | undefined;
 }
 
 export interface StoredCapacityReservation {
@@ -136,6 +178,19 @@ export interface StoredCapacityReservation {
   clientId: string;
   sessionId: string;
   acquiredAt: string;
+}
+
+export type SandboxStatus = "creating" | "active" | "cleaning" | "cleaned" | "unknown";
+
+export interface StoredSandbox {
+  sessionId: string;
+  clientId: string;
+  environmentId: string;
+  status: SandboxStatus;
+  checkpoint: JsonRecord;
+  createdAt: string;
+  updatedAt: string;
+  lastError?: string | undefined;
 }
 
 export interface SessionNote {
@@ -147,11 +202,13 @@ export interface SessionNote {
 }
 
 export interface OrchestratorState {
-  version: 4;
+  version: 7;
   sessions: StoredSession[];
   events: StoredEvent[];
   deliveries: StoredDelivery[];
+  exhaustions: StoredExhaustion[];
   capacityReservations: StoredCapacityReservation[];
+  sandboxes: StoredSandbox[];
   notes: SessionNote[];
   cursors: Record<string, Record<string, unknown>>;
 }

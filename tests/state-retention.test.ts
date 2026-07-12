@@ -38,7 +38,7 @@ function delivery(
   status: StoredDelivery["status"],
   sessionId: string,
 ): StoredDelivery {
-  const attempts = status === "pending" ? 0 : 1;
+  const attempts = status === "pending" || status === "ignored" ? 0 : 1;
   return {
     id,
     eventId,
@@ -46,19 +46,25 @@ function delivery(
     clientId: "worker",
     handlerId: "manual",
     status,
+    phase: status === "processed" || status === "ignored" ? "completed" : "sandbox",
     attempts,
     maxAttempts: status === "pending" ? 2 : 1,
     retryDelayMs: 0,
     createdAt: old,
     updatedAt: old,
     sessionId,
-    ...(status === "processed" ? { processedAt: id === "delivery-recent" ? recent : old } : {}),
+    ...(
+      status === "processed" || status === "ignored"
+        ? { processedAt: id === "delivery-recent" ? recent : old }
+        : {}
+    ),
+    ...(status === "ignored" ? { ignoredReason: "session-ended" as const } : {}),
   };
 }
 
 function fixtureState(): OrchestratorState {
   return {
-    version: 4,
+    version: 7,
     sessions: [
       session("event-processed", "ended"),
       session("event-pending", "ended"),
@@ -66,6 +72,7 @@ function fixtureState(): OrchestratorState {
       session("event-failed", "ended"),
       session("event-recent", "ended"),
       session("sandbox", "ended", { "__sao.sandbox.local.created": true }),
+      session("sandbox-record", "ended"),
       session("paused", "paused"),
       session("failed", "failed"),
       { ...session("missing-ended-at", "ended"), endedAt: undefined },
@@ -76,6 +83,7 @@ function fixtureState(): OrchestratorState {
       event("event-processing"),
       event("event-failed"),
       event("event-recent"),
+      event("event-ignored"),
       event("event-orphan"),
     ],
     deliveries: [
@@ -84,12 +92,39 @@ function fixtureState(): OrchestratorState {
       delivery("delivery-processing", "event-processing", "processing", "event-processing"),
       delivery("delivery-failed", "event-failed", "failed", "event-failed"),
       delivery("delivery-recent", "event-recent", "processed", "event-recent"),
+      delivery("delivery-ignored", "event-ignored", "ignored", "event-ignored"),
     ],
+    exhaustions: [{
+      id: "exhaustion-processed",
+      sourceDeliveryId: "delivery-failed",
+      eventId: "event-failed",
+      clientId: "worker",
+      sessionId: "event-failed",
+      stage: "handling",
+      failure: { name: "Error", message: "Operation failed." },
+      status: "processed",
+      attempts: 1,
+      maxAttempts: 1,
+      retryDelayMs: 0,
+      createdAt: old,
+      updatedAt: old,
+      processedAt: old,
+    }],
     capacityReservations: [],
+    sandboxes: [{
+      sessionId: "sandbox-record",
+      clientId: "worker",
+      environmentId: "local",
+      status: "unknown",
+      checkpoint: {},
+      createdAt: old,
+      updatedAt: old,
+    }],
     notes: [
       { id: "note-processed", sessionId: "event-processed", message: "old", createdAt: old },
       { id: "note-pending", sessionId: "event-pending", message: "needed", createdAt: old },
       { id: "note-sandbox", sessionId: "sandbox", message: "resource", createdAt: old },
+      { id: "note-sandbox-record", sessionId: "sandbox-record", message: "resource", createdAt: old },
     ],
     cursors: { "manual:poll": { position: "unchanged" } },
   };
@@ -115,17 +150,19 @@ describe("state retention", () => {
     expect(preview).toMatchObject({
       before,
       dropDedupe: false,
-      deliveryIds: ["delivery-processed"],
+      deliveryIds: ["delivery-processed", "delivery-ignored"],
+      exhaustionIds: ["exhaustion-processed"],
       sessionIds: ["event-processed"],
       noteIds: ["note-processed"],
       eventIds: [],
-      dedupeProtectedEventIds: ["event-processed", "event-orphan"],
+      dedupeProtectedEventIds: ["event-processed", "event-ignored", "event-orphan"],
     });
     expect(preview.blockedSessions).toEqual([
       { id: "event-pending", reason: "retained-delivery" },
       { id: "event-failed", reason: "retained-delivery" },
       { id: "event-recent", reason: "retained-delivery" },
       { id: "sandbox", reason: "active-sandbox" },
+      { id: "sandbox-record", reason: "active-sandbox" },
     ]);
     expect(await store.read()).toEqual(original);
 
@@ -139,10 +176,11 @@ describe("state retention", () => {
       "delivery-failed",
       "delivery-recent",
     ]);
+    expect(state.exhaustions).toEqual([]);
     expect(state.sessions.map(({ id }) => id)).not.toContain("event-processed");
     expect(state.sessions.map(({ id }) => id)).toContain("sandbox");
     expect(state.sessions.map(({ id }) => id)).toEqual(expect.arrayContaining(["paused", "failed", "missing-ended-at"]));
-    expect(state.notes.map(({ id }) => id)).toEqual(["note-pending", "note-sandbox"]);
+    expect(state.notes.map(({ id }) => id)).toEqual(["note-pending", "note-sandbox", "note-sandbox-record"]);
     expect(state.events).toEqual(original.events);
     expect(state.cursors).toEqual(original.cursors);
   });
@@ -154,12 +192,38 @@ describe("state retention", () => {
     expect(await runtime.dispatch("manual", { id: "source-old" })).toMatchObject({ status: "duplicate" });
 
     const preview = await runtime.previewStatePrune({ before, dropDedupe: true });
-    expect(preview.eventIds).toEqual(["event-processed", "event-orphan"]);
+    expect(preview.eventIds).toEqual(["event-processed", "event-ignored", "event-orphan"]);
     expect(preview.dedupeProtectedEventIds).toEqual([]);
     await runtime.pruneState({ before, dropDedupe: true });
 
     expect((await store.read()).events.map(({ id }) => id)).not.toContain("event-processed");
     expect(await runtime.dispatch("manual", { id: "source-old" })).toMatchObject({ status: "queued" });
+  });
+
+  it("retains source history referenced by newer exhaustion work after manual retry", async () => {
+    const { runtime, store } = await retentionRuntime();
+    const state = await store.read();
+    const source = state.deliveries.find(({ id }) => id === "delivery-failed")!;
+    source.status = "processed";
+    source.phase = "completed";
+    source.processedAt = old;
+    state.exhaustions[0]!.updatedAt = recent;
+    state.exhaustions[0]!.processedAt = recent;
+    await store.write(state);
+
+    const plan = await runtime.previewStatePrune({ before, dropDedupe: true });
+
+    expect(plan.exhaustionIds).not.toContain("exhaustion-processed");
+    expect(plan.deliveryIds).not.toContain("delivery-failed");
+    expect(plan.sessionIds).not.toContain("event-failed");
+    expect(plan.eventIds).not.toContain("event-failed");
+
+    await runtime.pruneState({ before, dropDedupe: true });
+    const retained = await store.read();
+    expect(retained.exhaustions.map(({ id }) => id)).toContain("exhaustion-processed");
+    expect(retained.deliveries.map(({ id }) => id)).toContain("delivery-failed");
+    expect(retained.sessions.map(({ id }) => id)).toContain("event-failed");
+    expect(retained.events.map(({ id }) => id)).toContain("event-failed");
   });
 
   it("rejects invalid cutoffs instead of deleting history", async () => {

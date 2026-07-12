@@ -6,6 +6,7 @@ The package requires Node.js 20 or newer and is ESM-only.
 | --- | --- |
 | `simple-agent-orchestrator` | Config, channels, clients, sessions, environments, stores, keys, and utilities |
 | `simple-agent-orchestrator/runtime` | Runtime creation and lifecycle, project loading, inspection, and maintenance |
+| `simple-agent-orchestrator/node` | Shell-free detached child-process lifecycle helpers for Node.js |
 | `simple-agent-orchestrator/testing` | In-memory integration tests |
 
 Internal package paths are not public APIs.
@@ -23,6 +24,7 @@ Internal package paths are not public APIs.
 - [Stores and state](#stores-and-state)
 - [Runtime API](#runtime-api)
 - [Project loading](#project-loading)
+- [Node process helper](#node-process-helper)
 - [Testing API](#testing-api)
 
 ## Quick API links
@@ -32,11 +34,12 @@ Internal package paths are not public APIs.
 | Config | [`defineConfig`](#defineconfigfactory), [`OrchestratorConfig`](#orchestratorconfig), [`RetryOptions`](#retryoptions), [`HttpConfig`](#httpconfig) |
 | Channels | [`createChannel`](#createchannelid-setup), [`createManualChannel`](#createmanualchannelid), [`channel.poll`](#channelpolldefinition), [`Cursor`](#cursor) |
 | Events | [`DispatchEvent`](#dispatchevent), [`DispatchResult`](#dispatchresult), [dispatch methods](#dispatch-methods) |
-| Clients | [`createClient`](#createclientid-setup), [`ClientBuilder`](#clientbuilder), [`client.handle`](#clienthandlechannel-options), [`HandlerContext`](#handlercontext), [`HandlerTimeoutError`](#handlertimeouterror) |
-| Sessions and resources | [`Session`](#session), [`createEnvironment`](#createenvironmentid-setup), [`EnvironmentInstance`](#environmentinstance), [`SandboxDefinition`](#sandboxdefinition) |
+| Clients | [`createClient`](#createclientid-setup), [`ClientBuilder`](#clientbuilder), [`client.handle`](#clienthandlechannel-options), [`client.onExhausted`](#clientonexhaustedoptions), [`HandlerContext`](#handlercontext), [`HandlerTimeoutError`](#handlertimeouterror) |
+| Sessions and resources | [`Session`](#session), [`createEnvironment`](#createenvironmentid-setup), [`EnvironmentInstance`](#environmentinstance), [`SandboxDefinition`](#sandboxdefinition), [`listSandboxes`](#runtime-dispatch-and-inspection), [`completeSession`](#administrative-mutations) |
 | Keys and utilities | [Typed state keys](#sessionkey-envkey-and-cursorkey), [`defineKey`](#definekeynamespace-options), [`parseDuration`](#parsedurationvalue), [`env`](#env) |
 | Stores | [`Store`](#store), [`memoryStore`](#memorystoreinitial), [`jsonFileStore`](#jsonfilestorepath-and-filestorepath), [state validation](#state-validation), [saved records](#saved-records) |
 | Runtime | [`createRuntime`](#createruntimeconfig-options), [`OrchestratorRuntime`](#new-orchestratorruntimeoptions), [start and stop](#start-and-stop-a-runtime), [`runOffline`](#runofflineoperation), [state retention](#state-retention) |
+| Node process | [`spawnManagedProcess`](#spawnmanagedprocesscommand-args-options) |
 | Projects and tests | [`ProjectContext`](#projectcontext), [project loading](#discovery-and-loading-functions), [`createTestRuntime`](#createtestruntimeconfig-options), [`TestRuntime`](#testruntime) |
 
 ## Root exports
@@ -73,11 +76,11 @@ Import these APIs from `simple-agent-orchestrator`.
 | --- | --- |
 | Config | `DefineConfigContext`, `ConfigFactory`, `HttpConfig`, `HttpDispatch`, `HttpRegistrationContext`, `HttpRegistrationHook`, `OrchestratorConfig` |
 | Channels | `ChannelBuilder`, `ChannelDefinition`, `ChannelRuntimeApi`, `Cursor`, `PollCommitContext`, `PollContext`, `PollDefinition` |
-| Clients | `CapacityOptions`, `ClientBuilder`, `ClientDefinition`, `EventHandler`, `HandlerCapacity`, `HandlerContext`, `HandleOptions` |
-| Environments | `EnvironmentBuilder`, `EnvironmentDefinition`, `EnvironmentHookContext`, `EnvironmentInstance`, `SandboxContext`, `SandboxDefinition` |
-| Events and state | `ConcurrencyOptions`, `DispatchEvent`, `DispatchResult`, `JsonRecord`, `JsonValue`, `OrchestratorEvent`, `OrchestratorState`, `ProjectContext`, `RetryOptions`, `SessionNote`, `StoredCapacityReservation`, `StoredDelivery`, `StoredEvent`, `StoredSession` |
+| Clients | `CapacityOptions`, `ClientBuilder`, `ClientDefinition`, `EventHandler`, `ExhaustionContext`, `ExhaustionOptions`, `HandlerCapacity`, `HandlerContext`, `HandleOptions` |
+| Environments | `EnvironmentBuilder`, `EnvironmentDefinition`, `EnvironmentHookContext`, `EnvironmentInstance`, `SandboxCompletionContext`, `SandboxContext`, `SandboxDefinition`, `SandboxDeliveryContext`, `SandboxDisposition` |
+| Events and state | `ConcurrencyOptions`, `DeliveryIgnoredReason`, `DeliveryPhase`, `DeliveryStatus`, `FailureStage`, `DispatchEvent`, `DispatchResult`, `JsonRecord`, `JsonValue`, `OrchestratorEvent`, `OrchestratorState`, `ProjectContext`, `RetryOptions`, `SandboxStatus`, `SessionNote`, `StoredCapacityReservation`, `StoredDelivery`, `StoredDeliveryEffects`, `StoredEvent`, `StoredExhaustion`, `StoredFailureDescriptor`, `StoredSandbox`, `StoredSession`, `WorkStatus` |
 | Keys and logging | `KeyBuilder`, `KeyLike`, `Logger`, `StateKey` |
-| Sessions | `Session`, `SessionEndOptions` |
+| Sessions | `ReadonlySession`, `Session`, `SessionEndOptions` |
 | Stores | `StateValidationErrorCode`, `Store` |
 
 ## When definitions are read
@@ -265,8 +268,9 @@ interface PollDefinition<TRaw = unknown> {
   readonly map?: (
     item: TRaw,
     context: PollContext,
-  ) => Promise<DispatchEvent | null | undefined>
+  ) => Promise<DispatchEvent | readonly DispatchEvent[] | null | undefined>
     | DispatchEvent
+    | readonly DispatchEvent[]
     | null
     | undefined;
   readonly commit?: (
@@ -279,6 +283,7 @@ interface PollDefinition<TRaw = unknown> {
 
 ```ts
 interface PollContext {
+  pollStartedAt: string;
   channel: ChannelRuntimeApi;
   cursor: Cursor;
   project: ProjectContext;
@@ -292,7 +297,9 @@ interface PollCommitContext<TRaw = unknown> extends PollContext {
 }
 ```
 
-A poll runs `fetch`, maps each item sequentially, saves mapped events, runs `commit`, then saves cursor changes. On failure, cursor changes are discarded; events already saved remain in the store.
+A poll captures `pollStartedAt` immediately before `fetch` as an ISO timestamp and passes that same value to `fetch`, every `map` call, and `commit`. It maps each item sequentially; `map` may return one event, a readonly array of events, or `null`/`undefined` to skip the item. Arrays are flattened and dispatched sequentially in return order. `commit.events` contains that flattened event order.
+
+After dispatch, the poll runs `commit` and then saves cursor changes. On failure, cursor changes are discarded; events already saved remain in the store, including earlier events from a fan-out array.
 
 A named poll uses cursor ID `${channelId}:${pollId}`. An unnamed poll uses `${channelId}:${registrationIndex}`. Renaming a named poll or reordering unnamed polls can select different saved cursor data; cursors are not migrated.
 
@@ -383,6 +390,7 @@ interface ClientBuilder {
   concurrency(options: ConcurrencyOptions): void;
   retries(options: RetryOptions): void;
   timeout(value: number | string): void;
+  onExhausted(options: ExhaustionOptions): void;
   handle(channel: ChannelDefinition, handler: EventHandler | HandleOptions): void;
 }
 ```
@@ -407,21 +415,40 @@ interface HandleOptions<
   TMeta extends Record<string, unknown> = Record<string, unknown>,
 > {
   readonly id?: string;
+  readonly session?: "existing-only";
   readonly retries?: RetryOptions;
   readonly timeout?: number | string;
   readonly handle: EventHandler<TPayload, TInput, TMeta>;
   readonly onSuccess?: EventHandler<TPayload, TInput, TMeta>;
   readonly onFailure?: (
-    context: HandlerContext<TPayload, TInput, TMeta> & { error: unknown },
+    context: HandlerContext<TPayload, TInput, TMeta> & { error: unknown; stage: FailureStage },
   ) => Promise<void> | void;
 }
 ```
 
 Default handler IDs use `${clientId}:${channelId}:${registrationIndex}` with a one-based index. Handler IDs must be unique within a client.
 
-Each attempt creates the sandbox if needed, runs `handle`, runs `onSuccess`, cleans up the sandbox if the session ended, then saves the result. An error after context creation calls `onFailure`. Errors from `onFailure` are logged and do not replace the attempt error.
+`session: "existing-only"` binds the delivery to the exact active session ID during dispatch. With no active session, dispatch persists terminal status `ignored` and reason `session-missing`. If the bound session is not active at a later claim, the delivery becomes `ignored` with reason `session-ended`; it does not bind a newer session with the same key or run another phase. Work ignored before its first claim has zero attempts. An automatic retry ignored after the session ends keeps its prior attempt count, failure details, and staged but uncommitted effects. Manual retry clears the prior failure fields before the next claim. Ignoring the delivery does not create a session, capacity reservation, or sandbox, or invoke another handler hook. There is no `onIgnored` hook.
 
-Processing is retryable, not exactly once. `handle`, `onSuccess`, cleanup, and external effects can repeat. Keep external effects idempotent.
+The saved delivery `phase` names the next operation: `sandbox`, `handling`, `acknowledging`, `cleaning`, or `persisting`. A claim consumes one delivery attempt and resumes that phase. Successful phases are not repeated after a later phase fails. The runtime stages ordinary session changes, notes, session-end intent, and capacity-release intent on the delivery after `handle` and `onSuccess`; staged values are reconstructed for later phases but are not visible as committed session state. `completed` is the terminal phase.
+
+An error after context creation calls `onFailure` with the failed `stage`. Errors from `onFailure` are logged and do not replace the attempt error.
+
+Processing is retryable, not exactly once. The currently running phase can repeat after an interruption because an outside effect and its local checkpoint are not one transaction. Keep external effects idempotent.
+
+### `client.onExhausted(options)`
+
+```ts
+interface ExhaustionOptions {
+  readonly retries?: RetryOptions;
+  readonly timeout?: number | string;
+  readonly handle: (context: ExhaustionContext) => Promise<void> | void;
+}
+```
+
+Registers at most one client-level handler. When a primary delivery uses its final attempt in any phase, the runtime atomically creates one independent durable exhaustion record. Its context contains `event`, `sourceDelivery`, optional `session`, `stage`, sanitized `failure`, `attempt`, `signal`, `project`, `logger`, `environment`, and `client`. The runtime mounts the client environment but does not create or ensure a sandbox. Exhaustion failures use their own fixed retry budget and never create another exhaustion record. Exhaustion options do not inherit handler, client, or config retry and timeout settings; they default to three attempts, zero delay, and no timeout.
+
+`ExhaustionContext.session` is a `ReadonlySession`: it exposes identity plus `get`, `getOptional`, and `has`, but no mutation methods. Exhaustion work does not commit session mutations.
 
 ### `HandlerContext`
 
@@ -448,7 +475,7 @@ interface HandlerCapacity {
 }
 ```
 
-`environment`, `signal`, and `capacity` are always present. Without a configured environment, the client receives an empty environment with ID `default`. `capacity.reserved` is `true` when the client has a retained capacity limit. Calling `release()` without one throws.
+`environment`, `signal`, and `capacity` are always present. Without a configured environment, the client receives an empty environment with ID `default`. `capacity.reserved` is `true` when this client already has a retained reservation for the session. Calling `release()` without a configured capacity limit throws.
 
 ### `OrchestratorEvent`
 
@@ -504,15 +531,18 @@ On timeout, the runtime aborts the attempt's `signal` with this error. Timeout i
 ### `Session`
 
 ```ts
-interface Session {
+interface ReadonlySession {
   readonly id: string;
   readonly key: string;
   readonly status: StoredSession["status"];
 
   get<T = unknown>(key: KeyLike<T>): T;
   getOptional<T = unknown>(key: KeyLike<T>): T | undefined;
-  set<T = unknown>(key: KeyLike<T>, value: T): void;
   has(key: KeyLike): boolean;
+}
+
+interface Session extends ReadonlySession {
+  set<T = unknown>(key: KeyLike<T>, value: T): void;
   delete(key: KeyLike): void;
 
   ensure<T = unknown>(
@@ -596,19 +626,40 @@ interface EnvironmentInstance {
 
 ```ts
 interface SandboxDefinition {
-  readonly create: (context: SandboxContext) => Promise<void> | void;
+  readonly create: (context: SandboxDeliveryContext) => Promise<void> | void;
+  readonly reconcile?: (context: SandboxContext) => Promise<SandboxDisposition> | SandboxDisposition;
   readonly cleanup?: (context: SandboxContext) => Promise<void> | void;
 }
 
-interface SandboxContext extends EnvironmentHookContext {
+interface SandboxContextBase extends EnvironmentHookContext {
   session: Session;
+  readonly currentCheckpoint: Readonly<JsonRecord>;
+  checkpoint(update: JsonRecord): Promise<void>;
+}
+
+interface SandboxDeliveryContext extends SandboxContextBase {
+  cause: { type: "delivery" };
   event: DispatchEvent;
 }
+
+interface SandboxCompletionContext extends SandboxContextBase {
+  cause: { type: "completion"; reason?: string };
+  event?: undefined;
+}
+
+type SandboxContext = SandboxDeliveryContext | SandboxCompletionContext;
+type SandboxDisposition = "active" | "cleaned" | "unknown";
 ```
 
-After `create` succeeds, its session changes and sandbox marker are saved immediately. `cleanup` runs after `handle` and `onSuccess` when the handler ends the session. A cleanup error fails the attempt.
+Sandbox records are keyed by session ID, client ID, and environment ID. Their status is `creating`, `active`, `cleaning`, `cleaned`, or `unknown`. `checkpoint(update)` merges JSON-safe fields into the record immediately, including when the surrounding hook later fails. `currentCheckpoint` reflects the merged checkpoint for that hook invocation.
 
-Sandbox locking is limited to one runtime process. `endSession` does not run cleanup. Stopping the runtime does not clean every active sandbox.
+The runtime saves `creating` before `create` and `cleaning` before `cleanup`. When cleanup was interrupted, the next cleanup attempt requires `reconcile` to inspect the checkpoint and return `active`, `cleaned`, or `unknown`. `active` repeats cleanup, `cleaned` skips it, and `unknown` stops processing. A `cleaning` or `unknown` record without `reconcile` blocks instead of being treated as usable. Hook execution stays outside the store mutex, while status and checkpoint writes use it.
+
+After `create` succeeds, its ordinary session changes are also saved immediately. `cleanup` runs after `handle` and `onSuccess` when the handler ends the session. A cleanup error fails the attempt and leaves a `cleaning` record that requires reconciliation before cleanup can continue.
+
+For delivery hooks, `cause.type` is `delivery` and `event` is present. Administrative completion uses `cause.type === "completion"`, includes the optional reason, and omits `event`; narrow on `cause.type` before reading event data in `reconcile` or `cleanup`.
+
+Sandbox locking is limited to one runtime process. `endSession` remains metadata-only. `completeSession` mounts recorded environments and cleans their sandboxes. Stopping the runtime does not clean every active sandbox.
 
 ## Keys and utilities
 
@@ -719,7 +770,7 @@ Saved event, session, note, and cursor values must be JSON-safe. The state file 
 ### State validation
 
 ```ts
-const CURRENT_STATE_VERSION = 4;
+const CURRENT_STATE_VERSION = 7;
 const MINIMUM_STATE_VERSION = 1;
 
 declare function validateAndMigrateState(
@@ -737,17 +788,19 @@ type StateValidationErrorCode =
   | "unsupported-version";
 ```
 
-Valid version 1 and 2 state gains immediate retry defaults and an empty capacity reservation collection. Valid version 3 state keeps its retry fields and gains the empty collection. Migration happens in memory; inspection does not rewrite the file. The next successful write saves version 4.
+Valid versions 1 through 6 migrate deterministically to version 7. Existing migration rules still apply; version 7 adds delivery phases, staged effects, and an empty exhaustion collection. Unfinished legacy deliveries resume conservatively at `sandbox`; processed and ignored deliveries migrate to `completed`. Migration happens in memory, inspection does not rewrite the file, and the next successful write saves version 7. Legacy `__sao.sandbox.*.created` flags remain unchanged because the snapshot does not identify their client owner.
 
 ### Saved records
 
 ```ts
 interface OrchestratorState {
-  version: 4;
+  version: 7;
   sessions: StoredSession[];
   events: StoredEvent[];
   deliveries: StoredDelivery[];
+  exhaustions: StoredExhaustion[];
   capacityReservations: StoredCapacityReservation[];
+  sandboxes: StoredSandbox[];
   notes: SessionNote[];
   cursors: Record<string, Record<string, unknown>>;
 }
@@ -757,9 +810,13 @@ interface OrchestratorState {
 
 `StoredEvent` contains internal `id`, source `sourceId`, channel ID, dedupe and session keys, body fields, and occurrence and receive timestamps.
 
-`StoredDelivery` contains event, client, and handler IDs; status; attempt counts; retry delay; next time it can run; last error; and session ID. Status is `pending`, `processing`, `processed`, or `failed`.
+`StoredDelivery` contains event, client, and handler IDs; status; attempt counts; retry delay; next time it can run; phase; last failure stage; optional staged effects; last error; session ID; and an optional ignored reason. Status is `pending`, `processing`, `processed`, `failed`, or `ignored`. Ignored reason is `session-missing` or `session-ended`.
+
+`StoredExhaustion` references its source delivery, event, client, optional session, failed stage, and a sanitized failure descriptor. It is independent historical work with its own `pending`, `processing`, `processed`, or `failed` status, attempts, fixed delay, and timestamps. Manually retrying the source delivery does not remove the exhaustion record or require the source to remain failed. The descriptor stores a bounded error name and generic message, never the raw error or stack.
 
 `StoredCapacityReservation` contains its ID, client ID, session ID, and acquisition time. Only active reservations are stored.
+
+`StoredSandbox` is keyed by session ID, client ID, and environment ID. It contains lifecycle status, JSON-safe checkpoint data, creation and update timestamps, and an optional last error.
 
 `SessionNote` contains its ID, session ID, message, optional data, and creation time.
 
@@ -825,7 +882,7 @@ await runtime.stop();
 
 A runtime is one-shot. Create a new instance after stop or failed startup. Sequential `drain()` calls are supported; overlapping calls reject. Drains do not wait for future retry times.
 
-Startup and drain return saved `processing` deliveries to `pending`. The interrupted attempt remains counted; if it exhausted the retry limit, recovery grants one replacement attempt.
+Startup and drain return saved `processing` deliveries and exhaustion work to `pending`. The interrupted attempt remains counted; if it exhausted the retry limit, recovery grants one replacement attempt. Delivery processing resumes from its saved next phase.
 
 ### Runtime dispatch and inspection
 
@@ -840,9 +897,11 @@ declare class OrchestratorRuntime {
   getSession(idOrKey: string): Promise<StoredSession | undefined>;
   listSessionNotes(idOrKey: string): Promise<SessionNote[]>;
   listCapacityReservations(): Promise<StoredCapacityReservation[]>;
+  listSandboxes(sessionId?: string): Promise<StoredSandbox[]>;
   listEvents(): Promise<Array<{
     event: StoredEvent;
     deliveries: StoredDelivery[];
+    exhaustions: StoredExhaustion[];
   }>>;
   printConfig(): Promise<Record<string, unknown>>;
 }
@@ -855,16 +914,21 @@ Store-backed inspection works after stop. Mutation methods reject after stop.
 ```ts
 declare class OrchestratorRuntime {
   endSession(idOrKey: string, reason?: string): Promise<boolean>;
+  completeSession(sessionId: string, reason?: string): Promise<boolean>;
   releaseCapacity(clientId: string, sessionIdOrKey: string): Promise<boolean>;
-  retryDelivery(deliveryId: string): Promise<boolean>;
+  retryDelivery(deliveryOrExhaustionId: string): Promise<boolean>;
 }
 ```
 
 `endSession` returns `false` if no session matches. It releases every capacity reservation for the session but does not run sandbox cleanup or stop external work.
 
+`completeSession` requires an exact active session ID and rejects while pending or processing delivery work targets that session or its session key. It mounts each environment named by that session's sandbox records, requires reconciliation for uncertain records, runs cleanup, and only then ends the session and releases all capacity. Failed cleanup leaves the session active and its capacity reserved; call completion again after the integration can reconcile it. Missing cleanup hooks, missing configured owners, unresolved reconciliation, and ambiguous legacy sandbox ownership reject without ending the session.
+
+Successful completion returns `true`. Missing, ended, keyed, or otherwise non-active targets reject because this operation deliberately does not resolve session keys.
+
 `releaseCapacity` removes one client's reservation while keeping the session active. It returns `false` if no matching active reservation exists. It does not stop external work.
 
-`retryDelivery` returns `false` unless the delivery exists with status `failed`. On success, it grants one additional attempt that can run now.
+`retryDelivery` returns `false` unless a delivery or exhaustion record exists with status `failed`. On success, it grants that record one additional attempt that can run now.
 
 For a JSON-file store, call administrative mutations inside `runOffline()` while no active runtime owns the file.
 
@@ -888,8 +952,9 @@ interface OfflineOperationContext {
   ): Promise<DispatchResult>;
   drain(): Promise<void>;
   endSession(idOrKey: string, reason?: string): Promise<boolean>;
+  completeSession(sessionId: string, reason?: string): Promise<boolean>;
   releaseCapacity(clientId: string, sessionIdOrKey: string): Promise<boolean>;
-  retryDelivery(deliveryId: string): Promise<boolean>;
+  retryDelivery(deliveryOrExhaustionId: string): Promise<boolean>;
   pruneState(options: StatePruneOptions): Promise<StatePrunePlan>;
 }
 ```
@@ -910,11 +975,11 @@ declare class OrchestratorRuntime {
 }
 ```
 
-Pruning selects processed deliveries strictly older than `before`. It selects old ended sessions and notes only when no retained delivery or active sandbox refers to them.
+Pruning selects processed and ignored deliveries strictly older than `before`. A retained exhaustion record protects its source delivery, event, and optional session. Pruning selects old ended sessions and notes only when no retained work or active sandbox refers to them.
 
 Events remain as dedupe records unless `dropDedupe` is `true`. Removing an event allows the same channel ID and dedupe key to be accepted again.
 
-`StatePrunePlan` reports selected delivery, session, note, and event IDs; dedupe-protected events; and sessions blocked by `active-sandbox` or `retained-delivery`.
+`StatePrunePlan` reports selected delivery, terminal exhaustion, session, note, and event IDs; dedupe-protected events; and sessions blocked by `active-sandbox` or `retained-delivery`.
 
 For persistent stores, call `pruneState` inside `runOffline`. Preview and back up the state before applying the plan.
 
@@ -974,6 +1039,84 @@ declare function loadProjectOrchestrator(options?: LoadProjectOptions): Promise<
 Config search checks `.simple-agent-orchestrator/orchestrator.ts`, `.mts`, `.cts`, `.js`, `.mjs`, and `.cjs`, in that order. If none exists, it checks `simpleAgentOrchestrator.config` in `package.json`. TypeScript config runs through `tsx` without type-checking.
 
 Config loading temporarily sets `process.cwd()` to the project root. Do not concurrently load configs for different roots if their code reads the working directory.
+
+## Node process helper
+
+Import this Node-specific API from `simple-agent-orchestrator/node`. It is independent of runtime deliveries and saved state.
+
+### `spawnManagedProcess(command, args?, options?)`
+
+Starts one detached process without a shell and returns its PID and lifecycle handle.
+
+```ts
+import { spawnManagedProcess } from "simple-agent-orchestrator/node";
+
+const agent = spawnManagedProcess(process.execPath, ["agent-server.mjs"], {
+  cwd: project.root,
+  termGraceMs: 5_000,
+  ownsProcess: async (pid) => processRecordStillMatches(pid),
+});
+
+await agent.waitUntilReady(() => agentClient.isReady(), {
+  signal,
+  timeoutMs: 30_000,
+});
+
+await agent.stop();
+```
+
+`processRecordStillMatches` and `agentClient` are application-provided functions. The helper does not provide ports, HTTP checks, persistence, restart policy, or provider policy.
+
+```ts
+declare function spawnManagedProcess(
+  command: string,
+  args?: readonly string[],
+  options?: SpawnManagedProcessOptions,
+): ManagedProcess;
+
+interface SpawnManagedProcessOptions {
+  cwd?: string | URL;
+  env?: Record<string, string | undefined>;
+  termGraceMs?: number;
+  ownsProcess?: (pid: number) => boolean | Promise<boolean>;
+}
+
+interface StopManagedProcessOptions {
+  termGraceMs?: number;
+}
+
+interface WaitUntilReadyOptions {
+  signal?: AbortSignal;
+  intervalMs?: number;
+  timeoutMs?: number;
+}
+
+interface ManagedProcess {
+  readonly pid: number;
+  readonly exit: Promise<ManagedProcessExit>;
+  isAlive(): boolean;
+  stop(options?: StopManagedProcessOptions): Promise<ManagedProcessExit>;
+  waitUntilReady(
+    check: () => boolean | Promise<boolean>,
+    options?: WaitUntilReadyOptions,
+  ): Promise<void>;
+}
+
+interface ManagedProcessExit {
+  readonly pid: number;
+  readonly code: number | null;
+  readonly signal: string | null;
+  readonly error?: Error;
+}
+```
+
+The child uses `shell: false`, detached mode, ignored standard streams, and `unref()`. Arguments go directly to the executable. The helper does not capture output or accept shell syntax.
+
+On POSIX, `stop()` signals the detached process group with `SIGTERM`, waits for the configured grace period, and sends `SIGKILL` if the group is still alive. If group signaling reports that no group exists, it defensively falls back to the direct child. On Windows it signals the direct child; it does not claim process-tree cleanup there. Descendants that create another process group are also outside the helper's control.
+
+The TERM grace defaults to 5 seconds. The first `stop()` call fixes the stop options; concurrent and later calls return the same promise. If both the process and its detached group have exited, `stop()` returns its exit result without signaling. `ownsProcess`, when present, runs once before signaling. A successful decision authorizes graceful shutdown and any required escalation, even if the process-group leader exits during the grace period. A false result rejects stop without sending a signal. Use it when your application has stronger ownership data than a PID, because operating systems can reuse PIDs.
+
+`isAlive()` checks the direct PID and treats a permissions error as alive. `waitUntilReady()` checks every 50 ms by default, supports synchronous or asynchronous application checks, rejects with the abort reason, rejects on timeout, and rejects if the child exits first. It has no default timeout.
 
 ## Testing API
 
@@ -1047,11 +1190,17 @@ interface TestRuntime {
     get(id: string): Promise<StoredDelivery | undefined>;
     retry(id: string, options?: { drain?: boolean }): Promise<boolean>;
   };
+
+  exhaustions: {
+    list(): Promise<StoredExhaustion[]>;
+    get(id: string): Promise<StoredExhaustion | undefined>;
+    retry(id: string, options?: { drain?: boolean }): Promise<boolean>;
+  };
 }
 ```
 
-`dispatch`, `capacity.release`, and `deliveries.retry` call `drain()` by default. Pass `{ drain: false }` to leave work pending.
+`dispatch`, `capacity.release`, `deliveries.retry`, and `exhaustions.retry` call `drain()` by default. Pass `{ drain: false }` to leave work pending.
 
-`events.get` accepts the internal event ID. `TestEventRecord` is `{ event: StoredEvent, deliveries: StoredDelivery[] }`; the dispatched source ID is `event.sourceId`.
+`events.get` accepts the internal event ID. `TestEventRecord` is `{ event: StoredEvent, deliveries: StoredDelivery[], exhaustions: StoredExhaustion[] }`; the dispatched source ID is `event.sourceId`. Use `test.exhaustions.list/get/retry` to inspect or manually retry exhaustion work.
 
 Mutating helpers reject after stop. Store-backed inspection remains available.

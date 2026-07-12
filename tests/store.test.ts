@@ -110,9 +110,12 @@ describe("stores", () => {
         ...historical,
         version: CURRENT_STATE_VERSION,
         capacityReservations: [],
+        sandboxes: [],
+        exhaustions: [],
         deliveries: historicalDeliveries.map((delivery) => ({
           ...delivery,
           retryDelayMs: 0,
+          phase: delivery.status === "processed" ? "completed" : "sandbox",
         })),
       });
       expect(await jsonFileStore(path).read()).toEqual(migrated);
@@ -136,7 +139,202 @@ describe("stores", () => {
       ...versionThree,
       version: CURRENT_STATE_VERSION,
       capacityReservations: [],
+      sandboxes: [],
+      exhaustions: [],
+      deliveries: deliveries.map((delivery) => ({
+        ...delivery,
+        phase: (delivery as Record<string, unknown>).status === "processed" ? "completed" : "sandbox",
+      })),
     });
+  });
+
+  it("upgrades version 4 state and validates terminal ignored deliveries", () => {
+    const time = new Date(0).toISOString();
+    const { sandboxes: _sandboxes, exhaustions: _exhaustions, ...versionFourBase } = emptyState();
+    const versionFour = {
+      ...versionFourBase,
+      version: 4,
+      events: [{
+        id: "event",
+        channelId: "manual",
+        sourceId: "source",
+        dedupeKey: "manual:source",
+        sessionKey: "work",
+        receivedAt: time,
+      }],
+      deliveries: [{
+        id: "delivery",
+        eventId: "event",
+        channelId: "manual",
+        clientId: "client",
+        handlerId: "handler",
+        status: "processed" as const,
+        attempts: 1,
+        maxAttempts: 1,
+        retryDelayMs: 0,
+        createdAt: time,
+        updatedAt: time,
+        processedAt: time,
+      }],
+    };
+    expect(validateAndMigrateState(versionFour)).toMatchObject({
+      version: CURRENT_STATE_VERSION,
+      deliveries: [{ status: "processed", phase: "completed" }],
+    });
+
+    const ignored = {
+      ...emptyState(),
+      events: versionFour.events,
+      deliveries: [{
+        ...versionFour.deliveries[0],
+        status: "ignored",
+        phase: "completed",
+        attempts: 0,
+        ignoredReason: "session-missing",
+      }],
+    };
+    expect(validateAndMigrateState(ignored)).toEqual(ignored);
+    expect(validateAndMigrateState({
+      ...ignored,
+      deliveries: [{
+        ...ignored.deliveries[0],
+        ignoredReason: "session-ended",
+        sessionId: "removed-session",
+      }],
+    })).toMatchObject({
+      deliveries: [{ ignoredReason: "session-ended", sessionId: "removed-session" }],
+    });
+    expect(() => validateAndMigrateState({
+      ...ignored,
+      deliveries: [{ ...ignored.deliveries[0], ignoredReason: undefined }],
+    })).toThrow("ignoredReason");
+    expect(() => validateAndMigrateState({
+      ...ignored,
+      deliveries: [{ ...ignored.deliveries[0], startedAt: time }],
+    })).toThrow("startedAt");
+    expect(() => validateAndMigrateState({
+      ...ignored,
+      deliveries: [{ ...ignored.deliveries[0], lastError: "should not run" }],
+    })).toThrow("lastError");
+  });
+
+  it("upgrades version 5 without guessing sandbox ownership from legacy session flags", () => {
+    const versionFive = {
+      ...emptyState(),
+      version: 5,
+      sessions: [{
+        id: "session",
+        key: "work",
+        status: "active" as const,
+        state: { "__sao.sandbox.workspace.created": true },
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      }],
+    };
+    const { sandboxes: _sandboxes, exhaustions: _exhaustions, ...historical } = versionFive;
+
+    expect(validateAndMigrateState(historical)).toEqual({
+      ...historical,
+      version: CURRENT_STATE_VERSION,
+      sandboxes: [],
+      exhaustions: [],
+    });
+  });
+
+  it("upgrades version 6 deliveries to conservative next phases", () => {
+    const time = new Date(0).toISOString();
+    const { exhaustions: _exhaustions, ...base } = emptyState();
+    const versionSix = {
+      ...base,
+      version: 6,
+      events: ["pending", "processed"].map((id) => ({
+        id: `event-${id}`,
+        channelId: "manual",
+        sourceId: id,
+        dedupeKey: `manual:${id}`,
+        sessionKey: id,
+        receivedAt: time,
+      })),
+      deliveries: [
+        {
+          id: "delivery-pending",
+          eventId: "event-pending",
+          channelId: "manual",
+          clientId: "client",
+          handlerId: "handler",
+          status: "pending",
+          attempts: 0,
+          maxAttempts: 1,
+          retryDelayMs: 0,
+          createdAt: time,
+          updatedAt: time,
+        },
+        {
+          id: "delivery-processed",
+          eventId: "event-processed",
+          channelId: "manual",
+          clientId: "client",
+          handlerId: "handler",
+          status: "processed",
+          attempts: 1,
+          maxAttempts: 1,
+          retryDelayMs: 0,
+          createdAt: time,
+          updatedAt: time,
+          processedAt: time,
+        },
+      ],
+    };
+
+    expect(validateAndMigrateState(versionSix)).toMatchObject({
+      version: CURRENT_STATE_VERSION,
+      exhaustions: [],
+      deliveries: [
+        { id: "delivery-pending", phase: "sandbox" },
+        { id: "delivery-processed", phase: "completed" },
+      ],
+    });
+  });
+
+  it("validates durable sandbox identities, statuses, references, and JSON-safe checkpoints", () => {
+    const state = {
+      ...emptyState(),
+      sessions: [{
+        id: "session",
+        key: "work",
+        status: "active" as const,
+        state: {},
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      }],
+      sandboxes: [{
+        sessionId: "session",
+        clientId: "agent",
+        environmentId: "workspace",
+        status: "active" as const,
+        checkpoint: { workspaceId: "ws-1" },
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      }],
+    };
+
+    expect(validateAndMigrateState(state)).toEqual(state);
+    expect(() => validateAndMigrateState({
+      ...state,
+      sandboxes: [...state.sandboxes, { ...state.sandboxes[0]!, status: "cleaned" }],
+    })).toThrow("duplicates a sessionId, clientId, and environmentId identity");
+    expect(() => validateAndMigrateState({
+      ...state,
+      sandboxes: [{ ...state.sandboxes[0]!, sessionId: "missing" }],
+    })).toThrow("references missing session");
+    expect(() => validateAndMigrateState({
+      ...state,
+      sandboxes: [{ ...state.sandboxes[0]!, status: "lost" }],
+    })).toThrow("status must be creating, active, cleaning, cleaned, or unknown");
+    expect(() => validateAndMigrateState({
+      ...state,
+      sandboxes: [{ ...state.sandboxes[0]!, checkpoint: { invalid: undefined } }],
+    })).toThrow("must be JSON-safe");
   });
 
   it("validates durable capacity reservation identities and session references", () => {
@@ -173,6 +371,53 @@ describe("stores", () => {
     })).toThrow("must reference an active session");
   });
 
+  it("accepts historical exhaustion work after its source delivery is manually retried", () => {
+    const time = new Date(0).toISOString();
+    const state = {
+      ...emptyState(),
+      events: [{
+        id: "event",
+        channelId: "manual",
+        sourceId: "source",
+        dedupeKey: "source",
+        sessionKey: "session",
+        receivedAt: time,
+      }],
+      deliveries: [{
+        id: "delivery",
+        eventId: "event",
+        channelId: "manual",
+        clientId: "client",
+        handlerId: "handler",
+        status: "processed" as const,
+        phase: "completed" as const,
+        attempts: 2,
+        maxAttempts: 2,
+        retryDelayMs: 0,
+        createdAt: time,
+        updatedAt: time,
+        processedAt: time,
+      }],
+      exhaustions: [{
+        id: "exhaustion",
+        sourceDeliveryId: "delivery",
+        eventId: "event",
+        clientId: "client",
+        stage: "handling" as const,
+        failure: { name: "Error", message: "Operation failed." },
+        status: "processed" as const,
+        attempts: 1,
+        maxAttempts: 1,
+        retryDelayMs: 0,
+        createdAt: time,
+        updatedAt: time,
+        processedAt: time,
+      }],
+    };
+
+    expect(validateAndMigrateState(state)).toEqual(state);
+  });
+
   it.each([
     ["negative retry delay", { retryDelayMs: -1 }, "retryDelayMs must be an integer"],
     ["fractional retry delay", { retryDelayMs: 0.5 }, "retryDelayMs must be an integer"],
@@ -199,6 +444,7 @@ describe("stores", () => {
         clientId: "client",
         handlerId: "handler",
         status: "pending",
+        phase: "sandbox",
         attempts: 1,
         maxAttempts: 2,
         createdAt: "now",
@@ -228,6 +474,7 @@ describe("stores", () => {
           clientId: "client",
           handlerId: "handler",
           status: "waiting",
+          phase: "sandbox",
           attempts: 0,
           maxAttempts: 1,
           retryDelayMs: 0,
@@ -264,6 +511,7 @@ describe("stores", () => {
           clientId: "client",
           handlerId: "handler",
           status: "pending",
+          phase: "sandbox",
           attempts: 1,
           maxAttempts: 1,
           retryDelayMs: 0,
@@ -307,6 +555,7 @@ describe("stores", () => {
           clientId: "client",
           handlerId: "handler",
           status: "pending",
+          phase: "sandbox",
           attempts: 0,
           maxAttempts: 1,
           retryDelayMs: 0,
@@ -336,6 +585,7 @@ describe("stores", () => {
           clientId: "client",
           handlerId: "handler",
           status: "pending",
+          phase: "sandbox",
           attempts: 0,
           maxAttempts: 1,
           retryDelayMs: 0,

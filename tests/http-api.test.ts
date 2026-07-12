@@ -42,8 +42,8 @@ function webhook(port: number, channelId: string, body: string, contentType = "a
   });
 }
 
-function deliveryCounts(pending = 0, processing = 0, processed = 0, failed = 0) {
-  return { pending, processing, processed, failed };
+function deliveryCounts(pending = 0, processing = 0, processed = 0, failed = 0, ignored = 0) {
+  return { pending, processing, processed, failed, ignored };
 }
 
 afterEach(async () => {
@@ -212,7 +212,7 @@ describe("HTTP webhook and operational API", () => {
     const occupied = await occupy(requestedPort);
     const now = "2026-07-10T10:00:00.000Z";
     const state: OrchestratorState = {
-      version: 4,
+      version: 7,
       events: ["a", "b", "c"].map((id) => ({
         id: `evt_${id}`,
         channelId: "summary",
@@ -225,20 +225,23 @@ describe("HTTP webhook and operational API", () => {
         meta: { secret: true },
         receivedAt: now,
       })),
-      deliveries: ["pending", "processing", "processed", "failed"].map((status, index) => ({
+      deliveries: ["pending", "processing", "processed", "failed", "ignored"].map((status, index) => ({
         id: `delivery-${index}`,
-        eventId: index === 3 ? "evt_a" : `evt_${String.fromCharCode(97 + index)}`,
+        eventId: `evt_${String.fromCharCode(97 + (index % 3))}`,
         channelId: "summary",
         clientId: "client",
-        handlerId: "handler",
-        status: status as "pending" | "processing" | "processed" | "failed",
-        attempts: 1,
+        handlerId: `handler-${index}`,
+        status: status as "pending" | "processing" | "processed" | "failed" | "ignored",
+        phase: status === "processed" || status === "ignored" ? "completed" as const : "sandbox" as const,
+        attempts: status === "ignored" ? 0 : 1,
         maxAttempts: 3,
         retryDelayMs: 0,
         createdAt: now,
         updatedAt: now,
-        lastError: "secret-error",
+        ...(status === "failed" ? { lastError: "secret-error" } : {}),
+        ...(status === "ignored" ? { ignoredReason: "session-missing" as const, processedAt: now } : {}),
       })),
+      exhaustions: [],
       sessions: ["a", "b", "c"].map((id) => ({
         id: `session_${id}`,
         key: `key-${id}`,
@@ -249,6 +252,7 @@ describe("HTTP webhook and operational API", () => {
         ...(id === "a" ? { endedAt: now, endReason: "secret-reason" } : {}),
       })),
       capacityReservations: [],
+      sandboxes: [],
       notes: [{ id: "note", sessionId: "session_a", message: "secret-note", createdAt: now }],
       cursors: {},
     };
@@ -265,7 +269,8 @@ describe("HTTP webhook and operational API", () => {
         totals: {
           events: 3,
           sessions: 3,
-          deliveries: deliveryCounts(2, 0, 1, 1),
+          deliveries: deliveryCounts(2, 0, 1, 1, 1),
+          exhaustions: { pending: 0, processing: 0, processed: 0, failed: 0 },
         },
       });
 
@@ -286,6 +291,7 @@ describe("HTTP webhook and operational API", () => {
         type: "secret-type",
         receivedAt: now,
         deliveries: deliveryCounts(0, 0, 1, 0),
+        exhaustions: { pending: 0, processing: 0, processed: 0, failed: 0 },
       });
       expect(JSON.stringify(eventBody)).not.toContain("secret-input");
       expect(JSON.stringify(eventBody)).not.toContain("secret-error");
