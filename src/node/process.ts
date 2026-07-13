@@ -1,7 +1,9 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 
 const DEFAULT_TERM_GRACE_MS = 5_000;
+const DEFAULT_KILL_WAIT_MS = 5_000;
 const DEFAULT_READY_INTERVAL_MS = 50;
+const MAX_PROCESS_PID = 2_147_483_647;
 const MAX_TIMER_MS = 2_147_483_647;
 
 export interface ManagedProcessExit {
@@ -14,8 +16,22 @@ export interface ManagedProcessExit {
 export interface SpawnManagedProcessOptions {
   readonly cwd?: string | URL;
   readonly env?: Record<string, string | undefined>;
+  readonly stdio?: ManagedProcessStdio;
   readonly termGraceMs?: number;
   readonly ownsProcess?: (pid: number) => boolean | Promise<boolean>;
+}
+
+export type ManagedProcessStdio = "ignore" | "inherit" | readonly [
+  ManagedProcessStdioTarget,
+  ManagedProcessStdioTarget,
+  ManagedProcessStdioTarget,
+  ...ManagedProcessStdioTarget[],
+];
+export type ManagedProcessStdioTarget = "ignore" | "inherit" | number;
+
+export interface AdoptManagedProcessOptions {
+  readonly termGraceMs?: number;
+  readonly ownsProcess: (pid: number) => boolean | Promise<boolean>;
 }
 
 export interface StopManagedProcessOptions {
@@ -39,18 +55,29 @@ export interface ManagedProcess {
   ): Promise<void>;
 }
 
+export interface AdoptedManagedProcess {
+  readonly pid: number;
+  isAlive(): boolean;
+  stop(options?: StopManagedProcessOptions): Promise<void>;
+  waitUntilReady(
+    check: () => boolean | Promise<boolean>,
+    options?: WaitUntilReadyOptions,
+  ): Promise<void>;
+}
+
 export function spawnManagedProcess(
   command: string,
   args: readonly string[] = [],
   options: SpawnManagedProcessOptions = {},
 ): ManagedProcess {
   const termGraceMs = duration(options.termGraceMs, DEFAULT_TERM_GRACE_MS, "termGraceMs");
-  const child = spawn(command, [...args], {
+  validateDetachedStdio(options.stdio);
+  const child: ChildProcess = spawn(command, [...args], {
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(options.env === undefined ? {} : { env: options.env }),
     detached: true,
     shell: false,
-    stdio: "ignore",
+    stdio: (Array.isArray(options.stdio) ? [...options.stdio] : options.stdio ?? "ignore") as StdioOptions,
     windowsHide: true,
   });
   const pid = child.pid;
@@ -63,6 +90,207 @@ export function spawnManagedProcess(
   const managed = new NodeManagedProcess(child, pid, termGraceMs, options.ownsProcess);
   child.unref();
   return managed;
+}
+
+export function adoptManagedProcess(
+  pid: number,
+  options: AdoptManagedProcessOptions,
+): AdoptedManagedProcess {
+  validatePid(pid);
+  const ownsProcess = options?.ownsProcess;
+  if (typeof ownsProcess !== "function") {
+    throw new Error("ownsProcess must be provided when adopting a managed process");
+  }
+  const termGraceMs = duration(options.termGraceMs, DEFAULT_TERM_GRACE_MS, "termGraceMs");
+  return new NodeAdoptedManagedProcess(pid, termGraceMs, ownsProcess);
+}
+
+class NodeAdoptedManagedProcess implements AdoptedManagedProcess {
+  private stopPromise: Promise<void> | undefined;
+
+  constructor(
+    readonly pid: number,
+    private readonly defaultTermGraceMs: number,
+    private readonly ownsProcess: AdoptManagedProcessOptions["ownsProcess"],
+  ) {}
+
+  isAlive(): boolean {
+    return managedTargetIsAlive(this.pid);
+  }
+
+  stop(options: StopManagedProcessOptions = {}): Promise<void> {
+    if (this.stopPromise === undefined) {
+      const graceMs = duration(options.termGraceMs, this.defaultTermGraceMs, "termGraceMs");
+      this.stopPromise = this.stopOnce(graceMs);
+    }
+    return this.stopPromise;
+  }
+
+  async waitUntilReady(
+    check: () => boolean | Promise<boolean>,
+    options: WaitUntilReadyOptions = {},
+  ): Promise<void> {
+    const intervalMs = duration(options.intervalMs, DEFAULT_READY_INTERVAL_MS, "intervalMs");
+    const timeoutMs = options.timeoutMs === undefined
+      ? undefined
+      : duration(options.timeoutMs, 0, "timeoutMs");
+    const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+
+    while (true) {
+      throwIfAborted(options.signal);
+      this.throwIfGone();
+      const ready = await this.runReadinessCheck(check, options.signal, deadline, timeoutMs);
+      if (ready) {
+        this.throwIfGone();
+        return;
+      }
+
+      const remaining = deadline === undefined ? intervalMs : deadline - Date.now();
+      if (remaining <= 0) throw this.readinessTimeout(timeoutMs);
+      await this.waitForInterval(Math.min(intervalMs, remaining), options.signal);
+    }
+  }
+
+  private async stopOnce(graceMs: number): Promise<void> {
+    if (!this.isAlive()) return;
+    if (!await this.verifyOwnership()) return;
+
+    if (!signalManagedTarget(this.pid, "SIGTERM")) return;
+    if (await waitForCondition(() => !this.isAlive(), graceMs)) return;
+
+    if (!this.isAlive()) return;
+    if (!await this.verifyOwnership()) return;
+    if (!signalManagedTarget(this.pid, "SIGKILL")) return;
+    if (!await waitForCondition(() => !this.isAlive(), DEFAULT_KILL_WAIT_MS)) {
+      throw new Error(`Process ${this.pid} remained alive after SIGKILL`);
+    }
+  }
+
+  private async verifyOwnership(): Promise<boolean> {
+    let ownsProcess: boolean;
+    try {
+      ownsProcess = await this.ownsProcess(this.pid);
+    } catch (error) {
+      if (!this.isAlive()) return false;
+      throw error;
+    }
+    if (!this.isAlive()) return false;
+    if (ownsProcess !== true) {
+      throw new Error(`Process ${this.pid} ownership check denied signaling`);
+    }
+    return true;
+  }
+
+  private runReadinessCheck(
+    check: () => boolean | Promise<boolean>,
+    signal?: AbortSignal,
+    deadline?: number,
+    timeoutMs?: number,
+  ): Promise<boolean> {
+    throwIfAborted(signal);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let disappearanceTimer: ReturnType<typeof setTimeout> | undefined;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+
+      const cleanup = (): void => {
+        if (disappearanceTimer !== undefined) clearTimeout(disappearanceTimer);
+        if (timeout !== undefined) clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
+      };
+      const succeed = (ready: boolean): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(ready);
+      };
+      const fail = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const abort = (): void => fail(signal?.reason);
+      const detectDisappearance = (): void => {
+        if (settled) return;
+        if (!this.isAlive()) {
+          fail(this.disappearanceError());
+          return;
+        }
+        disappearanceTimer = setTimeout(detectDisappearance, 10);
+      };
+
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      if (deadline !== undefined) {
+        timeout = setTimeout(
+          () => fail(this.readinessTimeout(timeoutMs)),
+          Math.max(0, deadline - Date.now()),
+        );
+      }
+      detectDisappearance();
+      Promise.resolve().then(check).then(succeed, fail);
+    });
+  }
+
+  private waitForInterval(delayMs: number, signal?: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let delay: ReturnType<typeof setTimeout> | undefined;
+      let disappearanceTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const cleanup = (): void => {
+        if (delay !== undefined) clearTimeout(delay);
+        if (disappearanceTimer !== undefined) clearTimeout(disappearanceTimer);
+        signal?.removeEventListener("abort", abort);
+      };
+      const succeed = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const fail = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const abort = (): void => fail(signal?.reason);
+      const detectDisappearance = (): void => {
+        if (settled) return;
+        if (!this.isAlive()) {
+          fail(this.disappearanceError());
+          return;
+        }
+        disappearanceTimer = setTimeout(detectDisappearance, 10);
+      };
+
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      delay = setTimeout(succeed, delayMs);
+      detectDisappearance();
+    });
+  }
+
+  private throwIfGone(): void {
+    if (!this.isAlive()) throw this.disappearanceError();
+  }
+
+  private disappearanceError(): Error {
+    return new Error(`Process ${this.pid} disappeared before becoming ready`);
+  }
+
+  private readinessTimeout(timeoutMs: number | undefined): Error {
+    return new Error(`Process ${this.pid} did not become ready within ${timeoutMs}ms`);
+  }
 }
 
 class NodeManagedProcess implements ManagedProcess {
@@ -161,7 +389,7 @@ class NodeManagedProcess implements ManagedProcess {
   }
 
   private async assertOwnership(): Promise<void> {
-    if (this.ownsProcess !== undefined && !await this.ownsProcess(this.pid)) {
+    if (this.ownsProcess !== undefined && await this.ownsProcess(this.pid) !== true) {
       throw new Error(`Process ${this.pid} ownership check denied signaling`);
     }
   }
@@ -239,22 +467,60 @@ function duration(value: number | undefined, fallback: number, name: string): nu
   return Math.ceil(resolved);
 }
 
-function pidIsAlive(pid: number): boolean {
+function validatePid(pid: number): void {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid > MAX_PROCESS_PID) {
+    throw new Error(`pid must be a positive safe process PID greater than 1 and no greater than ${MAX_PROCESS_PID}`);
+  }
+}
+
+function validateDetachedStdio(stdio: ManagedProcessStdio | undefined): void {
+  if (stdio === undefined || stdio === "ignore" || stdio === "inherit") return;
+  const values = Array.isArray(stdio) ? stdio : [stdio];
+  if (Array.isArray(stdio) && values.length < 3) {
+    throw new Error("stdio arrays must explicitly configure stdin, stdout, and stderr");
+  }
+  for (const value of values) {
+    if (
+      value === undefined || value === null ||
+      value === "pipe" || value === "overlapped" || value === "ipc"
+    ) {
+      throw new Error("stdio must not create pipes or IPC channels for a detached managed process");
+    }
+    if (value !== "ignore" && value !== "inherit" && !(typeof value === "number" && Number.isInteger(value) && value >= 0)) {
+      throw new Error("stdio contains an unsupported detached process option");
+    }
+  }
+}
+
+function managedTargetIsAlive(pid: number): boolean {
+  return signalTargetIsAlive(process.platform === "win32" ? pid : -pid);
+}
+
+function signalManagedTarget(pid: number, signal: NodeJS.Signals): boolean {
   try {
-    process.kill(pid, 0);
+    process.kill(process.platform === "win32" ? pid : -pid, signal);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function signalTargetIsAlive(target: number): boolean {
+  try {
+    process.kill(target, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
+function pidIsAlive(pid: number): boolean {
+  return signalTargetIsAlive(pid);
+}
+
 function processGroupIsAlive(pid: number): boolean {
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
+  return signalTargetIsAlive(-pid);
 }
 
 function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {

@@ -1,9 +1,14 @@
 import type { ChannelDefinition } from "./channel.js";
-import type { EnvironmentDefinition, EnvironmentInstance } from "./environment.js";
+import type {
+  EnvironmentDefinition,
+  EnvironmentInstance,
+  ResourceSandboxDefinition,
+} from "./environment.js";
 import type {
   CapacityOptions,
   ConcurrencyOptions,
   Logger,
+  JsonValue,
   OrchestratorEvent,
   ProjectContext,
   RetryOptions,
@@ -27,6 +32,14 @@ export interface HandlerContext<
   attempt: number;
   signal: AbortSignal;
   capacity: HandlerCapacity;
+  sandbox: HandlerSandboxAccessor;
+}
+
+export interface HandlerSandboxAccessor {
+  get<TResource extends JsonValue>(definition: ResourceSandboxDefinition<TResource>): Readonly<TResource>;
+  getOptional<TResource extends JsonValue>(
+    definition: ResourceSandboxDefinition<TResource>,
+  ): Readonly<TResource> | undefined;
 }
 
 export interface HandlerCapacity {

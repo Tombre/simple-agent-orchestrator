@@ -167,8 +167,14 @@ type HandlerContext = {
   attempt: number;
   signal: AbortSignal;
   capacity: { readonly reserved: boolean; release(): void };
+  sandbox: {
+    get<T extends JsonValue>(definition: ResourceSandboxDefinition<T>): Readonly<T>;
+    getOptional<T extends JsonValue>(definition: ResourceSandboxDefinition<T>): Readonly<T> | undefined;
+  };
 };
 ```
+
+Sandbox access uses configured definition identity, not an ID or structural match. `get` requires an active resource. `getOptional` returns `undefined` when there is no active record; an active typed record without a resource is invalid. An `existing-only` handler does not create or reconcile before handling. If it explicitly ends the session, the later cleanup phase may reconcile uncertain saved state.
 
 Exhaustion context provides an optional `ReadonlySession` with only `id`, `key`, `status`, `get`, `getOptional`, and `has`. Exhaustion records are independent historical work and remain valid if their source delivery is manually retried to another status.
 
@@ -193,16 +199,47 @@ session.note("Sent review to agent", { reviewId: event.payload.id });
 session.end({ reason: "github.pr.merged" });
 ```
 
-Use `session.ensure` when retries should reuse a persisted value. Its external factory can repeat if creation succeeds before local persistence, so use provider idempotency or reconciliation. Use an environment sandbox when an external resource also needs cleanup. Sandbox records are keyed by session, client, and environment; `checkpoint(update)` eagerly saves JSON-safe resource data, and optional `reconcile` returns `active`, `cleaned`, or `unknown` before uncertain work continues.
+Use `session.ensure` when retries should reuse a persisted value. Its external factory can repeat if creation succeeds before local persistence, so use provider idempotency or reconciliation. Use `createSandbox` when a JSON-safe typed resource also needs cleanup. Sandbox records are keyed by session, client, and environment and eagerly save the resource, checkpoints, and cleanup-step progress. Optional sandbox `reconcile` returns `active`, `cleaned`, or `unknown` before uncertain lifecycle work continues.
 
 Ordinary handler/hook state, notes, `session.end()`, and capacity-release intent are staged on the delivery after handling and acknowledgement, then committed only after cleanup and final persistence. A retry resumes the saved next phase and reconstructs the session from staged effects. Ensured values and state mutations made during sandbox creation remain eager. Processing is retryable, not exactly once.
 
 ## Environments and sandboxes
 
 ```ts
-import { createEnvironment, envKey } from "simple-agent-orchestrator";
+import { createEnvironment, createSandbox, envKey } from "simple-agent-orchestrator";
 
 export const opencodeServerUrl = envKey<string>("opencode.serverUrl");
+
+export const worktreeSandbox = createSandbox<{ id: string; path: string }>({
+  async create({ event, session, project, signal, publishResource }) {
+    const branch = event.meta?.branch;
+    if (typeof branch !== "string" || branch.trim() === "") {
+      throw new Error("Expected event.meta.branch");
+    }
+
+    const worktree = await ensureActiveWorktree({
+      resourceKey: `worktree:${session.id}`,
+      rootDirectory: project.root,
+      branch,
+      signal,
+    });
+    await publishResource({ id: worktree.id, path: worktree.path });
+  },
+
+  async reconcile({ resource, session, signal, publishResource }) {
+    if (resource && await worktreeExists(resource.id)) return "active";
+    const recovered = await findWorktreeForSession(session.id, { signal });
+    if (!recovered) return "unknown";
+    await publishResource({ id: recovered.id, path: recovered.path });
+    return "active";
+  },
+
+  async cleanup({ cleanup }) {
+    await cleanup.step("remove-worktree", { retry: "idempotent" }, async ({ resource }) => {
+      await closeWorktreeIdempotently(resource.id);
+    });
+  },
+});
 
 export const opencodeEnvironment = createEnvironment("opencode", (environment) => {
   let shutdown: (() => Promise<void>) | undefined;
@@ -218,35 +255,13 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
     shutdown = undefined;
   });
 
-  environment.useSandbox({
-    async create({ event, session, project, checkpoint }) {
-      const branch = event.meta?.branch;
-      if (typeof branch !== "string" || branch.trim() === "") {
-        throw new Error("Expected event.meta.branch");
-      }
-
-      const worktreeId = await ensureActiveWorktree({
-        resourceKey: `worktree:${session.id}`,
-        rootDirectory: project.root,
-        branch,
-      });
-      await checkpoint({ worktreeId });
-      session.set("worktree.id", worktreeId);
-    },
-
-    async reconcile({ currentCheckpoint }) {
-      const id = currentCheckpoint.worktreeId;
-      if (typeof id !== "string") return "unknown";
-      return await worktreeExists(id) ? "active" : "cleaned";
-    },
-
-    async cleanup({ currentCheckpoint }) {
-      const id = currentCheckpoint.worktreeId;
-      if (typeof id === "string") await closeWorktreeIdempotently(id);
-    },
-  });
+  environment.useSandbox(worktreeSandbox);
 });
 ```
+
+All worktree and OpenCode functions above are project APIs. `createSandbox`, `publishResource`, `environment.useSandbox`, and `cleanup.step` are package APIs. `create` may return the resource instead of publishing it; eager publish preserves identity if later creation code fails. Reconciliation receives `resource?`, `currentStatus`, and `currentCheckpoint`; it must publish a resource before returning `active` when none is stored.
+
+Every outside typed-cleanup effect belongs inside a stable, non-empty step ID because cleanup re-enters directly from `cleaning`. A step chooses exactly `{ retry: "idempotent" }` or `{ reconcile }`; step reconciliation reports `completed`, `incomplete`, or `unknown`. Saved status is `running`, `completed`, `failed`, or `unknown`. Completed steps skip, unknown blocks, dependent steps run sequentially, and independent steps may use `Promise.allSettled` if the cleanup hook propagates failures. This is sandbox cleanup, not a workflow engine or exactly-once execution.
 
 Runtime instances are one-shot. Call `start()` once, or use sequential direct `drain()` calls followed by `stop()`; do not overlap drains or try to restart a stopped runtime. Startup and each drain automatically requeue deliveries left `processing` by an interrupted attempt, preserving the consumed attempt and warning that external effects may repeat. HTTP starts only during ordinary `start()`, after environment mounts and before pollers/workers. `start({ drain: true })`, direct drains, offline work, inspection, and test-harness initialization do not open it. Failed startup and one-shot start clean up automatically. Shutdown closes HTTP and settles accepted requests and dispatches before releasing ownership. Environments unmount in reverse mount order, hooks unmount in reverse registration order, and cleanup continues after failures. Make cleanup hooks retry-safe because a later `stop()` retries unresolved cleanup.
 
@@ -274,7 +289,7 @@ export default defineConfig(({ project }) => ({
 }));
 ```
 
-Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 7 is current; valid versions 1 through 6 migrate in memory. Version 7 adds delivery phases, staged effects, and durable exhaustion records. Unfinished legacy deliveries resume at `sandbox`; processed and ignored deliveries become `completed`. Legacy sandbox flags are preserved because migration cannot infer their client owner. The next successful write persists version 7; invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
+Use `memoryStore()` in tests. `fileStore()`/`jsonFileStore()` validates snapshots before runtime work and writes. State version 8 is current; valid versions 1 through 7 migrate in memory. Version 8 adds optional sandbox `resource` and `cleanupSteps`; older records receive empty steps and no resource, so typed definitions reconcile active legacy sandboxes before use or cleanup. Earlier delivery-phase, exhaustion, sandbox, and legacy-flag migration rules remain. The next successful write persists version 8; invalid or unsupported files are not replaced. Run `state validate` for a read-only compatibility check. Durable values must be JSON-safe and at most 100 levels deep. Custom adapters can use the exported `validateAndMigrateState` and must return a valid current `OrchestratorState` from `read()`.
 
 Use `runtime.previewStatePrune({ before })` to inspect conservative retention and `runtime.runOffline(({ pruneState }) => pruneState({ before }))` to apply it. The CLI equivalents are `state prune --before <timestamp>` and the same command with `--apply`. Processed and ignored deliveries and safely unreferenced ended sessions/notes are eligible; retained exhaustion work protects its source delivery, event, and optional session, while cursors, unfinished sandbox records, and legacy active flags are preserved. Events remain as dedupe history unless `dropDedupe: true`/`--drop-dedupe` is explicit, which allows old source identities to dispatch again.
 
@@ -315,19 +330,32 @@ The context is valid only during the callback. `runOffline` requires an unused o
 ## Managed Node processes
 
 ```ts
-import { spawnManagedProcess } from "simple-agent-orchestrator/node";
+import {
+  adoptManagedProcess,
+  spawnManagedProcess,
+} from "simple-agent-orchestrator/node";
 
 const child = spawnManagedProcess(process.execPath, ["agent-server.mjs"], {
   cwd: project.root,
+  stdio: ["ignore", logFileDescriptor, logFileDescriptor],
   termGraceMs: 5_000,
   ownsProcess: async (pid) => processRecordStillMatches(pid),
 });
 
 await child.waitUntilReady(() => agentClient.isReady(), { signal, timeoutMs: 30_000 });
 await child.stop();
+
+const adopted = adoptManagedProcess(saved.pid, {
+  ownsProcess: (pid) => processRecordStillMatches(pid, saved.ownershipToken),
+});
+await adopted.stop(); // Promise<void>, no exit result
 ```
 
-The helper always uses detached mode, ignored standard streams, `unref()`, and `shell: false`. On POSIX, stop sends TERM and then KILL to the detached process group, with direct-child fallback when the group does not exist. Windows uses direct-child signaling. Stop is idempotent; the first call fixes its grace option. An optional async `ownsProcess(pid)` check runs once and authorizes graceful shutdown plus any required escalation. Readiness is application-defined: the helper does not add restart, port, HTTP, persistence, or provider behavior.
+`processRecordStillMatches`, `agentClient`, `saved`, and the log file descriptor come from the project; they are not package APIs.
+
+Spawn always uses detached mode, `unref()`, and `shell: false`. Stdio defaults to `ignore`; inherited streams and existing numeric file descriptors are allowed, while generated pipes, overlapped pipes, IPC, and caller-owned stream objects are not. Spawned POSIX stop uses the detached process group with direct-child fallback when the group does not exist; Windows uses the direct child. Its optional ownership check runs once before signaling.
+
+Adoption requires a safe integer PID greater than 1 and mandatory `ownsProcess` identity verification. On POSIX it observes and signals group `-pid` only, with no positive-PID fallback; Windows uses the PID. It verifies ownership before TERM and again before KILL, waits at most five seconds after KILL, and rejects if the target remains alive. The first adopted stop call caches its promise and options; concurrent and later calls return it. Adopted stop has no exit result. Readiness is application-defined. Neither helper adds restart, port, HTTP, persistence, or provider behavior.
 
 ## Testing
 
@@ -337,6 +365,9 @@ import { createTestRuntime } from "simple-agent-orchestrator/testing";
 const test = await createTestRuntime(config, { root: process.cwd() });
 await test.dispatch(channel, event); // drains by default
 await test.sessions.get("session-key");
+await test.sessions.end("session-key", "test end"); // metadata only
+await test.sessions.complete("exact-session-id", "test complete");
+await test.sandboxes.list("exact-session-id");
 await test.capacity.list();
 await test.capacity.release("client-id", "session-key"); // drains by default
 await test.events.list();
@@ -346,7 +377,7 @@ await test.readState();
 await test.stop();
 ```
 
-Pass config as the first argument rather than nesting it in an options object. Defaults are isolated memory state, silent logging, and disabled HTTP; options may override store/logger/HTTP and select either `root` or `project`. Event helpers return `{ event, deliveries, exhaustions }` records; delivery and exhaustion helpers expose their stored records directly. `test.runtime` is the public low-level escape hatch.
+Pass config as the first argument rather than nesting it in an options object. Defaults are isolated memory state, silent logging, and disabled HTTP; options may override store/logger/HTTP and select either `root` or `project`. `sessions.end` accepts an ID or key and does not clean sandboxes; `sessions.complete` requires an exact active ID and performs cleanup. `sandboxes.list(sessionId?)` returns stored sandbox resources and cleanup steps. Event helpers return `{ event, deliveries, exhaustions }` records; delivery and exhaustion helpers expose their stored records directly. `test.runtime` is the public low-level escape hatch.
 
 ## CLI reminders
 

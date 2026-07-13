@@ -49,9 +49,9 @@ When a handler ends the session, its history remains available. The next event w
 
 ## 4. Environments provide the tools
 
-An **environment** holds resources that a client can reuse while the process is running, such as a GitHub API client or a local agent server. It can also manage a **sandbox**, a resource tied to one session. For this pull request, the sandbox could be a dedicated Git worktree.
+An **environment** holds resources that a client can reuse while the process is running, such as a GitHub API client or a local agent server. It can also manage a **sandbox**, a resource tied to one session. For this pull request, the sandbox could save a typed description of a dedicated Git worktree so the handler and cleanup use the same resource after retries or restarts.
 
-The handler receives the event, session, environment, logger, and an `AbortSignal` it can pass to APIs that support cancellation.
+The handler receives the event, session, environment, typed sandbox accessor, logger, and an `AbortSignal` it can pass to APIs that support cancellation.
 
 ## 5. The runtime records the result
 
@@ -64,6 +64,8 @@ One event can produce several deliveries when multiple clients subscribe to the 
 ## What retries mean for your code
 
 A handler can run more than once after an error, timeout, restart, or an interruption while its result is being saved. Make calls to outside systems safe to repeat by using stable idempotency keys or checking their current state first. Pass the handler's `signal` to APIs that support cancellation. The [failure guide](guides/failure-semantics.md) explains each step of an attempt.
+
+Typed sandbox cleanup can save progress for named cleanup steps. That is a narrow cleanup feature, not an exactly-once guarantee or a workflow engine for general application work.
 
 Concurrency limits and locks work only inside one runtime process. The default JSON store prevents a second runtime from actively using the same state file. If several processes need to share work, this package isn't the shared queue between them; use a system built for that job.
 

@@ -13,9 +13,9 @@ Use Simple Agent Orchestrator when you want events from your project to trigger 
 - [Receive events with channels](guides/channels.md): send events from project code, the CLI, an HTTP request, or an API poll.
 - [Process events with clients](guides/clients.md): write handlers, require an existing session when needed, and choose capacity, retry, timeout, concurrency, and exhausted-delivery behavior.
 - [Keep context with sessions](guides/sessions-state.md): share state across related events, add notes, and mark completed work as ended.
-- [Set up environments and sandboxes](guides/environments-sandboxes.md): provide reusable process resources, checkpoint and reconcile session sandboxes, and complete cleanup administratively.
+- [Set up environments and sandboxes](guides/environments-sandboxes.md): provide reusable process resources, publish typed session resources, and resume named cleanup steps safely.
 - [Test your integration](guides/testing.md): run events in memory and inspect exactly what happened.
-- [Study a complete example](guides/github-opencode-example.md): poll GitHub reviews and send them to a coding agent, with one session and worktree per pull request.
+- [Study a complete example](guides/github-opencode-example.md): poll GitHub reviews and send them to OpenCode, with one typed worktree and adopted process per pull request.
 
 ## Run it day to day
 

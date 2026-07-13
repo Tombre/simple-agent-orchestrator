@@ -6,11 +6,12 @@ import type {
   StoredEvent,
   StoredExhaustion,
   StoredSandbox,
+  StoredSandboxCleanupStep,
   StoredSession,
 } from "../core/types.js";
 import { isSupportedRetryDelay } from "../utils/time.js";
 
-export const CURRENT_STATE_VERSION = 7 as const;
+export const CURRENT_STATE_VERSION = 8 as const;
 export const MINIMUM_STATE_VERSION = 1 as const;
 const MAX_JSON_NESTING_DEPTH = 100;
 
@@ -365,13 +366,89 @@ function validateCapacityReservation(
   requireTimestamp(value.acquiredAt, `${path}.acquiredAt`, source);
 }
 
-function validateSandbox(value: unknown, index: number, source: string): asserts value is StoredSandbox {
+function validateSandboxCleanupStep(
+  value: unknown,
+  id: string,
+  sandboxPath: string,
+  source: string,
+): asserts value is StoredSandboxCleanupStep {
+  const path = `${sandboxPath}.cleanupSteps.${id}`;
+  if (id.trim().length === 0) failure("invalid-state", source, `${sandboxPath}.cleanupSteps contains an empty step id.`);
+  requireRecord(value, path, source);
+  requireFields(
+    value,
+    ["status", "attempts", "createdAt", "updatedAt"],
+    ["startedAt", "completedAt", "lastError"],
+    path,
+    source,
+  );
+  if (!("running completed failed unknown".split(" ") as unknown[]).includes(value.status)) {
+    failure("invalid-state", source, `${path}.status must be running, completed, failed, or unknown.`);
+  }
+  requireInteger(value.attempts, `${path}.attempts`, 0, source);
+  requireTimestamp(value.createdAt, `${path}.createdAt`, source);
+  requireTimestamp(value.updatedAt, `${path}.updatedAt`, source);
+  for (const field of ["startedAt", "completedAt"] as const) {
+    if (value[field] !== undefined) requireTimestamp(value[field], `${path}.${field}`, source);
+  }
+  optionalString(value, "lastError", path, source);
+
+  if (value.attempts === 0) {
+    failure("invalid-state", source, `${path}.attempts must be positive after cleanup step work starts.`);
+  }
+  if (value.attempts > 0 && value.startedAt === undefined) {
+    failure("invalid-state", source, `${path}.startedAt is required after a cleanup step attempt.`);
+  }
+  if (value.status === "completed" && value.completedAt === undefined) {
+    failure("invalid-state", source, `${path}.completedAt is required for completed cleanup steps.`);
+  }
+  if (value.status !== "completed" && value.completedAt !== undefined) {
+    failure("invalid-state", source, `${path}.completedAt is only valid for completed cleanup steps.`);
+  }
+  if ((value.status === "failed" || value.status === "unknown") && value.lastError === undefined) {
+    failure("invalid-state", source, `${path}.lastError is required for ${value.status} cleanup steps.`);
+  }
+  if ((value.status === "running" || value.status === "completed") && value.lastError !== undefined) {
+    failure("invalid-state", source, `${path}.lastError is not valid for ${value.status} cleanup steps.`);
+  }
+
+  const createdAt = Date.parse(value.createdAt as string);
+  const updatedAt = Date.parse(value.updatedAt as string);
+  if (updatedAt < createdAt) failure("invalid-state", source, `${path}.updatedAt cannot precede createdAt.`);
+  if (value.startedAt !== undefined && Date.parse(value.startedAt as string) < createdAt) {
+    failure("invalid-state", source, `${path}.startedAt cannot precede createdAt.`);
+  }
+  if (value.startedAt !== undefined && Date.parse(value.startedAt as string) > updatedAt) {
+    failure("invalid-state", source, `${path}.startedAt cannot follow updatedAt.`);
+  }
+  if (
+    value.completedAt !== undefined &&
+    value.startedAt !== undefined &&
+    Date.parse(value.completedAt as string) < Date.parse(value.startedAt as string)
+  ) {
+    failure("invalid-state", source, `${path}.completedAt cannot precede startedAt.`);
+  }
+  if (value.completedAt !== undefined && Date.parse(value.completedAt as string) > updatedAt) {
+    failure("invalid-state", source, `${path}.completedAt cannot follow updatedAt.`);
+  }
+}
+
+function validateSandbox(
+  value: unknown,
+  index: number,
+  source: string,
+  resourceAwareState = true,
+): asserts value is StoredSandbox {
   const path = `state.sandboxes[${index}]`;
   requireRecord(value, path, source);
   requireFields(
     value,
-    ["sessionId", "clientId", "environmentId", "status", "checkpoint", "createdAt", "updatedAt"],
-    ["lastError"],
+    [
+      "sessionId", "clientId", "environmentId", "status", "checkpoint",
+      ...(resourceAwareState ? ["cleanupSteps"] : []),
+      "createdAt", "updatedAt",
+    ],
+    ["lastError", ...(resourceAwareState ? ["resource"] : [])],
     path,
     source,
   );
@@ -382,6 +459,13 @@ function validateSandbox(value: unknown, index: number, source: string): asserts
     failure("invalid-state", source, `${path}.status must be creating, active, cleaning, cleaned, or unknown.`);
   }
   requireJsonRecord(value.checkpoint, `${path}.checkpoint`, source);
+  if (resourceAwareState) {
+    if (Object.hasOwn(value, "resource")) requireJsonValue(value.resource, `${path}.resource`, source);
+    requireRecord(value.cleanupSteps, `${path}.cleanupSteps`, source);
+    for (const [id, step] of Object.entries(value.cleanupSteps)) {
+      validateSandboxCleanupStep(step, id, path, source);
+    }
+  }
   requireTimestamp(value.createdAt, `${path}.createdAt`, source);
   requireTimestamp(value.updatedAt, `${path}.updatedAt`, source);
   optionalString(value, "lastError", path, source);
@@ -563,8 +647,14 @@ export function validateAndMigrateState(value: unknown, source = "state"): Orche
   const capacityReservations = version >= 4 ? value.capacityReservations : [];
   requireArray(capacityReservations, "state.capacityReservations", source);
   capacityReservations.forEach((reservation, index) => validateCapacityReservation(reservation, index, source));
-  const sandboxes = version >= 6 ? value.sandboxes : [];
-  requireArray(sandboxes, "state.sandboxes", source);
+  const historicalSandboxes = version >= 6 ? value.sandboxes : [];
+  requireArray(historicalSandboxes, "state.sandboxes", source);
+  if (version < 8) {
+    historicalSandboxes.forEach((sandbox, index) => validateSandbox(sandbox, index, source, false));
+  }
+  const sandboxes = version >= 8
+    ? historicalSandboxes
+    : historicalSandboxes.map((sandbox) => ({ ...(sandbox as Record<string, unknown>), cleanupSteps: {} }));
   sandboxes.forEach((sandbox, index) => validateSandbox(sandbox, index, source));
   const exhaustions = version >= 7 ? value.exhaustions : [];
   requireArray(exhaustions, "state.exhaustions", source);

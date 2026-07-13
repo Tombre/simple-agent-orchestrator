@@ -12,6 +12,7 @@ import type {
   StoredEvent,
   StoredExhaustion,
   StoredSession,
+  StoredSandbox,
 } from "../core/types.js";
 import { createProjectContext } from "../runtime/project.js";
 import { OrchestratorRuntime } from "../runtime/runtime.js";
@@ -51,6 +52,11 @@ export interface TestRuntime {
     list(): Promise<StoredSession[]>;
     get(idOrKey: string): Promise<StoredSession | undefined>;
     notes(idOrKey: string): Promise<SessionNote[]>;
+    end(idOrKey: string, reason?: string): Promise<boolean>;
+    complete(sessionId: string, reason?: string): Promise<boolean>;
+  };
+  readonly sandboxes: {
+    list(sessionId?: string): Promise<StoredSandbox[]>;
   };
   readonly capacity: {
     list(): Promise<StoredCapacityReservation[]>;
@@ -125,6 +131,17 @@ export async function createTestRuntime(
       list: () => runtime.listSessions(),
       get: (idOrKey) => runtime.getSession(idOrKey),
       notes: (idOrKey) => runtime.listSessionNotes(idOrKey),
+      end(idOrKey, reason) {
+        assertRunning();
+        return runtime.endSession(idOrKey, reason);
+      },
+      complete(sessionId, reason) {
+        assertRunning();
+        return runtime.completeSession(sessionId, reason);
+      },
+    },
+    sandboxes: {
+      list: (sessionId) => runtime.listSandboxes(sessionId),
     },
     capacity: {
       list: () => runtime.listCapacityReservations(),

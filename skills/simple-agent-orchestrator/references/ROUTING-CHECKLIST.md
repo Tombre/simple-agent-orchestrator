@@ -21,7 +21,7 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 ## Handler safety
 
 - Each handler works when it is the first event for a session.
-- Persistent external identifiers are created with `session.ensure`; resources that need cleanup use an environment sandbox. Their external factories use stable idempotency keys or reconciliation.
+- Persistent external identifiers are created with `session.ensure`; resources that need cleanup use `createSandbox` and a typed JSON-safe resource. Their external factories use stable idempotency keys or reconciliation.
 - The handler does not require state created by another channel unless it can recreate or recover it.
 - External source acknowledgement happens in one designated `onSuccess`, its ownership under fan-out is explicit, and it is safe to repeat.
 - Each external handler or hook operation uses a stable idempotency key that does not include `attempt`, or reconciles external state before acting.
@@ -31,17 +31,28 @@ Use this when reviewing or debugging Simple Agent Orchestrator integrations.
 ## Session lifecycle
 
 - `session.end(...)` is called only when the durable work unit is complete, such as a PR merge or resolved issue.
-- Sandboxes and session resources have cleanup logic when they create external state.
+- Sandboxes have cleanup logic when they create external state, and every outside typed-cleanup effect is inside a durable cleanup step.
 - Ended sessions remain useful for debugging, and future events with the same `sessionKey` create a fresh active session.
 
 ## Environment and sandbox
 
 - Shared runtime resources start in `environment.onMount`, not at module import time.
 - Cleanup is registered through `environment.onUnmount`.
-- Sandbox creation receives `{ event, session, project, environment, currentCheckpoint, checkpoint }`, so branch/repo metadata comes from the triggering event and resource IDs can be saved eagerly.
-- A sandbox with uncertain create or cleanup state implements `reconcile`; it reports `active`, `cleaned`, or `unknown` before the runtime chooses another action.
-- Sandbox cleanup checks whether the resource exists before closing it.
+- Typed sandbox creation returns its resource or calls `publishResource` eagerly once identity is known. The resource is JSON-safe and contains everything handlers and cleanup need.
+- Handlers call `sandbox.get/getOptional` with the exact definition configured by `environment.useSandbox`; `existing-only` handlers do not rely on creation or reconciliation.
+- Sandbox hooks use `currentStatus`; resource-aware `reconcile` checks the optional resource, publishes a recovered resource before reporting `active`, and reports `active`, `cleaned`, or `unknown` conservatively.
+- Every outside cleanup effect uses `cleanup.step` with a stable non-empty ID and exactly one of `{ retry: "idempotent" }` or `{ reconcile }`.
+- Step reconciliation reports `completed`, `incomplete`, or `unknown`; unknown blocks. Dependent steps are awaited sequentially. Independent `Promise.allSettled` results are checked and rethrown.
+- Cleanup code does not place provider calls, process signals, or filesystem changes outside a step; typed cleanup re-enters directly from `cleaning`.
 - Sandbox lifecycle logic treats persisted cleanup as complete; a retry of final delivery persistence does not recreate the sandbox.
+- Cleanup steps are not treated as exactly-once work or a general workflow engine.
+
+## Managed process lifecycle
+
+- Spawned managed processes default stdio to `ignore`; explicit stdio does not ask Node to generate pipes, overlapped pipes, or IPC channels.
+- Persisted processes are recovered with `adoptManagedProcess` only when the PID is greater than 1 and project identity data can implement mandatory `ownsProcess` verification.
+- POSIX adoption intentionally targets only group `-pid`; code does not add a positive-PID fallback. Windows adoption targets the PID and does not claim descendant cleanup.
+- Adopted ownership is checked before TERM and again before KILL. The first stop promise/options are reused, stop returns no exit result, and post-KILL disappearance is bounded.
 
 ## HTTP ingress
 

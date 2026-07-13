@@ -125,6 +125,9 @@ Retry gives a failed delivery one additional attempt and runs ready work by defa
 | Process work that can run now | `test.drain()` |
 | List or inspect sessions | `test.sessions.list/get` |
 | Read a session's notes | `test.sessions.notes(...)` |
+| End a session without sandbox cleanup | `test.sessions.end(idOrKey, reason?)` |
+| Complete an exact session with sandbox cleanup | `test.sessions.complete(sessionId, reason?)` |
+| Inspect all or one session's sandboxes | `test.sandboxes.list(sessionId?)` |
 | Inspect or release retained capacity | `test.capacity.list/release` |
 | Inspect events together with their deliveries | `test.events.list/get` |
 | Inspect or retry individual deliveries | `test.deliveries.list/get/retry` |
@@ -135,6 +138,21 @@ Retry gives a failed delivery one additional attempt and runs ready work by defa
 | Clean up environments and stop the runtime | `test.stop()` |
 
 `test.capacity.release(clientId, sessionIdOrKey)` drains newly available work by default. Pass `{ drain: false }` when you want to inspect the pending delivery before it runs.
+
+In a test fixture whose typed sandbox publishes `workspace-123` and records a `remove` cleanup step, verify lifecycle behavior without reaching into the runtime:
+
+```ts
+const session = await test.sessions.get("demo");
+if (!session) throw new Error("Expected a session");
+
+await test.sessions.complete(session.id, "test complete");
+
+const [sandbox] = await test.sandboxes.list(session.id);
+expect(sandbox?.resource).toEqual({ workspaceId: "workspace-123" });
+expect(sandbox?.cleanupSteps.remove?.status).toBe("completed");
+```
+
+`sessions.end` accepts an ID or key and performs the same metadata-only operation as `runtime.endSession`; it does not clean sandboxes and returns `false` when no session matches. `sessions.complete` requires an exact active session ID, throws when that requirement is not met, and performs configured cleanup before ending. `sandboxes.list()` returns all records, while `sandboxes.list(session.id)` filters by exact session ID.
 
 The event and delivery helpers return ignored deliveries unchanged, including `ignoredReason`, bound `sessionId` when present, prior attempts when a retry was ignored, and terminal timestamps. Use `{ drain: false }` to inspect an `existing-only` delivery before its bound session ends.
 

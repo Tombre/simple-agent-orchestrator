@@ -33,7 +33,7 @@ Read [the design principles](docs/design-principles.md) before changing project 
 - **Handler**: a client's subscription to a channel. It owns `handle`, `onSuccess`, `onFailure`, and an optional retry override.
 - **Session**: durable continuity for a `sessionKey`. It stores typed state and notes across related deliveries; only active sessions are reused.
 - **Environment**: process-local resources mounted for a client. Values are not durable and environment definitions may own one sandbox lifecycle.
-- **Sandbox**: an optional session-scoped resource created and cleaned up by an environment. A durable record keyed by session ID, client ID, and environment ID tracks lifecycle status and JSON-safe checkpoints; integrations own the actual resource and reconciliation disposition.
+- **Sandbox**: an optional session-scoped resource created and cleaned up by an environment. `createSandbox` defines a typed JSON-safe resource. A durable record keyed by session ID, client ID, and environment ID tracks lifecycle status, the resource, JSON-safe checkpoints, and cleanup-step progress; integrations own the actual resource and reconciliation disposition.
 - **Store**: a full runtime-state snapshot adapter. The package ships isolated memory storage and a local JSON-file store.
 - **Runtime**: the one-shot, in-process coordinator for dispatch, polling, workers, lifecycle, locking, and persistence.
 - **HTTP server**: the optional project/runtime-scoped Hono listener started by ordinary `start()` for health, normalized webhook ingestion, bounded read-only operational summaries, and project routes; it is not a client environment.
@@ -121,8 +121,13 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Ordinary session mutations and notes persist only after a successful attempt.
 - `session.ensure` values persist eagerly and survive a failed attempt.
 - Sandbox lifecycle status and checkpoints persist eagerly so handler retries reuse or reconcile the same sandbox. Hook execution stays outside the runtime mutex; record writes stay inside it.
-- Sandbox records use `creating`, `active`, `cleaning`, `cleaned`, or `unknown`. Optional reconciliation runs before uncertain creation or cleanup continues and reports `active`, `cleaned`, or `unknown`.
+- Typed sandbox resources returned from `create` or passed to `publishResource` persist eagerly. An `active` typed sandbox must have a resource. Resource-aware reconciliation receives the optional saved resource, may publish a recovered one, and must publish one before reporting `active`.
+- `HandlerContext.sandbox.get/getOptional` accepts only the exact `createSandbox` definition configured on that client's environment. `get` requires an active saved resource; `getOptional` returns `undefined` when no active record exists. An active typed record without a resource is invalid. An `existing-only` handler does not create or reconcile before handling; an explicit session end may reconcile uncertain state during the later cleanup phase.
+- Sandbox records use `creating`, `active`, `cleaning`, `cleaned`, or `unknown`, and hooks receive that entry status as `currentStatus`. Optional sandbox reconciliation reports `active`, `cleaned`, or `unknown` before uncertain creation or cleanup continues.
 - Sandbox cleanup is a delivery phase after `handle` and `onSuccess`. Cleanup failure retries cleanup without rerunning completed handling or acknowledgement.
+- Typed sandbox cleanup re-enters the cleanup hook directly from `cleaning` when a resource exists. Every outside cleanup effect must therefore run inside a durable `cleanup.step`; code outside a step can repeat without a checkpoint.
+- A cleanup step has a stable non-empty ID and exactly one retry policy: `retry: "idempotent"` or `reconcile`. Step status is `running`, `completed`, `failed`, or `unknown`; completed steps skip, interrupted/failed idempotent steps repeat, and reconciled steps report `completed`, `incomplete`, or `unknown`. Unknown blocks conservatively.
+- Await cleanup steps sequentially when they depend on one another. Independent steps may use `Promise.allSettled`, but the cleanup hook must propagate rejected results. Abort prevents later steps from starting after the currently awaited operation settles.
 - `session.get` throws when a value is absent; use `getOptional`, `has`, or `ensure` when absence is valid.
 - `session.end()` preserves history and cannot be undone by a concurrently completing handler.
 - Concurrent deliveries merge mutations to different session-state keys.
@@ -134,13 +139,13 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - A named poll's cursor identity is `${channelId}:${pollId}` and remains stable when registrations move. An unnamed poll uses `${channelId}:${pollRegistrationIndex}`; reordering unnamed polls can reinterpret persisted cursors.
 - `memoryStore` isolates reads and writes by cloning.
 - `jsonFileStore` validates the full snapshot before runtime work and writes, does not replace invalid state, and writes via temporary file plus rename.
-- State version 7 is current. Structurally valid version 1 through 6 snapshots migrate deterministically in memory; unfinished legacy deliveries resume at `sandbox`, processed and ignored deliveries become `completed`, and the exhaustion collection starts empty. Existing retry, capacity, ignored-delivery, sandbox, and legacy-flag migration rules remain intact. The next successful write persists version 7; inspection does not rewrite older state.
+- State version 8 is current. Structurally valid version 1 through 7 snapshots migrate deterministically in memory. Version 8 adds sandbox `resource` and `cleanupSteps`; older sandboxes receive empty cleanup-step records and typed definitions must reconcile an active legacy record before a resource can be exposed or cleaned. Existing delivery-phase, exhaustion, retry, capacity, ignored-delivery, sandbox, and legacy-flag migration rules remain intact. The next successful write persists version 8; inspection does not rewrite older state.
 - Persisted event, session, note, cursor, and sandbox checkpoint values must be JSON-safe when using `jsonFileStore`.
 - Dispatch may return `queued` with no matching handlers. Sessions are created only when a delivery is processed.
 - State pruning is explicit and preview-first. It removes only old processed or ignored deliveries and safely unreferenced ended sessions/notes/cleaned sandbox records, preserves cursors and operational records, preserves sessions with unfinished sandbox records or legacy active flags, and retains event dedupe unless the operator explicitly drops it.
 - CLI parsing is schema-strict. Dispatch requires `--id`; session/event lists support positive `--limit` and `--json`; missing show/end/complete/retry targets fail.
 - `init` discovers the nearest package by default, requires an existing regular valid object-valued `package.json`, never edits the host manifest, and with `--force` overwrites only known template files while preserving unknown files.
-- `createRuntime(config, options)` defaults to the project JSON store. Direct construction plus `init()` is the low-level memory-default path. `createTestRuntime(config, options)` defaults to isolated memory, silent logging, and disabled HTTP and exposes grouped event and exhaustion records, delivery/exhaustion helpers, cleanup, and `test.runtime`.
+- `createRuntime(config, options)` defaults to the project JSON store. Direct construction plus `init()` is the low-level memory-default path. `createTestRuntime(config, options)` defaults to isolated memory, silent logging, and disabled HTTP and exposes grouped event and exhaustion records, `sessions.end/complete`, `sandboxes.list`, delivery/exhaustion helpers, cleanup, and `test.runtime`.
 
 ## Lifecycle And Concurrency
 
@@ -161,6 +166,7 @@ Preserve these contracts unless implementation, tests, and documentation are del
 - Session merging, `session.ensure`, sandbox locks, poll locks, and `StoreMutex` provide only in-process coordination.
 - Sandbox creation and cleanup are serialized per session/client/environment in one process.
 - Sandbox cleanup runs only after `handle` and `onSuccess` succeed and the handler called `session.end()`.
+- Cleanup steps are a sandbox-cleanup primitive, not a general workflow engine. They do not make processing exactly once or couple saved state transactionally to outside effects.
 - Keep external side effects idempotent because delivery state and external systems are not one transaction.
 - `completeSession(sessionId, reason?)` and CLI `sessions complete` require an exact active session ID, reject while pending or processing deliveries target that session or key, mount recorded environments, reconcile and clean every recorded sandbox, and release capacity and end only after all cleanup succeeds. Failures remain durable and retryable. `endSession`/`sessions end` remain metadata-only.
 - CLI `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, and `state prune --apply` are offline operations that fail before writing while a `jsonFileStore` runtime owns the state. Inspection, `capacity list`, and retention preview remain available; direct library mutations need an explicit `runtime.runOffline(...)` scope.
@@ -183,6 +189,8 @@ Do not claim these are solved unless code and regression tests explicitly solve 
 - Legacy sandbox flags do not identify a client. The runtime adopts one only when the configured environment has exactly one possible client owner; otherwise sandbox use and administrative completion reject conservatively.
 - Administrative `sessions end` does not invoke sandbox cleanup.
 - Runtime shutdown unmounts environments but does not clean every active session sandbox.
+- `adoptManagedProcess(pid, { ownsProcess, termGraceMs? })` requires a PID greater than 1 and a mandatory ownership check. On POSIX it observes and signals only process group `-pid`, with no positive-PID fallback; on Windows it targets the PID. It rechecks ownership before KILL escalation, caches the first stop promise and options, returns no exit result, and waits a bounded five seconds after KILL before rejecting.
+- `spawnManagedProcess` defaults stdio to `ignore`. Inherited streams and existing numeric file descriptors are allowed; generated pipes, overlapped pipes, IPC channels, and caller-owned stream objects are not because the detached handle does not expose or manage them.
 - Poll dispatch, source acknowledgement, cursor commit, and external effects are not transactionally coupled.
 - No provider-specific webhook route, provider integration, prompt renderer, approval system, or agent queue is bundled.
 - TypeScript config files are transpiled by `tsx` at runtime, not type-checked while loading.
@@ -226,7 +234,7 @@ Use proportionate checks during development, then broaden them according to impa
 - Every behavior fix or feature: run the smallest relevant test first, add a regression test, then run `npm run typecheck`.
 - Shared runtime, persistence, lifecycle, concurrency, public API, CLI, or template changes: run the full suite, typecheck, and build.
 - Large changes: also exercise the real CLI/runtime in a temporary project. Process a manual event, run `start --drain`, and inspect the resulting delivery/session. Tests alone are not sufficient.
-- Export, package metadata, build, binary, template, skill, or release-facing changes: inspect the packed artifact and install it into a clean temporary consumer. Verify `.`, `./runtime`, and `./testing` imports as applicable and run the installed CLI.
+- Export, package metadata, build, binary, template, skill, or release-facing changes: inspect the packed artifact and install it into a clean temporary consumer. Verify `.`, `./runtime`, `./node`, and `./testing` imports as applicable and run the installed CLI.
 - Documentation-only changes: verify links, paths, examples, commands, and statements against source. Full code checks are optional unless documentation exposes a discovered inconsistency.
 
 Full verification from the repository root:

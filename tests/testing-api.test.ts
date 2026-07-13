@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createChannel, createClient } from "../src/index.js";
+import { createChannel, createClient, createEnvironment, createSandbox } from "../src/index.js";
 import { createProjectContext } from "../src/runtime/index.js";
 import { createTestRuntime, memoryStore, type TestRuntimeOptions } from "../src/testing/index.js";
 
@@ -92,6 +92,34 @@ describe("testing API", () => {
     await expect(test.dispatch(channel, { id: "later" })).rejects.toThrow("stopped");
     await expect(test.drain()).rejects.toThrow("stopped");
     await expect(test.deliveries.retry("missing")).rejects.toThrow("stopped");
+  });
+
+  it("exposes session ending, administrative completion, and sandbox inspection", async () => {
+    const channel = createChannel("testing-lifecycle");
+    const sandbox = createSandbox({
+      create: () => ({ workspaceId: "ws-1" }),
+      cleanup() {},
+    });
+    const environment = createEnvironment("workspace", (builder) => builder.useSandbox(sandbox));
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, () => {});
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+    await test.dispatch(channel, { id: "first", sessionKey: "first" });
+    const first = (await test.sessions.list())[0]!;
+
+    expect(await test.sandboxes.list(first.id)).toMatchObject([{
+      status: "active",
+      resource: { workspaceId: "ws-1" },
+    }]);
+    expect(await test.sessions.complete(first.id, "complete-test")).toBe(true);
+    expect(await test.sessions.get(first.id)).toMatchObject({ status: "ended", endReason: "complete-test" });
+
+    await test.dispatch(channel, { id: "second", sessionKey: "second" });
+    expect(await test.sessions.end("second", "end-test")).toBe(true);
+    expect(await test.sessions.get("second")).toMatchObject({ status: "ended", endReason: "end-test" });
+    await test.stop();
   });
 
   it("rejects root and project together at runtime and in its option type", async () => {

@@ -186,8 +186,8 @@ async function verifyConsumer(consumerRoot, archive) {
 import type { DispatchResult, HttpRegistrationContext, OrchestratorState, ReadonlySession, StateValidationErrorCode, StoredDeliveryEffects, WorkStatus } from "simple-agent-orchestrator";
 import { createRuntime, loadProjectOrchestrator } from "simple-agent-orchestrator/runtime";
 import type { OfflineOperationContext } from "simple-agent-orchestrator/runtime";
-import { spawnManagedProcess } from "simple-agent-orchestrator/node";
-import type { ManagedProcess } from "simple-agent-orchestrator/node";
+import { adoptManagedProcess, spawnManagedProcess } from "simple-agent-orchestrator/node";
+import type { AdoptedManagedProcess, ManagedProcess, ManagedProcessStdio } from "simple-agent-orchestrator/node";
 import { createTestRuntime } from "simple-agent-orchestrator/testing";
 import type { TestRuntime } from "simple-agent-orchestrator/testing";
 
@@ -200,7 +200,9 @@ const config = { channels: [channel], clients: [client], http: { enabled: false,
 void defineConfig(config);
 const runtimePromise = createRuntime({ ...config, store: memoryStore() }, { root: "." });
 const testRuntimePromise: Promise<TestRuntime> = createTestRuntime(config, { root: "." });
-const managedProcess: ManagedProcess = spawnManagedProcess("node", ["-e", "process.exit(0)"]);
+const managedStdio: ManagedProcessStdio = ["ignore", "inherit", "inherit"];
+const managedProcess: ManagedProcess = spawnManagedProcess("node", ["-e", "process.exit(0)"], { stdio: managedStdio });
+const adoptedProcess: AdoptedManagedProcess = adoptManagedProcess(2, { ownsProcess: () => false });
 declare const offline: OfflineOperationContext;
 const dispatchResult: Promise<DispatchResult> = offline.dispatch(channel, { id: "typed" });
 declare const readonlySession: ReadonlySession;
@@ -219,6 +221,7 @@ const validationCode: StateValidationErrorCode = "invalid-state";
 void runtimePromise;
 void testRuntimePromise;
 void managedProcess.exit;
+void adoptedProcess.isAlive;
 void dispatchResult;
 void readonlySession.id;
 void workStatus;
