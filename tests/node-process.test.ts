@@ -1,9 +1,17 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, open, readFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { adoptManagedProcess, spawnManagedProcess } from "../src/node/index.js";
+import {
+  adoptManagedProcess,
+  createPosixProcessGroupLocator,
+  getAvailableLoopbackPort,
+  isLoopbackHttpUrl,
+  publishReadyRecord,
+  readReadyRecord,
+  spawnManagedProcess,
+} from "../src/node/index.js";
 import { deferred, waitFor } from "./helpers.js";
 
 const node = process.execPath;
@@ -530,6 +538,46 @@ describe("managed Node processes", () => {
       expect(() => adoptManagedProcess(pid, { ownsProcess })).toThrow("positive safe process PID");
     }
     expect(() => adoptManagedProcess(123, {} as never)).toThrow("ownsProcess must be provided");
+  });
+
+  it.runIf(process.platform !== "win32")("locates and verifies a managed POSIX process group", async () => {
+    const marker = `sao-locator-${crypto.randomUUID()}`;
+    const processHandle = spawnManagedProcess(node, ["-e", "setInterval(() => {}, 1000)", marker]);
+    const locator = createPosixProcessGroupLocator([marker]);
+
+    try {
+      await waitFor(async () => expect(await locator.locate()).toBe(processHandle.pid));
+      await expect(locator.owns(processHandle.pid)).resolves.toBe(true);
+      await expect(locator.owns(processHandle.pid + 1)).resolves.toBe(false);
+    } finally {
+      await processHandle.stop({ termGraceMs: 20 });
+    }
+  });
+
+  it("atomically publishes and validates readiness records", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sao-ready-record-"));
+    const readyPath = join(directory, "ready.json");
+    try {
+      await publishReadyRecord(readyPath, { state: "ready", pid: 42 });
+
+      await expect(readReadyRecord(readyPath, (record): record is typeof record & { state: "ready" } =>
+        record.state === "ready"
+      )).resolves.toEqual({ state: "ready", pid: 42 });
+      await expect(readReadyRecord(readyPath, (record): record is typeof record & { state: "other" } =>
+        record.state === "other"
+      )).resolves.toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("provides strict loopback HTTP endpoints", async () => {
+    const port = await getAvailableLoopbackPort();
+    expect(port).toBeGreaterThan(0);
+    expect(isLoopbackHttpUrl(`http://127.0.0.1:${port}`)).toBe(true);
+    expect(isLoopbackHttpUrl(`http://localhost:${port}`)).toBe(false);
+    expect(isLoopbackHttpUrl(`https://127.0.0.1:${port}`)).toBe(false);
+    expect(isLoopbackHttpUrl(`http://user@127.0.0.1:${port}`)).toBe(false);
   });
 });
 

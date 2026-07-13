@@ -657,6 +657,9 @@ interface ResourceSandboxDefinition<TResource extends JsonValue> {
   readonly create: (
     context: SandboxResourceCreateContext<TResource>,
   ) => Promise<TResource | void> | TResource | void;
+  readonly prepare?: (
+    context: SandboxResourcePrepareContext<TResource>,
+  ) => Promise<TResource | void> | TResource | void;
   readonly reconcile?: (
     context: SandboxResourceReconcileContext<TResource>,
   ) => Promise<SandboxDisposition> | SandboxDisposition;
@@ -681,9 +684,17 @@ type SandboxResourceReconcileContext<TResource extends JsonValue> =
     readonly resource?: Readonly<TResource>;
     publishResource(resource: TResource): Promise<void>;
   };
+
+type SandboxResourcePrepareContext<TResource extends JsonValue> =
+  SandboxDeliveryContext & {
+    readonly resource?: Readonly<TResource>;
+    publishResource(resource: TResource): Promise<void>;
+  };
 ```
 
 Resource-aware `reconcile` receives the saved resource when one exists and may publish a recovered resource. Returning `active` without a published resource throws and leaves the prior lifecycle status in place. This rule lets a typed definition safely adopt a version 6 or 7 sandbox record, or an older session's legacy sandbox flag, that predates stored resources.
+
+Optional `prepare` runs under the sandbox lock immediately before `handle` while the delivery is in its sandbox or handling phase. It receives the active resource, may return or eagerly publish a refreshed resource, and must leave a published resource before handling begins. Because handling retries can run it again, every outside effect in `prepare` must be retry-safe or reconcile by durable identity. Existing-only handlers do not create or reconcile sandboxes, but `prepare` runs when their exact session already has an active sandbox record; it is skipped when no record exists.
 
 ### `SandboxDefinition`
 
@@ -1316,6 +1327,15 @@ On POSIX, adoption refers only to process group `-pid`. `isAlive()` and `stop()`
 `stop()` checks liveness, verifies ownership, sends `SIGTERM`, and waits for the configured grace period. If the target remains alive, it verifies ownership again immediately before `SIGKILL`. After KILL it waits up to five seconds for the target to disappear and rejects if it remains alive. If the target disappears while ownership is being checked, stop resolves without signaling it.
 
 The first `stop()` call fixes both the promise and its options. Concurrent and later calls return that same promise, including a rejection. The promise resolves with `void`, not `ManagedProcessExit`, because an adopted process has no child-process exit event. `waitUntilReady()` has the same interval, timeout, and abort behavior as the spawned handle, but reports disappearance rather than an exit code.
+
+### Node lifecycle utilities
+
+`simple-agent-orchestrator/node` also exports narrow utilities used around managed processes:
+
+- `createPosixProcessGroupLocator(requiredCommandValues)` locates one POSIX process group whose command contains every exact argument value and provides a rescanning `owns(processGroupId)` check. It throws if multiple groups match and is unavailable on Windows.
+- `publishReadyRecord(filePath, record)` writes a private JSON readiness record through an exclusive temporary file and atomic rename. `readReadyRecord(filePath, validate)` returns only records accepted by the caller's type guard.
+- `getAvailableLoopbackPort()` asks the operating system for an unused `127.0.0.1` port and releases it before returning. The caller still owns the bind race.
+- `isLoopbackHttpUrl(value)` accepts only plain HTTP URLs rooted at `127.0.0.1` with an explicit port and no credentials, path, query, or fragment.
 
 ## Testing API
 

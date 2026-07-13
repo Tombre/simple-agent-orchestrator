@@ -107,6 +107,11 @@ export const worktreeSandbox = createSandbox<WorktreeResource>({
     return "active";
   },
 
+  async prepare({ resource, signal }) {
+    if (!resource) throw new Error("Expected an active worktree resource");
+    return refreshWorktree(resource, { signal });
+  },
+
   async cleanup({ cleanup }) {
     await cleanup.step("remove-worktree", { retry: "idempotent" }, async ({ resource, signal }) => {
       await closeWorktree(resource.id, { signal });
@@ -136,6 +141,8 @@ Use the eager `publishResource` pattern when you need the identity saved before 
 
 When `create` finishes with a published resource, the status becomes `active` and its session changes are saved immediately. If creation was interrupted, `reconcile` receives `resource` when one was saved, plus `currentStatus` and the checkpoint. It may call `publishResource` to recover an older or partially saved record. Reporting `active` without a resource is an error.
 
+Optional `prepare` runs immediately before each handler attempt that can still execute. Use it to check or refresh a long-lived active resource after a runtime restart. A returned resource is saved before the handler receives it; `publishResource` is available when preparation has multiple recoverable stages. Preparation can repeat after interruption, so use durable identity and reconciliation rather than attempt numbers.
+
 Only one sandbox can be configured on an environment. A later `useSandbox` call replaces the earlier one.
 
 Choose event data used by `create` carefully. Creation normally happens on the first delivery for a session, so later events with a different branch or workspace request won't recreate the sandbox automatically.
@@ -157,7 +164,7 @@ export const codingClient = createClient("coding", (client) => {
 
 `sandbox.get(worktreeSandbox)` returns a readonly value with the type inferred by `createSandbox`. It throws unless the same definition object was configured on this client's environment and its saved resource is active. `getOptional` performs the same definition-identity check but returns `undefined` when no active resource exists. A resumed cleanup attempt also retains the resource in the `onFailure` context so failure reporting can identify what cleanup was handling.
 
-An `existing-only` handler does not create or reconcile a sandbox before handling. It can read a resource already active for that exact session and client. With no active resource, including a migrated record that predates typed resources, `getOptional` returns `undefined` and `get` throws. If the handler calls `session.end()`, the later cleanup phase may reconcile uncertain saved state before cleanup; it still does not create a replacement session for a late event.
+An `existing-only` handler does not create or reconcile a sandbox before handling. If the exact session and client already have an active sandbox record, its optional `prepare` hook runs before the handler reads the resource. With no active record, `prepare` is skipped, `getOptional` returns `undefined`, and `get` throws. If the handler calls `session.end()`, the later cleanup phase may reconcile uncertain saved state before cleanup; it still does not create a replacement session for a late event.
 
 ## Clean up after the session ends
 

@@ -51,6 +51,7 @@ export type {
   SandboxDisposition,
   SandboxResourceCleanupContext,
   SandboxResourceCreateContext,
+  SandboxResourcePrepareContext,
   SandboxResourceReconcileContext,
   ResourceSandboxDefinition,
 } from "./core/environment.js";

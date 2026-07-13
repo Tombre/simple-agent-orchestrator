@@ -143,6 +143,72 @@ describe("typed sandbox resources", () => {
     await test.stop();
   });
 
+  it("durably prepares an active resource before each handler", async () => {
+    const channel = createChannel("typed-prepare");
+    const sandbox = createSandbox({
+      create: () => ({ revision: 0 }),
+      prepare: ({ resource }) => ({ revision: resource!.revision + 1 }),
+    });
+    const environment = createEnvironment("workspace", (builder) => builder.useSandbox(sandbox));
+    const seen: number[] = [];
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, ({ sandbox: resources }) => {
+        seen.push(resources.get(sandbox).revision);
+      });
+    });
+    const test = await createTestRuntime({ channels: [channel], clients: [client] });
+
+    await test.dispatch(channel, { id: "first", sessionKey: "work" });
+    await test.dispatch(channel, { id: "second", sessionKey: "work" });
+
+    expect(seen).toEqual([1, 2]);
+    expect(await test.sandboxes.list()).toMatchObject([{ resource: { revision: 2 } }]);
+    await test.stop();
+  });
+
+  it("reuses an eagerly prepared resource after a runtime restart", async () => {
+    const createChannelDefinition = createChannel("typed-prepare-create");
+    const resumeChannel = createChannel("typed-prepare-resume");
+    const seen: string[] = [];
+    let interrupted = true;
+    const sandbox = createSandbox<{ id: string }>({
+      create: () => ({ id: "created" }),
+      async prepare({ resource, publishResource }) {
+        if (interrupted) {
+          interrupted = false;
+          await publishResource({ id: "replacement" });
+          throw new Error("preparation interrupted");
+        }
+        return resource;
+      },
+    });
+    const environment = createEnvironment("workspace", (builder) => builder.useSandbox(sandbox));
+    const client = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(createChannelDefinition, { retries: { attempts: 1 }, handle: vi.fn() });
+      builder.handle(resumeChannel, {
+        session: "existing-only",
+        handle({ sandbox: resources }) {
+          seen.push(resources.get(sandbox).id);
+        },
+      });
+    });
+    const store = memoryStore();
+    const config = { channels: [createChannelDefinition, resumeChannel], clients: [client] };
+    const first = await createTestRuntime(config, { store });
+    await first.dispatch(createChannelDefinition, { id: "first", sessionKey: "work" });
+    expect(await first.sandboxes.list()).toMatchObject([{ resource: { id: "replacement" } }]);
+    await first.stop();
+
+    const restarted = await createTestRuntime(config, { store });
+    await restarted.dispatch(resumeChannel, { id: "second", sessionKey: "work" });
+
+    expect(seen).toEqual(["replacement"]);
+    expect(await restarted.sandboxes.list()).toMatchObject([{ resource: { id: "replacement" } }]);
+    await restarted.stop();
+  });
+
   it("blocks active resource-aware sandboxes without a published resource", async () => {
     const channel = createChannel("typed-missing");
     const sandbox = createSandbox<{ workspaceId: string }>({ create() {} });
@@ -293,19 +359,19 @@ describe("typed sandbox resources", () => {
     await test.stop();
   });
 
-  it("gives existing-only handlers read-only access without invoking lifecycle hooks", async () => {
+  it("gives existing-only handlers prepared access without invoking creation or reconciliation", async () => {
+    const createChannelDefinition = createChannel("typed-existing-only-create");
     const channel = createChannel("typed-existing-only");
     const other = createSandbox({ create: () => ({ wrong: true }) });
     const create = vi.fn(() => ({ workspaceId: "ws-1" }));
     const reconcile = vi.fn(() => "active" as const);
-    const sandbox = createSandbox({ create, reconcile });
+    const prepare = vi.fn(({ resource }) => resource);
+    const sandbox = createSandbox({ create, prepare, reconcile });
     const environment = createEnvironment("workspace", (builder) => builder.useSandbox(sandbox));
     const observed: unknown[] = [];
     const client = createClient("client", (builder) => {
       builder.useEnvironment(environment);
-      builder.handle(channel, ({ event }) => {
-        if (event.id === "first") return;
-      });
+      builder.handle(createChannelDefinition, () => {});
       builder.handle(channel, {
         id: "existing",
         session: "existing-only",
@@ -316,9 +382,10 @@ describe("typed sandbox resources", () => {
         },
       });
     });
-    const test = await createTestRuntime({ channels: [channel], clients: [client] });
-    await test.dispatch(channel, { id: "first", sessionKey: "work" });
+    const test = await createTestRuntime({ channels: [createChannelDefinition, channel], clients: [client] });
+    await test.dispatch(createChannelDefinition, { id: "first", sessionKey: "work" });
     create.mockClear();
+    prepare.mockClear();
     reconcile.mockClear();
 
     await test.dispatch(channel, { id: "second", sessionKey: "work" });
@@ -326,6 +393,7 @@ describe("typed sandbox resources", () => {
     expect(observed).toEqual([{ workspaceId: "ws-1" }]);
     expect(create).not.toHaveBeenCalled();
     expect(reconcile).not.toHaveBeenCalled();
+    expect(prepare).toHaveBeenCalledOnce();
     await test.stop();
   });
 

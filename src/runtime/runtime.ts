@@ -30,6 +30,7 @@ import type {
   SandboxDisposition,
   SandboxResourceCleanupContext,
   SandboxResourceCreateContext,
+  SandboxResourcePrepareContext,
   SandboxResourceReconcileContext,
 } from "../core/environment.js";
 import {
@@ -1903,6 +1904,10 @@ export class OrchestratorRuntime {
         await this.ensureSandbox(client, environment, sessionImpl, event, attemptSignal);
         await this.checkpointDelivery(delivery.id, "handling");
       }
+      if (delivery.phase === "sandbox" || delivery.phase === "handling") {
+        stage = "sandbox";
+        await this.prepareSandbox(client, environment, sessionImpl, event, attemptSignal);
+      }
       attemptSignal.throwIfTimedOut();
 
       const orchestratorEvent = this.toRuntimeEvent(event);
@@ -2420,6 +2425,45 @@ export class OrchestratorRuntime {
     });
   }
 
+  private async prepareSandbox(
+    client: RuntimeClient,
+    environment: EnvironmentInstance,
+    session: SessionImpl,
+    event: StoredEvent,
+    attemptSignal: AttemptSignal,
+  ): Promise<void> {
+    const definition = client.environment;
+    const resourceDefinition = this.resourceSandboxDefinition(client);
+    if (!definition || !resourceDefinition?.prepare) return;
+    await this.withSandboxLock(this.sandboxKey(session.id, client.id, definition.id), async () => {
+      attemptSignal.throwIfTimedOut();
+      const currentSession = await this.getSession(session.id);
+      if (currentSession?.status !== "active") throw new Error(`Session ended before sandbox preparation: ${session.id}`);
+      let record = await this.getSandbox(session.id, client.id, definition.id);
+      if (!record || record.status !== "active") return;
+      try {
+        const resource = await resourceDefinition.prepare!(
+          this.resourceSandboxContext(
+            client,
+            environment,
+            session,
+            event,
+            attemptSignal.signal,
+            record,
+            { type: "delivery" },
+          ),
+        );
+        if (resource !== undefined) record = await this.publishSandboxResource(record, resource);
+        record = (await this.getSandbox(session.id, client.id, definition.id)) ?? record;
+        this.assertPublishedSandboxResource(record);
+      } catch (error) {
+        await this.setSandboxStatus(session.id, client.id, definition.id, record.status, undefined, error);
+        throw error;
+      }
+      attemptSignal.throwIfTimedOut();
+    });
+  }
+
   private async completeSandbox(
     client: RuntimeClient,
     environment: EnvironmentInstance,
@@ -2608,7 +2652,7 @@ export class OrchestratorRuntime {
     signal: AbortSignal,
     sandbox: StoredSandbox,
     cause: SandboxContext["cause"],
-  ): SandboxResourceCreateContext<JsonValue> & SandboxResourceReconcileContext<JsonValue> {
+  ): SandboxResourceCreateContext<JsonValue> & SandboxResourcePrepareContext<JsonValue> & SandboxResourceReconcileContext<JsonValue> {
     const context = event === undefined
       ? this.sandboxContext(
           client,
@@ -2624,7 +2668,7 @@ export class OrchestratorRuntime {
       publishResource: async (resource: JsonValue) => {
         await this.publishSandboxResource(sandbox, resource);
       },
-    }) as SandboxResourceCreateContext<JsonValue> & SandboxResourceReconcileContext<JsonValue>;
+    }) as SandboxResourceCreateContext<JsonValue> & SandboxResourcePrepareContext<JsonValue> & SandboxResourceReconcileContext<JsonValue>;
     if (Object.hasOwn(sandbox, "resource")) {
       Object.defineProperty(resourceContext, "resource", {
         enumerable: true,

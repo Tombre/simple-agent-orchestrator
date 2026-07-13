@@ -234,6 +234,11 @@ export const worktreeSandbox = createSandbox<{ id: string; path: string }>({
     return "active";
   },
 
+  async prepare({ resource, signal }) {
+    if (!resource) throw new Error("Expected an active worktree resource");
+    return ensureWorktreeReady(resource, { signal });
+  },
+
   async cleanup({ cleanup }) {
     await cleanup.step("remove-worktree", { retry: "idempotent" }, async ({ resource }) => {
       await closeWorktreeIdempotently(resource.id);
@@ -259,7 +264,7 @@ export const opencodeEnvironment = createEnvironment("opencode", (environment) =
 });
 ```
 
-All worktree and OpenCode functions above are project APIs. `createSandbox`, `publishResource`, `environment.useSandbox`, and `cleanup.step` are package APIs. `create` may return the resource instead of publishing it; eager publish preserves identity if later creation code fails. Reconciliation receives `resource?`, `currentStatus`, and `currentCheckpoint`; it must publish a resource before returning `active` when none is stored.
+All worktree and OpenCode functions above are project APIs. `createSandbox`, `publishResource`, environment registration, and cleanup steps are package APIs. `create` may return the resource instead of publishing it; eager publish preserves identity if later creation code fails. Reconciliation receives `resource?`, `currentStatus`, and `currentCheckpoint`; it must publish a resource before returning `active` when none is stored. Optional `prepare` runs before handling for active sandboxes, including existing-only deliveries, and may durably refresh the resource. It can repeat after interruption and must be retry-safe.
 
 Every outside typed-cleanup effect belongs inside a stable, non-empty step ID because cleanup re-enters directly from `cleaning`. A step chooses exactly `{ retry: "idempotent" }` or `{ reconcile }`; step reconciliation reports `completed`, `incomplete`, or `unknown`. Saved status is `running`, `completed`, `failed`, or `unknown`. Completed steps skip, unknown blocks, dependent steps run sequentially, and independent steps may use `Promise.allSettled` if the cleanup hook propagates failures. This is sandbox cleanup, not a workflow engine or exactly-once execution.
 
@@ -332,6 +337,11 @@ The context is valid only during the callback. `runOffline` requires an unused o
 ```ts
 import {
   adoptManagedProcess,
+  createPosixProcessGroupLocator,
+  getAvailableLoopbackPort,
+  isLoopbackHttpUrl,
+  publishReadyRecord,
+  readReadyRecord,
   spawnManagedProcess,
 } from "simple-agent-orchestrator/node";
 
@@ -355,7 +365,7 @@ await adopted.stop(); // Promise<void>, no exit result
 
 Spawn always uses detached mode, `unref()`, and `shell: false`. Stdio defaults to `ignore`; inherited streams and existing numeric file descriptors are allowed, while generated pipes, overlapped pipes, IPC, and caller-owned stream objects are not. Spawned POSIX stop uses the detached process group with direct-child fallback when the group does not exist; Windows uses the direct child. Its optional ownership check runs once before signaling.
 
-Adoption requires a safe integer PID greater than 1 and mandatory `ownsProcess` identity verification. On POSIX it observes and signals group `-pid` only, with no positive-PID fallback; Windows uses the PID. It verifies ownership before TERM and again before KILL, waits at most five seconds after KILL, and rejects if the target remains alive. The first adopted stop call caches its promise and options; concurrent and later calls return it. Adopted stop has no exit result. Readiness is application-defined. Neither helper adds restart, port, HTTP, persistence, or provider behavior.
+Adoption requires a safe integer PID greater than 1 and mandatory `ownsProcess` identity verification. On POSIX it observes and signals group `-pid` only, with no positive-PID fallback; Windows uses the PID. It verifies ownership before TERM and again before KILL, waits at most five seconds after KILL, and rejects if the target remains alive. The first adopted stop call caches its promise and options; concurrent and later calls return it. Adopted stop has no exit result. `createPosixProcessGroupLocator` finds one group by exact command values and supplies a rescanning ownership check. `publishReadyRecord`/`readReadyRecord`, `getAvailableLoopbackPort`, and `isLoopbackHttpUrl` provide narrow process-boundary utilities without adding provider restart policy.
 
 ## Testing
 

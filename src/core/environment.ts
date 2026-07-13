@@ -60,6 +60,11 @@ export type SandboxResourceCreateContext<TResource extends JsonValue> = SandboxD
   publishResource(resource: TResource): Promise<void>;
 };
 
+export type SandboxResourcePrepareContext<TResource extends JsonValue> = SandboxDeliveryContext & {
+  readonly resource?: Readonly<TResource> | undefined;
+  publishResource(resource: TResource): Promise<void>;
+};
+
 export type SandboxResourceReconcileContext<TResource extends JsonValue> = SandboxContext & {
   readonly resource?: Readonly<TResource> | undefined;
   publishResource(resource: TResource): Promise<void>;
@@ -104,6 +109,9 @@ export interface ResourceSandboxDefinition<TResource extends JsonValue> {
   readonly [sandboxResourceType]?: TResource;
   readonly create: (
     ctx: SandboxResourceCreateContext<TResource>,
+  ) => Promise<TResource | void> | TResource | void;
+  readonly prepare?: (
+    ctx: SandboxResourcePrepareContext<TResource>,
   ) => Promise<TResource | void> | TResource | void;
   readonly reconcile?: (
     ctx: SandboxResourceReconcileContext<TResource>,

@@ -53,7 +53,7 @@ For a complete first run, including a useful handler and an HTTP request, follow
 - A **session** lets related events share state and notes, such as all comments on one pull request.
 - A client's optional **capacity** limit keeps only a configured number of long-running external agent sessions active while new sessions wait.
 - An **existing-only handler** can target the exact active session present at dispatch and durably ignore late callbacks without creating or rebinding work.
-- An **environment** gives a client process-local resources and can manage a typed, session-specific sandbox, such as a worktree. The typed resource, lifecycle status, checkpoints, and cleanup-step progress survive retries, and administrative completion can reconcile and clean them before ending the session.
+- An **environment** gives a client process-local resources and can manage a typed, session-specific sandbox, such as a worktree. The typed resource, lifecycle status, checkpoints, and cleanup-step progress survive retries; an optional preparation hook can refresh active resources before handling, and administrative completion can reconcile and clean them before ending the session.
 - The **runtime** runs all of this in one process and can also serve HTTP.
 
 Set up channels, clients, and environments before initializing the runtime. It reads their setup once during `init()`, so code that changes them later won't reconfigure that runtime; create and start a new runtime instead.
