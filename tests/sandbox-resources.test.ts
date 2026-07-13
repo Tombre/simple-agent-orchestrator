@@ -560,6 +560,14 @@ describe("typed sandbox resources", () => {
       },
     });
   });
+
+  it("brands resource definitions across package module contexts", () => {
+    const sandbox = createSandbox({ create: () => ({ id: "resource" }) });
+    const brand = Symbol.for("simple-agent-orchestrator.resource-sandbox");
+
+    expect((sandbox as unknown as Record<symbol, unknown>)[brand]).toBe(true);
+    expect(Object.keys(sandbox)).toEqual(["create"]);
+  });
 });
 
 describe("durable sandbox cleanup steps", () => {

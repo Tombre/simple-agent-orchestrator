@@ -10,7 +10,7 @@ import type {
 import { keyName } from "./types.js";
 import type { ReadonlySession, Session } from "./session.js";
 
-const resourceSandboxDefinitions = new WeakSet<object>();
+const resourceSandboxBrand = Symbol.for("simple-agent-orchestrator.resource-sandbox");
 declare const sandboxResourceType: unique symbol;
 
 export interface EnvironmentInstance {
@@ -116,14 +116,16 @@ export interface ResourceSandboxDefinition<TResource extends JsonValue> {
 export function createSandbox<TResource extends JsonValue>(
   definition: ResourceSandboxDefinition<TResource>,
 ): ResourceSandboxDefinition<TResource> {
-  resourceSandboxDefinitions.add(definition);
+  Object.defineProperty(definition, resourceSandboxBrand, { value: true });
   return definition;
 }
 
 export function isResourceSandboxDefinition(
   definition: SandboxDefinition | ResourceSandboxDefinition<JsonValue>,
 ): definition is ResourceSandboxDefinition<JsonValue> {
-  return resourceSandboxDefinitions.has(definition);
+  return (definition as ResourceSandboxDefinition<JsonValue> & { [resourceSandboxBrand]?: unknown })[
+    resourceSandboxBrand
+  ] === true;
 }
 
 export type AnySandboxDefinition = SandboxDefinition | ResourceSandboxDefinition<JsonValue>;

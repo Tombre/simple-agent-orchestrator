@@ -314,7 +314,7 @@ describe("managed Node processes", () => {
     const directory = await mkdtemp(join(tmpdir(), "sao-adopt-ownership-"));
     const readyPath = join(directory, "ready");
     const target = spawnTarget(
-      "require('node:fs').writeFileSync(process.argv[1], 'ready'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+      "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(process.argv[1], 'ready'); setInterval(() => {}, 1000)",
       [readyPath],
     );
     let ownershipChecks = 0;
@@ -339,7 +339,7 @@ describe("managed Node processes", () => {
     const directory = await mkdtemp(join(tmpdir(), "sao-adopt-kill-exit-"));
     const readyPath = join(directory, "ready");
     const target = spawnTarget(
-      "require('node:fs').writeFileSync(process.argv[1], 'ready'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+      "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(process.argv[1], 'ready'); setInterval(() => {}, 1000)",
       [readyPath],
     );
     let ownershipChecks = 0;
