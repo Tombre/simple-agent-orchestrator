@@ -157,7 +157,7 @@ export const codingClient = createClient("coding", (client) => {
 
 `sandbox.get(worktreeSandbox)` returns a readonly value with the type inferred by `createSandbox`. It throws unless the same definition object was configured on this client's environment and its saved resource is active. `getOptional` performs the same definition-identity check but returns `undefined` when no active resource exists. A resumed cleanup attempt also retains the resource in the `onFailure` context so failure reporting can identify what cleanup was handling.
 
-An `existing-only` handler does not create or reconcile a sandbox before handling. It can read a resource already active for that exact session and client. With no active record, `getOptional` returns `undefined` and `get` throws. An invalid `active` typed record with no resource fails before the handler runs. If the handler calls `session.end()`, the later cleanup phase may reconcile uncertain saved state before cleanup; it still does not create a replacement session for a late event.
+An `existing-only` handler does not create or reconcile a sandbox before handling. It can read a resource already active for that exact session and client. With no active resource, including a migrated record that predates typed resources, `getOptional` returns `undefined` and `get` throws. If the handler calls `session.end()`, the later cleanup phase may reconcile uncertain saved state before cleanup; it still does not create a replacement session for a late event.
 
 ## Clean up after the session ends
 

@@ -357,6 +357,47 @@ describe("typed sandbox resources", () => {
     await test.stop();
   });
 
+  it("lets existing-only handlers inspect a migrated active sandbox without running hooks", async () => {
+    const channel = createChannel("typed-existing-only-migrated");
+    const create = vi.fn(() => ({ workspaceId: "legacy" }));
+    const reconcile = vi.fn(() => "active" as const);
+    const sandbox = createSandbox({ create, reconcile });
+    const environment = createEnvironment("workspace", (builder) => builder.useSandbox(sandbox));
+    const creator = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, () => {});
+    });
+    const initial = await createTestRuntime({ channels: [channel], clients: [creator] });
+    await initial.dispatch(channel, { id: "first", sessionKey: "work" });
+    const state = await initial.readState();
+    await initial.stop();
+    delete state.sandboxes[0]!.resource;
+    create.mockClear();
+    reconcile.mockClear();
+
+    const observed: unknown[] = [];
+    const observer = createClient("client", (builder) => {
+      builder.useEnvironment(environment);
+      builder.handle(channel, {
+        session: "existing-only",
+        handle({ sandbox: resources }) {
+          observed.push(resources.getOptional(sandbox));
+        },
+      });
+    });
+    const restarted = await createTestRuntime(
+      { channels: [channel], clients: [observer] },
+      { store: memoryStore(state) },
+    );
+
+    await restarted.dispatch(channel, { id: "second", sessionKey: "work" });
+
+    expect(observed).toEqual([undefined]);
+    expect(create).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+    await restarted.stop();
+  });
+
   it("reconciles a version-7 active sandbox before exposing a typed resource", async () => {
     const channel = createChannel("typed-v7-delivery");
     const legacyEnvironment = createEnvironment("workspace", (builder) => {

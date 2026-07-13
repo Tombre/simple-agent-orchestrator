@@ -2800,9 +2800,6 @@ export class OrchestratorRuntime {
     const resourceAvailable = record !== undefined &&
       (record.status === "active" || (includeCleaningResource && record.status === "cleaning")) &&
       Object.hasOwn(record, "resource");
-    if (record?.status === "active" && !resourceAvailable) {
-      throw new Error(`Active resource-aware sandbox ${client.id}/${environment!.id} has no published resource`);
-    }
     const resource = resourceAvailable
       ? structuredClone(record.resource)
       : undefined;

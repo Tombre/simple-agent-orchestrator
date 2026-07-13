@@ -174,7 +174,7 @@ type HandlerContext = {
 };
 ```
 
-Sandbox access uses configured definition identity, not an ID or structural match. `get` requires an active resource. `getOptional` returns `undefined` when there is no active record; an active typed record without a resource is invalid. An `existing-only` handler does not create or reconcile before handling. If it explicitly ends the session, the later cleanup phase may reconcile uncertain saved state.
+Sandbox access uses configured definition identity, not an ID or structural match. `get` requires an active resource. `getOptional` returns `undefined` when there is no active resource, including a migrated active record without one. An `existing-only` handler does not create or reconcile before handling. If it explicitly ends the session, the later cleanup phase may reconcile uncertain saved state.
 
 Exhaustion context provides an optional `ReadonlySession` with only `id`, `key`, `status`, `get`, `getOptional`, and `has`. Exhaustion records are independent historical work and remain valid if their source delivery is manually retried to another status.
 

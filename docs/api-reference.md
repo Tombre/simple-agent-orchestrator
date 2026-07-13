@@ -492,7 +492,7 @@ interface HandlerSandboxAccessor {
 }
 ```
 
-Both methods require the exact `createSandbox(...)` definition object configured by this client's environment. Passing an equivalent but different definition, or a definition configured for another client, throws. `get` also throws unless that sandbox has an active saved resource. `getOptional` returns `undefined` when there is no active record. An `active` typed record without a resource is invalid and fails context creation rather than returning `undefined`. During a resumed `cleaning` phase, the failure hook can still read the retained resource for diagnostics.
+Both methods require the exact `createSandbox(...)` definition object configured by this client's environment. Passing an equivalent but different definition, or a definition configured for another client, throws. `get` also throws unless that sandbox has an active saved resource. `getOptional` returns `undefined` when there is no active resource, including a migrated active record that predates typed resources. During a resumed `cleaning` phase, the failure hook can still read the retained resource for diagnostics.
 
 Normal handlers receive the resource after the runtime has created or reconciled the sandbox. A handler with `session: "existing-only"` gets an existing-state-only view before handling: the accessor may read an already-active resource, but dispatch does not create a record or run `create` or `reconcile`. If that handler explicitly ends the session, the later cleanup phase may reconcile uncertain saved state before cleanup.
 
