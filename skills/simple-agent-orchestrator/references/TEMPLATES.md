@@ -116,6 +116,51 @@ export const codingClient = createClient("coding", (client) => {
 });
 ```
 
+## Typed sandbox resource and cleanup
+
+```ts
+import {
+  createEnvironment,
+  createSandbox,
+} from "simple-agent-orchestrator";
+
+// createProjectWorkspace, findProjectWorkspace, workspaceExists, and removeProjectWorkspace
+// are project-provided resource adapters.
+export const workspaceSandbox = createSandbox<{ id: string; path: string }>({
+  async create({ session, project, signal, publishResource }) {
+    const workspace = await createProjectWorkspace({
+      key: `workspace:${session.id}`,
+      root: project.root,
+      signal,
+    });
+    await publishResource({ id: workspace.id, path: workspace.path });
+  },
+
+  async reconcile({ resource, currentStatus, session, signal, publishResource }) {
+    if (resource && await workspaceExists(resource.id, { signal })) return "active";
+    const workspace = await findProjectWorkspace({
+      key: `workspace:${session.id}`,
+      signal,
+    });
+    if (!workspace) return currentStatus === "cleaning" ? "cleaned" : "unknown";
+    await publishResource({ id: workspace.id, path: workspace.path });
+    return "active";
+  },
+
+  async cleanup({ cleanup }) {
+    await cleanup.step("remove-workspace", { retry: "idempotent" }, async ({ resource, signal }) => {
+      await removeProjectWorkspace(resource.id, { signal });
+    });
+  },
+});
+
+export const codingEnvironment = createEnvironment("coding", (environment) => {
+  environment.useSandbox(workspaceSandbox);
+});
+```
+
+`create` may return the resource instead of calling `publishResource`; use eager publish when later creation work can fail. A handler reads it with `sandbox.get(workspaceSandbox)`. Keep the exact definition object. Put every outside cleanup effect inside a stable step because typed cleanup re-enters from saved `cleaning` state. Cleanup steps are not a general workflow engine or exactly-once boundary.
+
 ## Programmatic runtime and tests
 
 ```ts
@@ -136,6 +181,11 @@ const test = await createTestRuntime({
 });
 try {
   await test.dispatch(manualChannel, { id: "test-1" });
+  const session = (await test.sessions.list())[0];
+  if (session) {
+    await test.sessions.complete(session.id, "test complete");
+    await test.sandboxes.list(session.id);
+  }
 } finally {
   await test.stop();
 }

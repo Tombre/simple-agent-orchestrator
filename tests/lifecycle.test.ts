@@ -1388,6 +1388,7 @@ describe("resource lifecycle", () => {
         environmentId: environment.id,
         status: "active",
         checkpoint: {},
+        cleanupSteps: {},
         createdAt: now,
         updatedAt: now,
       }],

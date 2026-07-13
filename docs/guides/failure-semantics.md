@@ -46,12 +46,13 @@ An error thrown by `onFailure` is logged but doesn't replace the original delive
 | `session.note(...)` | Saved | Staged after successful handling; committed only after all phases finish |
 | `session.end(...)` | Saved | Staged after successful handling; committed only after all phases finish |
 | Completed `session.ensure(...)` | Already saved | Kept for the retry |
-| Completed sandbox creation details | Already saved | Kept for the retry |
+| Published or returned sandbox resource | Already saved | Kept for the retry once published |
+| Completed typed cleanup step | Already saved | Skipped when cleanup re-enters |
 | Normal changes in `onFailure` | Not applicable | Discarded |
 
 This split is intentional. Ordinary changes remain attached to the delivery after `handle` succeeds, but other deliveries don't see them until every phase finishes. If `handle` fails before its checkpoint, those changes are discarded. An `ensure` value usually identifies something already created outside the process; keeping it gives the retry a chance to reuse that same thing. Sandbox creation follows the same rule.
 
-There is still a small but important gap: an `ensure` factory or sandbox creator can finish its external work just before the process stops and before final status is recorded. Save external IDs through the sandbox checkpoint API and use `reconcile` to check them before creating again. The external create call still needs a stable key because a process can stop before the first checkpoint write.
+There is still a small but important gap: an `ensure` factory or sandbox creator can finish its external work just before the process stops and before final status is recorded. Publish typed sandbox resources as soon as their identity is known and use `reconcile` to check them before creating again. The external create call still needs a stable key because a process can stop before the first resource write.
 
 ## Give every external action a stable key
 
@@ -135,7 +136,18 @@ Creation isn't the only risky edge. The process can stop in any of these gaps:
 - Sandbox creation finishes before its `active` status is recorded.
 - Sandbox cleanup finishes before the delivery is marked `processed`.
 
-Use stable resource IDs, then check what exists before creating, cleaning up, or recreating anything. See [environments and sandboxes](environments-sandboxes.md#make-creation-and-cleanup-safe-to-repeat).
+Typed sandbox cleanup handles that last gap with durable steps. Put every outside cleanup effect inside `cleanup.step(id, policy, operation)`. The cleanup hook is re-entered directly from a saved `cleaning` status, so an effect outside a step may repeat without a checkpoint.
+
+Choose exactly one policy for each stable step ID:
+
+- `{ retry: "idempotent" }` allows failed or interrupted work to run again.
+- `{ reconcile }` checks a previously started step and reports `completed`, `incomplete`, or `unknown`.
+
+`unknown` stops conservatively. Completed steps skip. Await dependent steps in sequence. Independent effects can use `Promise.allSettled`, but propagate any rejection so the sandbox isn't marked cleaned. Abort prevents a later sequential step from starting after the current operation settles; it cannot undo an outside action already in flight.
+
+Use stable resource IDs, then check what exists before creating, cleaning up, or recreating anything. See [environments and sandboxes](environments-sandboxes.md#give-each-cleanup-effect-its-own-saved-step).
+
+These steps are limited to typed sandbox cleanup. They don't make handling exactly once, and they aren't a general workflow engine for arbitrary application work.
 
 ## Keep secrets out of saved data
 

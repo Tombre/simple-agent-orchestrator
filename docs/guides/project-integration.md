@@ -166,7 +166,7 @@ The CLI and programmatic `createRuntime()` use this JSON file by default:
 .simple-agent-orchestrator/state/state.json
 ```
 
-It can contain event bodies, session state, notes, poll positions, and delivery errors in plaintext. Avoid credentials and source data you don't need.
+It can contain event bodies, session state, notes, typed sandbox resources and cleanup-step errors, poll positions, and delivery errors in plaintext. Avoid credentials and source data you don't need.
 
 The JSON store prevents another `start()`, `drain()`, or `runOffline()` operation from owning the same file. Stop the running orchestrator before using commands such as `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, or `state prune --apply`.
 

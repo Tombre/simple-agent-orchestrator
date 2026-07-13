@@ -35,11 +35,11 @@ Internal package paths are not public APIs.
 | Channels | [`createChannel`](#createchannelid-setup), [`createManualChannel`](#createmanualchannelid), [`channel.poll`](#channelpolldefinition), [`Cursor`](#cursor) |
 | Events | [`DispatchEvent`](#dispatchevent), [`DispatchResult`](#dispatchresult), [dispatch methods](#dispatch-methods) |
 | Clients | [`createClient`](#createclientid-setup), [`ClientBuilder`](#clientbuilder), [`client.handle`](#clienthandlechannel-options), [`client.onExhausted`](#clientonexhaustedoptions), [`HandlerContext`](#handlercontext), [`HandlerTimeoutError`](#handlertimeouterror) |
-| Sessions and resources | [`Session`](#session), [`createEnvironment`](#createenvironmentid-setup), [`EnvironmentInstance`](#environmentinstance), [`SandboxDefinition`](#sandboxdefinition), [`listSandboxes`](#runtime-dispatch-and-inspection), [`completeSession`](#administrative-mutations) |
+| Sessions and resources | [`Session`](#session), [`createEnvironment`](#createenvironmentid-setup), [`createSandbox`](#createsandboxdefinition), [`EnvironmentInstance`](#environmentinstance), [`HandlerSandboxAccessor`](#handlersandboxaccessor), [`SandboxDefinition`](#sandboxdefinition), [`listSandboxes`](#runtime-dispatch-and-inspection), [`completeSession`](#administrative-mutations) |
 | Keys and utilities | [Typed state keys](#sessionkey-envkey-and-cursorkey), [`defineKey`](#definekeynamespace-options), [`parseDuration`](#parsedurationvalue), [`env`](#env) |
 | Stores | [`Store`](#store), [`memoryStore`](#memorystoreinitial), [`jsonFileStore`](#jsonfilestorepath-and-filestorepath), [state validation](#state-validation), [saved records](#saved-records) |
 | Runtime | [`createRuntime`](#createruntimeconfig-options), [`OrchestratorRuntime`](#new-orchestratorruntimeoptions), [start and stop](#start-and-stop-a-runtime), [`runOffline`](#runofflineoperation), [state retention](#state-retention) |
-| Node process | [`spawnManagedProcess`](#spawnmanagedprocesscommand-args-options) |
+| Node process | [`spawnManagedProcess`](#spawnmanagedprocesscommand-args-options), [`adoptManagedProcess`](#adoptmanagedprocesspid-options) |
 | Projects and tests | [`ProjectContext`](#projectcontext), [project loading](#discovery-and-loading-functions), [`createTestRuntime`](#createtestruntimeconfig-options), [`TestRuntime`](#testruntime) |
 
 ## Root exports
@@ -55,6 +55,7 @@ Import these APIs from `simple-agent-orchestrator`.
 | `createManualChannel` | Creates a channel with no polls. |
 | `createClient` | Creates a client and its handlers. |
 | `createEnvironment` | Defines client process resources and an optional session sandbox. |
+| `createSandbox` | Defines a typed, JSON-safe session sandbox resource. |
 | `HandlerTimeoutError` | Identifies a cooperative handler timeout. |
 | `StateValidationError` | Reports invalid saved state or an unsupported state version. |
 | `CURRENT_STATE_VERSION` | Current saved-state format version. |
@@ -76,9 +77,9 @@ Import these APIs from `simple-agent-orchestrator`.
 | --- | --- |
 | Config | `DefineConfigContext`, `ConfigFactory`, `HttpConfig`, `HttpDispatch`, `HttpRegistrationContext`, `HttpRegistrationHook`, `OrchestratorConfig` |
 | Channels | `ChannelBuilder`, `ChannelDefinition`, `ChannelRuntimeApi`, `Cursor`, `PollCommitContext`, `PollContext`, `PollDefinition` |
-| Clients | `CapacityOptions`, `ClientBuilder`, `ClientDefinition`, `EventHandler`, `ExhaustionContext`, `ExhaustionOptions`, `HandlerCapacity`, `HandlerContext`, `HandleOptions` |
-| Environments | `EnvironmentBuilder`, `EnvironmentDefinition`, `EnvironmentHookContext`, `EnvironmentInstance`, `SandboxCompletionContext`, `SandboxContext`, `SandboxDefinition`, `SandboxDeliveryContext`, `SandboxDisposition` |
-| Events and state | `ConcurrencyOptions`, `DeliveryIgnoredReason`, `DeliveryPhase`, `DeliveryStatus`, `FailureStage`, `DispatchEvent`, `DispatchResult`, `JsonRecord`, `JsonValue`, `OrchestratorEvent`, `OrchestratorState`, `ProjectContext`, `RetryOptions`, `SandboxStatus`, `SessionNote`, `StoredCapacityReservation`, `StoredDelivery`, `StoredDeliveryEffects`, `StoredEvent`, `StoredExhaustion`, `StoredFailureDescriptor`, `StoredSandbox`, `StoredSession`, `WorkStatus` |
+| Clients | `CapacityOptions`, `ClientBuilder`, `ClientDefinition`, `EventHandler`, `ExhaustionContext`, `ExhaustionOptions`, `HandlerCapacity`, `HandlerContext`, `HandlerSandboxAccessor`, `HandleOptions` |
+| Environments | `EnvironmentBuilder`, `EnvironmentDefinition`, `EnvironmentHookContext`, `EnvironmentInstance`, `ResourceSandboxDefinition`, `SandboxCleanup`, `SandboxCleanupStepContext`, `SandboxCleanupStepDisposition`, `SandboxCleanupStepOptions`, `SandboxCompletionContext`, `SandboxContext`, `SandboxDefinition`, `SandboxDeliveryContext`, `SandboxDisposition`, `SandboxResourceCleanupContext`, `SandboxResourceCreateContext`, `SandboxResourceReconcileContext` |
+| Events and state | `ConcurrencyOptions`, `DeliveryIgnoredReason`, `DeliveryPhase`, `DeliveryStatus`, `FailureStage`, `DispatchEvent`, `DispatchResult`, `JsonRecord`, `JsonValue`, `OrchestratorEvent`, `OrchestratorState`, `ProjectContext`, `RetryOptions`, `SandboxCleanupStepStatus`, `SandboxStatus`, `SessionNote`, `StoredCapacityReservation`, `StoredDelivery`, `StoredDeliveryEffects`, `StoredEvent`, `StoredExhaustion`, `StoredFailureDescriptor`, `StoredSandbox`, `StoredSandboxCleanupStep`, `StoredSession`, `WorkStatus` |
 | Keys and logging | `KeyBuilder`, `KeyLike`, `Logger`, `StateKey` |
 | Sessions | `ReadonlySession`, `Session`, `SessionEndOptions` |
 | Stores | `StateValidationErrorCode`, `Store` |
@@ -467,6 +468,7 @@ interface HandlerContext<
   attempt: number;
   signal: AbortSignal;
   capacity: HandlerCapacity;
+  sandbox: HandlerSandboxAccessor;
 }
 
 interface HandlerCapacity {
@@ -475,7 +477,24 @@ interface HandlerCapacity {
 }
 ```
 
-`environment`, `signal`, and `capacity` are always present. Without a configured environment, the client receives an empty environment with ID `default`. `capacity.reserved` is `true` when this client already has a retained reservation for the session. Calling `release()` without a configured capacity limit throws.
+`environment`, `signal`, `capacity`, and `sandbox` are always present. Without a configured environment, the client receives an empty environment with ID `default`. `capacity.reserved` is `true` when this client already has a retained reservation for the session. Calling `release()` without a configured capacity limit throws.
+
+### `HandlerSandboxAccessor`
+
+```ts
+interface HandlerSandboxAccessor {
+  get<TResource extends JsonValue>(
+    definition: ResourceSandboxDefinition<TResource>,
+  ): Readonly<TResource>;
+  getOptional<TResource extends JsonValue>(
+    definition: ResourceSandboxDefinition<TResource>,
+  ): Readonly<TResource> | undefined;
+}
+```
+
+Both methods require the exact `createSandbox(...)` definition object configured by this client's environment. Passing an equivalent but different definition, or a definition configured for another client, throws. `get` also throws unless that sandbox has an active saved resource. `getOptional` returns `undefined` when there is no active resource, including a migrated active record that predates typed resources. During a resumed `cleaning` phase, the failure hook can still read the retained resource for diagnostics.
+
+Normal handlers receive the resource after the runtime has created or reconciled the sandbox. A handler with `session: "existing-only"` gets an existing-state-only view before handling: the accessor may read an already-active resource, but dispatch does not create a record or run `create` or `reconcile`. If that handler explicitly ends the session, the later cleanup phase may reconcile uncertain saved state before cleanup.
 
 ### `OrchestratorEvent`
 
@@ -589,10 +608,13 @@ interface EnvironmentBuilder {
   onMount(hook: (context: EnvironmentHookContext) => Promise<void> | void): void;
   onUnmount(hook: (context: EnvironmentHookContext) => Promise<void> | void): void;
   useSandbox(sandbox: SandboxDefinition): void;
+  useSandbox<TResource extends JsonValue>(
+    sandbox: ResourceSandboxDefinition<TResource>,
+  ): void;
 }
 ```
 
-A later `useSandbox` call replaces the previous sandbox definition.
+A later `useSandbox` call replaces the previous sandbox definition. Keep the configured `ResourceSandboxDefinition` object and pass that same object to `HandlerContext.sandbox`; definition identity is part of the lookup contract.
 
 ```ts
 interface EnvironmentHookContext {
@@ -622,6 +644,58 @@ interface EnvironmentInstance {
 
 `get` throws when absent. Instances are scoped by client ID and environment ID.
 
+### `createSandbox(definition)`
+
+Defines a sandbox with a typed, JSON-safe resource and returns the same definition object.
+
+```ts
+declare function createSandbox<TResource extends JsonValue>(
+  definition: ResourceSandboxDefinition<TResource>,
+): ResourceSandboxDefinition<TResource>;
+
+interface ResourceSandboxDefinition<TResource extends JsonValue> {
+  readonly create: (
+    context: SandboxResourceCreateContext<TResource>,
+  ) => Promise<TResource | void> | TResource | void;
+  readonly prepare?: (
+    context: SandboxResourcePrepareContext<TResource>,
+  ) => Promise<TResource | void> | TResource | void;
+  readonly reconcile?: (
+    context: SandboxResourceReconcileContext<TResource>,
+  ) => Promise<SandboxDisposition> | SandboxDisposition;
+  readonly cleanup?: (
+    context: SandboxResourceCleanupContext<TResource>,
+  ) => Promise<void> | void;
+}
+```
+
+`create` can return the resource, which lets TypeScript infer `TResource`. For an outside create operation with a risky response/checkpoint gap, provide the generic explicitly and call `await context.publishResource(resource)` as soon as the identity is known. That eager publish survives a later error or interruption in `create`. A returned resource is published after `create` resolves. `undefined` means no returned resource; before the sandbox can become `active`, one of these paths must have published a resource. `null` is a valid present resource.
+
+The runtime rejects values that are not JSON-safe. Published and returned values are cloned before storage and access.
+
+```ts
+type SandboxResourceCreateContext<TResource extends JsonValue> =
+  SandboxDeliveryContext & {
+    publishResource(resource: TResource): Promise<void>;
+  };
+
+type SandboxResourceReconcileContext<TResource extends JsonValue> =
+  SandboxContext & {
+    readonly resource?: Readonly<TResource>;
+    publishResource(resource: TResource): Promise<void>;
+  };
+
+type SandboxResourcePrepareContext<TResource extends JsonValue> =
+  SandboxDeliveryContext & {
+    readonly resource?: Readonly<TResource>;
+    publishResource(resource: TResource): Promise<void>;
+  };
+```
+
+Resource-aware `reconcile` receives the saved resource when one exists and may publish a recovered resource. Returning `active` without a published resource throws and leaves the prior lifecycle status in place. This rule lets a typed definition safely adopt a version 6 or 7 sandbox record, or an older session's legacy sandbox flag, that predates stored resources.
+
+Optional `prepare` runs under the sandbox lock immediately before `handle` while the delivery is in its sandbox or handling phase. It receives the active resource, may return or eagerly publish a refreshed resource, and must leave a published resource before handling begins. Because handling retries can run it again, every outside effect in `prepare` must be retry-safe or reconcile by durable identity. Existing-only handlers do not create or reconcile sandboxes, but `prepare` runs when their exact session already has an active sandbox record; it is skipped when no record exists.
+
 ### `SandboxDefinition`
 
 ```ts
@@ -633,6 +707,7 @@ interface SandboxDefinition {
 
 interface SandboxContextBase extends EnvironmentHookContext {
   session: Session;
+  readonly currentStatus: SandboxStatus;
   readonly currentCheckpoint: Readonly<JsonRecord>;
   checkpoint(update: JsonRecord): Promise<void>;
 }
@@ -653,13 +728,71 @@ type SandboxDisposition = "active" | "cleaned" | "unknown";
 
 Sandbox records are keyed by session ID, client ID, and environment ID. Their status is `creating`, `active`, `cleaning`, `cleaned`, or `unknown`. `checkpoint(update)` merges JSON-safe fields into the record immediately, including when the surrounding hook later fails. `currentCheckpoint` reflects the merged checkpoint for that hook invocation.
 
-The runtime saves `creating` before `create` and `cleaning` before `cleanup`. When cleanup was interrupted, the next cleanup attempt requires `reconcile` to inspect the checkpoint and return `active`, `cleaned`, or `unknown`. `active` repeats cleanup, `cleaned` skips it, and `unknown` stops processing. A `cleaning` or `unknown` record without `reconcile` blocks instead of being treated as usable. Hook execution stays outside the store mutex, while status and checkpoint writes use it.
+`currentStatus` is the saved status at hook entry. For example, first creation receives `creating`, first cleanup receives `cleaning`, and reconciliation sees the uncertain status that caused it to run.
 
-After `create` succeeds, its ordinary session changes are also saved immediately. `cleanup` runs after `handle` and `onSuccess` when the handler ends the session. A cleanup error fails the attempt and leaves a `cleaning` record that requires reconciliation before cleanup can continue.
+The runtime saves `creating` before `create` and `cleaning` before `cleanup`. For a legacy `SandboxDefinition`, interrupted cleanup requires `reconcile` to inspect the checkpoint and return `active`, `cleaned`, or `unknown`. `active` repeats cleanup, `cleaned` skips it, and `unknown` stops processing. A `cleaning` or `unknown` legacy record without `reconcile` blocks instead of being treated as usable. Hook execution stays outside the store mutex, while status, resource, checkpoint, and cleanup-step writes use it.
+
+After `create` succeeds, its ordinary session changes are also saved immediately. `cleanup` runs after `handle` and `onSuccess` when the handler ends the session. A legacy cleanup error leaves a `cleaning` record that requires sandbox reconciliation before cleanup can continue. Typed resource cleanup instead re-enters `cleanup` directly from `cleaning` when the saved resource is present, so its outside effects must use the durable step API below.
 
 For delivery hooks, `cause.type` is `delivery` and `event` is present. Administrative completion uses `cause.type === "completion"`, includes the optional reason, and omits `event`; narrow on `cause.type` before reading event data in `reconcile` or `cleanup`.
 
 Sandbox locking is limited to one runtime process. `endSession` remains metadata-only. `completeSession` mounts recorded environments and cleans their sandboxes. Stopping the runtime does not clean every active sandbox.
+
+### Typed sandbox cleanup steps
+
+```ts
+type SandboxCleanupStepDisposition = "completed" | "incomplete" | "unknown";
+
+type SandboxCleanupStepOptions<TResource extends JsonValue> =
+  | { readonly retry: "idempotent"; readonly reconcile?: never }
+  | {
+      readonly retry?: never;
+      readonly reconcile: (
+        context: SandboxCleanupStepContext<TResource>,
+      ) => Promise<SandboxCleanupStepDisposition> | SandboxCleanupStepDisposition;
+    };
+
+interface SandboxCleanup<TResource extends JsonValue> {
+  step(
+    id: string,
+    options: SandboxCleanupStepOptions<TResource>,
+    operation: (
+      context: SandboxCleanupStepContext<TResource>,
+    ) => Promise<void> | void,
+  ): Promise<void>;
+}
+
+type SandboxResourceCleanupContext<TResource extends JsonValue> =
+  SandboxContext & {
+    readonly resource: Readonly<TResource>;
+    readonly cleanup: SandboxCleanup<TResource>;
+  };
+
+type SandboxCleanupStepContext<TResource extends JsonValue> =
+  | (Omit<SandboxDeliveryContext, "session"> & {
+      readonly session: ReadonlySession;
+      readonly resource: Readonly<TResource>;
+    })
+  | (Omit<SandboxCompletionContext, "session"> & {
+      readonly session: ReadonlySession;
+      readonly resource: Readonly<TResource>;
+    });
+```
+
+Each step ID must be a stable, non-empty string and must choose exactly one policy:
+
+- `{ retry: "idempotent" }` reruns a failed or interrupted operation.
+- `{ reconcile }` checks a previously started step. `completed` skips the operation, `incomplete` runs it, and `unknown` records uncertainty and throws.
+
+The operation and reconciler receive the sandbox environment, project, logger, signal, cause, optional delivery event, `currentStatus`, `currentCheckpoint`, checkpoint writer, readonly session, and readonly resource. The readonly session has `id`, `key`, `status`, `get`, `getOptional`, and `has`; cleanup steps cannot mutate session state.
+
+Saved step status is `running`, `completed`, `failed`, or `unknown`. The record also stores attempts and timestamps, plus `lastError` for failed or unknown work. A completed ID is skipped when the cleanup hook runs again.
+
+Await steps in order when one depends on another. Independent operations can start together with `Promise.allSettled`, but the cleanup hook must inspect the results and throw if any rejected. Steps with the same ID are serialized inside one runtime process.
+
+**Put every outside cleanup effect inside `cleanup.step(...)`.** Typed cleanup is deliberately re-entered from a saved `cleaning` record without first running sandbox-level reconciliation. Any API call, process signal, file deletion, or other outside effect before, after, or between steps can repeat without its own durable checkpoint.
+
+The signal is checked before reconciliation, before starting an operation, and after reconciliation. Once an operation starts, cancellation remains cooperative. When awaited sequentially, an abort prevents the next step from starting after the current operation settles. Cleanup steps reduce uncertainty around cleanup only; they are not exactly-once operations or a general workflow engine.
 
 ## Keys and utilities
 
@@ -770,7 +903,7 @@ Saved event, session, note, and cursor values must be JSON-safe. The state file 
 ### State validation
 
 ```ts
-const CURRENT_STATE_VERSION = 7;
+const CURRENT_STATE_VERSION = 8;
 const MINIMUM_STATE_VERSION = 1;
 
 declare function validateAndMigrateState(
@@ -788,13 +921,15 @@ type StateValidationErrorCode =
   | "unsupported-version";
 ```
 
-Valid versions 1 through 6 migrate deterministically to version 7. Existing migration rules still apply; version 7 adds delivery phases, staged effects, and an empty exhaustion collection. Unfinished legacy deliveries resume conservatively at `sandbox`; processed and ignored deliveries migrate to `completed`. Migration happens in memory, inspection does not rewrite the file, and the next successful write saves version 7. Legacy `__sao.sandbox.*.created` flags remain unchanged because the snapshot does not identify their client owner.
+Valid versions 1 through 7 migrate deterministically to version 8. Version 8 adds the optional stored sandbox resource and a cleanup-step map; older sandbox records migrate with an empty `cleanupSteps` object and no resource. A typed definition must reconcile an active older record and publish its resource before the runtime exposes it to a handler or starts typed cleanup.
+
+Earlier migrations still apply. Version 7 added delivery phases, staged effects, and the exhaustion collection. Unfinished older deliveries resume conservatively at `sandbox`; processed and ignored deliveries migrate to `completed`. Legacy `__sao.sandbox.*.created` flags remain unchanged because the snapshot does not identify their client owner. Migration happens in memory, inspection does not rewrite the file, and the next successful write saves version 8.
 
 ### Saved records
 
 ```ts
 interface OrchestratorState {
-  version: 7;
+  version: 8;
   sessions: StoredSession[];
   events: StoredEvent[];
   deliveries: StoredDelivery[];
@@ -816,7 +951,34 @@ interface OrchestratorState {
 
 `StoredCapacityReservation` contains its ID, client ID, session ID, and acquisition time. Only active reservations are stored.
 
-`StoredSandbox` is keyed by session ID, client ID, and environment ID. It contains lifecycle status, JSON-safe checkpoint data, creation and update timestamps, and an optional last error.
+`StoredSandbox` is keyed by session ID, client ID, and environment ID:
+
+```ts
+interface StoredSandbox {
+  sessionId: string;
+  clientId: string;
+  environmentId: string;
+  status: "creating" | "active" | "cleaning" | "cleaned" | "unknown";
+  checkpoint: JsonRecord;
+  resource?: JsonValue;
+  cleanupSteps: Record<string, StoredSandboxCleanupStep>;
+  createdAt: string;
+  updatedAt: string;
+  lastError?: string;
+}
+
+interface StoredSandboxCleanupStep {
+  status: "running" | "completed" | "failed" | "unknown";
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  lastError?: string;
+}
+```
+
+`resource`, checkpoint values, and cleanup-step IDs and records are saved state. Treat them as plaintext. A current `active` typed sandbox has a `resource`; the field remains optional in the public stored type because legacy sandboxes and other lifecycle states may not have one.
 
 `SessionNote` contains its ID, session ID, message, optional data, and creation time.
 
@@ -1077,6 +1239,7 @@ declare function spawnManagedProcess(
 interface SpawnManagedProcessOptions {
   cwd?: string | URL;
   env?: Record<string, string | undefined>;
+  stdio?: ManagedProcessStdio;
   termGraceMs?: number;
   ownsProcess?: (pid: number) => boolean | Promise<boolean>;
 }
@@ -1110,13 +1273,69 @@ interface ManagedProcessExit {
 }
 ```
 
-The child uses `shell: false`, detached mode, ignored standard streams, and `unref()`. Arguments go directly to the executable. The helper does not capture output or accept shell syntax.
+The child uses `shell: false`, detached mode, `unref()`, and `windowsHide: true`. Arguments go directly to the executable. `stdio` defaults to `"ignore"`. You may use `"inherit"` or an array with at least three entries containing `"ignore"`, `"inherit"`, and existing numeric file descriptors. The first three entries configure stdin, stdout, and stderr explicitly. The API does not accept generated pipes, overlapped pipes, IPC channels, or caller-owned stream objects because the detached handle does not expose or manage those channels.
 
 On POSIX, `stop()` signals the detached process group with `SIGTERM`, waits for the configured grace period, and sends `SIGKILL` if the group is still alive. If group signaling reports that no group exists, it defensively falls back to the direct child. On Windows it signals the direct child; it does not claim process-tree cleanup there. Descendants that create another process group are also outside the helper's control.
 
 The TERM grace defaults to 5 seconds. The first `stop()` call fixes the stop options; concurrent and later calls return the same promise. If both the process and its detached group have exited, `stop()` returns its exit result without signaling. `ownsProcess`, when present, runs once before signaling. A successful decision authorizes graceful shutdown and any required escalation, even if the process-group leader exits during the grace period. A false result rejects stop without sending a signal. Use it when your application has stronger ownership data than a PID, because operating systems can reuse PIDs.
 
 `isAlive()` checks the direct PID and treats a permissions error as alive. `waitUntilReady()` checks every 50 ms by default, supports synchronous or asynchronous application checks, rejects with the abort reason, rejects on timeout, and rejects if the child exits first. It has no default timeout.
+
+### `adoptManagedProcess(pid, options)`
+
+Creates a lifecycle handle for a detached process identity recovered from your own saved resource. It does not spawn a child and cannot provide an exit result.
+
+```ts
+import { adoptManagedProcess } from "simple-agent-orchestrator/node";
+
+const processHandle = adoptManagedProcess(resource.pid, {
+  ownsProcess: async (pid) => processRecordStillMatches(pid, resource.token),
+  termGraceMs: 5_000,
+});
+
+await processHandle.stop();
+```
+
+`processRecordStillMatches` is application-provided. It must verify stronger identity than a numeric PID, such as a token or command identity saved with the sandbox resource.
+
+```ts
+declare function adoptManagedProcess(
+  pid: number,
+  options: AdoptManagedProcessOptions,
+): AdoptedManagedProcess;
+
+interface AdoptManagedProcessOptions {
+  termGraceMs?: number;
+  ownsProcess: (pid: number) => boolean | Promise<boolean>;
+}
+
+interface AdoptedManagedProcess {
+  readonly pid: number;
+  isAlive(): boolean;
+  stop(options?: StopManagedProcessOptions): Promise<void>;
+  waitUntilReady(
+    check: () => boolean | Promise<boolean>,
+    options?: WaitUntilReadyOptions,
+  ): Promise<void>;
+}
+```
+
+`pid` must be a safe integer greater than 1 and no greater than `2_147_483_647`. `ownsProcess` is mandatory because the saved PID may have been reused before cleanup resumes.
+
+On POSIX, adoption refers only to process group `-pid`. `isAlive()` and `stop()` never fall back to the positive PID if that group is absent; this avoids signaling an unrelated process that reused the group leader's PID. On Windows, adoption observes and signals the direct PID and does not promise descendant cleanup.
+
+`stop()` checks liveness, verifies ownership, sends `SIGTERM`, and waits for the configured grace period. If the target remains alive, it verifies ownership again immediately before `SIGKILL`. After KILL it waits up to five seconds for the target to disappear and rejects if it remains alive. If the target disappears while ownership is being checked, stop resolves without signaling it.
+
+The first `stop()` call fixes both the promise and its options. Concurrent and later calls return that same promise, including a rejection. The promise resolves with `void`, not `ManagedProcessExit`, because an adopted process has no child-process exit event. `waitUntilReady()` has the same interval, timeout, and abort behavior as the spawned handle, but reports disappearance rather than an exit code.
+
+### Node lifecycle utilities
+
+`simple-agent-orchestrator/node` also exports narrow utilities used around managed processes:
+
+- `createPosixProcessGroupLocator(requiredCommandValues)` locates one POSIX process group whose command contains every exact argument value and provides a rescanning `owns(processGroupId)` check. It throws if multiple groups match and is unavailable on Windows.
+- `publishReadyRecord(filePath, record)` writes a private JSON readiness record through an exclusive temporary file and atomic rename. `readReadyRecord(filePath, validate)` returns only records accepted by the caller's type guard.
+- `getAvailableLoopbackPort()` asks the operating system for an unused `127.0.0.1` port and releases it before returning. The caller still owns the bind race.
+- `isLoopbackHttpUrl(value)` accepts only plain HTTP URLs rooted at `127.0.0.1` with an explicit port and no credentials, path, query, or fragment.
 
 ## Testing API
 
@@ -1169,6 +1388,12 @@ interface TestRuntime {
     list(): Promise<StoredSession[]>;
     get(idOrKey: string): Promise<StoredSession | undefined>;
     notes(idOrKey: string): Promise<SessionNote[]>;
+    end(idOrKey: string, reason?: string): Promise<boolean>;
+    complete(sessionId: string, reason?: string): Promise<boolean>;
+  };
+
+  sandboxes: {
+    list(sessionId?: string): Promise<StoredSandbox[]>;
   };
 
   capacity: {
@@ -1199,7 +1424,7 @@ interface TestRuntime {
 }
 ```
 
-`dispatch`, `capacity.release`, `deliveries.retry`, and `exhaustions.retry` call `drain()` by default. Pass `{ drain: false }` to leave work pending.
+`dispatch`, `capacity.release`, `deliveries.retry`, and `exhaustions.retry` call `drain()` by default. Pass `{ drain: false }` to leave work pending. `sessions.end` is the metadata-only runtime operation and accepts an ID or key. `sessions.complete` requires an exact active session ID and runs configured sandbox cleanup before ending. `sandboxes.list()` returns all sandbox records; pass a session ID to filter them.
 
 `events.get` accepts the internal event ID. `TestEventRecord` is `{ event: StoredEvent, deliveries: StoredDelivery[], exhaustions: StoredExhaustion[] }`; the dispatched source ID is `event.sourceId`. Use `test.exhaustions.list/get/retry` to inspect or manually retry exhaustion work.
 

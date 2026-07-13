@@ -5,7 +5,7 @@ Your handler may need an API client shared by all its work, or a separate worktr
 - An **environment** holds values and resources for one client while the runtime process is running, such as an API client or local server.
 - A **sandbox** creates and tracks one external resource for each session, such as a worktree or remote workspace, so retries can reuse it.
 
-Environment values disappear when the process stops. Each sandbox has its own saved record, identified by session, client, and environment. It keeps lifecycle status and JSON-safe checkpoint data across retries and restarts.
+Environment values disappear when the process stops. Each sandbox has its own saved record, identified by session, client, and environment. It keeps lifecycle status, a JSON-safe typed resource, checkpoint data, and cleanup-step progress across retries and restarts.
 
 ## Share a process resource with your handlers
 
@@ -66,48 +66,105 @@ Environment registrations are captured when the runtime initializes. If you add 
 Now suppose each pull request needs a worktree. Add one sandbox to the client's environment:
 
 ```ts
-import { createEnvironment, sessionKey } from "simple-agent-orchestrator";
+import { createEnvironment, createSandbox } from "simple-agent-orchestrator";
 
-const worktreeId = sessionKey<string>("worktree.id");
+type WorktreeResource = {
+  id: string;
+  path: string;
+};
+
+export const worktreeSandbox = createSandbox<WorktreeResource>({
+  async create({ session, event, project, signal, publishResource }) {
+    const branch = event.meta?.branch;
+    if (typeof branch !== "string" || branch.trim() === "") {
+      throw new Error("Expected event.meta.branch");
+    }
+
+    const worktree = await ensureWorktree({
+      resourceKey: `worktree:${session.id}`,
+      repository: project.root,
+      branch,
+      signal,
+    });
+
+    // Save the identity before doing more work that could fail.
+    await publishResource({ id: worktree.id, path: worktree.path });
+  },
+
+  async reconcile({ resource, currentStatus, session, project, signal, publishResource }) {
+    if (resource && await worktreeExists(resource.id, { signal })) return "active";
+
+    const worktree = await findWorktree({
+      resourceKey: `worktree:${session.id}`,
+      repository: project.root,
+      signal,
+    });
+    if (!worktree) return currentStatus === "cleaning" ? "cleaned" : "unknown";
+
+    if (!resource) {
+      await publishResource({ id: worktree.id, path: worktree.path });
+    }
+    return "active";
+  },
+
+  async prepare({ resource, signal }) {
+    if (!resource) throw new Error("Expected an active worktree resource");
+    return refreshWorktree(resource, { signal });
+  },
+
+  async cleanup({ cleanup }) {
+    await cleanup.step("remove-worktree", { retry: "idempotent" }, async ({ resource, signal }) => {
+      await closeWorktree(resource.id, { signal });
+    });
+  },
+});
 
 export const codingEnvironment = createEnvironment("coding", (environment) => {
-  environment.useSandbox({
-    async create({ session, event, project, signal, checkpoint }) {
-      const branch = event.meta?.branch;
-      if (typeof branch !== "string" || branch.trim() === "") {
-        throw new Error("Expected event.meta.branch");
-      }
-
-      const id = await ensureWorktree({
-        resourceKey: `worktree:${session.id}`,
-        repository: project.root,
-        branch,
-        signal,
-      });
-
-      await checkpoint({ worktreeId: id });
-      session.set(worktreeId, id);
-    },
-
-    async reconcile({ currentCheckpoint, session, signal }) {
-      const id = currentCheckpoint.worktreeId;
-      if (typeof id !== "string") return "unknown";
-      return await worktreeExists(id, { signal }) ? "active" : "cleaned";
-    },
-
-    async cleanup({ currentCheckpoint, signal }) {
-      const id = currentCheckpoint.worktreeId;
-      if (typeof id === "string") await closeWorktree(id, { signal });
-    },
-  });
+  environment.useSandbox(worktreeSandbox);
 });
 ```
 
-A **delivery** is one handler's saved work record for an event, including its attempts and result. Before calling `create`, the runtime saves a `creating` sandbox record. `checkpoint(update)` merges JSON-safe data into that record immediately, even if the hook later fails. When `create` finishes, the status becomes `active` and its session changes are saved immediately. If creation was interrupted, the optional `reconcile` hook runs before another create attempt and reports whether the resource is `active`, `cleaned`, or still `unknown`.
+`ensureWorktree`, `findWorktree`, `worktreeExists`, and `closeWorktree` are project functions, not package APIs. Their stable `resourceKey` and lookup behavior are what make creation recoverable.
+
+A **delivery** is one handler's saved work record for an event, including its attempts and result. Before calling `create`, the runtime saves a `creating` sandbox record. `publishResource(resource)` immediately saves the JSON-safe resource, even if later code in `create` fails. You can instead return the resource from `create`; that shorter pattern publishes it after the function resolves:
+
+```ts
+export const worktreeSandbox = createSandbox({
+  async create(context) {
+    const worktree = await createWorktreeFor(context.session.id);
+    return { id: worktree.id, path: worktree.path };
+  },
+});
+```
+
+Use the eager `publishResource` pattern when you need the identity saved before the rest of creation finishes. Use the returned pattern when creation is one retry-safe operation. Either way, the resource must be JSON-safe. `undefined` means no resource was returned, while `null` is a valid resource if the definition's type allows it.
+
+When `create` finishes with a published resource, the status becomes `active` and its session changes are saved immediately. If creation was interrupted, `reconcile` receives `resource` when one was saved, plus `currentStatus` and the checkpoint. It may call `publishResource` to recover an older or partially saved record. Reporting `active` without a resource is an error.
+
+Optional `prepare` runs immediately before each handler attempt that can still execute. Use it to check or refresh a long-lived active resource after a runtime restart. A returned resource is saved before the handler receives it; `publishResource` is available when preparation has multiple recoverable stages. Preparation can repeat after interruption, so use durable identity and reconciliation rather than attempt numbers.
 
 Only one sandbox can be configured on an environment. A later `useSandbox` call replaces the earlier one.
 
 Choose event data used by `create` carefully. Creation normally happens on the first delivery for a session, so later events with a different branch or workspace request won't recreate the sandbox automatically.
+
+## Read the typed resource in a handler
+
+The sandbox definition is also its typed handle:
+
+```ts
+export const codingClient = createClient("coding", (client) => {
+  client.useEnvironment(codingEnvironment);
+
+  client.handle(reviewsChannel, async ({ sandbox }) => {
+    const worktree = sandbox.get(worktreeSandbox);
+    await runAgentIn(worktree.path);
+  });
+});
+```
+
+`sandbox.get(worktreeSandbox)` returns a readonly value with the type inferred by `createSandbox`. It throws unless the same definition object was configured on this client's environment and its saved resource is active. `getOptional` performs the same definition-identity check but returns `undefined` when no active resource exists. A resumed cleanup attempt also retains the resource in the `onFailure` context so failure reporting can identify what cleanup was handling.
+
+An `existing-only` handler does not create or reconcile a sandbox before handling. If the exact session and client already have an active sandbox record, its optional `prepare` hook runs before the handler reads the resource. With no active record, `prepare` is skipped, `getOptional` returns `undefined`, and `get` throws. If the handler calls `session.end()`, the later cleanup phase may reconcile uncertain saved state before cleanup; it still does not create a replacement session for a late event.
 
 ## Clean up after the session ends
 
@@ -119,9 +176,60 @@ Call `session.end()` in the handler when the work is complete. Sandbox cleanup r
 
 Cleanup must also succeed before the delivery is marked processed and the staged ordinary session changes are committed. If cleanup throws, the attempt fails and retries cleanup without rerunning `handle` or `onSuccess`.
 
-Ending a session through `sessions end` or `runtime.endSession()` is still metadata-only: it releases retained capacity without sandbox cleanup. Use `sessions complete <session-id>` or `runtime.completeSession(sessionId)` when the runtime should mount the recorded environments, reconcile uncertain sandbox state, and run cleanup. Completion requires the exact active session ID and rejects while pending or processing deliveries target that session or its key. It ends the session only after every cleanup succeeds. A failed cleanup leaves the session active and retains capacity; a later attempt needs `reconcile` to decide whether cleanup should repeat.
+Ending a session through `sessions end` or `runtime.endSession()` is still metadata-only: it releases retained capacity without sandbox cleanup. Use `sessions complete <session-id>` or `runtime.completeSession(sessionId)` when the runtime should mount the recorded environments and run cleanup. Completion requires the exact active session ID and rejects while pending or processing deliveries target that session or its key. It ends the session only after every cleanup succeeds. A failed cleanup leaves the session active and retains capacity.
+
+Typed cleanup can safely re-enter from a saved `cleaning` record because each outside effect belongs to a durable step. Sandbox-level `reconcile` still runs when the sandbox resource itself is missing or its lifecycle status is otherwise uncertain. It doesn't replace step-level reconciliation.
 
 State pruning also doesn't clean external workspaces. It keeps an ended session while any sandbox record is not `cleaned`, and it conservatively keeps legacy active flags whose client owner is unknown.
+
+## Give each cleanup effect its own saved step
+
+**Every outside effect in typed cleanup belongs inside `cleanup.step(...)`.** Typed cleanup is re-entered directly when the sandbox is already `cleaning`; the runtime does not call sandbox-level `reconcile` first. A provider call or process signal outside a step can therefore repeat with no durable record of its outcome.
+
+Give each step a stable, non-empty ID and exactly one retry policy:
+
+```ts
+async cleanup({ cleanup }) {
+  await cleanup.step("remove-worktree", {
+    reconcile: async ({ resource }) => {
+      const exists = await worktreeExists(resource.id);
+      return exists ? "incomplete" : "completed";
+    },
+  }, async ({ resource, signal }) => {
+    await closeWorktree(resource.id, { signal });
+  });
+}
+```
+
+Use `{ retry: "idempotent" }` only when repeating the operation is safe. Use `reconcile` when a previous attempt may have succeeded but cannot safely be repeated without checking. For a previously started step, the reconciler returns:
+
+| Result | What happens |
+| --- | --- |
+| `completed` | Save the step as complete and skip its operation. |
+| `incomplete` | Start another operation attempt. |
+| `unknown` | Save conservative uncertainty and stop cleanup. |
+
+The saved step status is `running`, `completed`, `failed`, or `unknown`. Completed IDs are skipped when the cleanup hook runs again. Cleanup-step sessions are readonly so cleanup cannot introduce new staged session changes.
+
+Await dependent steps sequentially, as in the example above. For independent cleanup, use `Promise.allSettled` so one rejection doesn't prevent another operation from settling, then throw the failures so the sandbox does not become `cleaned`:
+
+```ts
+const results = await Promise.allSettled([
+  cleanup.step("remove-label", { retry: "idempotent" }, removeLabel),
+  cleanup.step("close-worktree", { retry: "idempotent" }, closeWorktree),
+]);
+
+const failures = results.filter((result) => result.status === "rejected");
+if (failures.length > 0) {
+  throw new AggregateError(failures.map(({ reason }) => reason));
+}
+```
+
+Here `removeLabel` and `closeWorktree` are project cleanup callbacks with the step-operation signature; the package supplies `cleanup.step` and the context passed to each callback.
+
+The signal is checked before a step starts and after reconciliation. Once your operation is running, abort remains cooperative. If sequential cleanup is aborted while one operation runs, the next step does not start after the current operation settles.
+
+Cleanup steps solve only this narrow sandbox-cleanup problem. They don't make outside effects exactly once, and they aren't a general workflow engine.
 
 ## Make creation and cleanup safe to repeat
 
@@ -131,9 +239,9 @@ Plan for these cases:
 
 | If this happens | Expect this consequence | What your code should do |
 | --- | --- | --- |
-| The worktree is created, then the process stops before saving `active` | The record remains `creating` | Save its ID with `checkpoint`, then have `reconcile` check whether it exists. |
-| Cleanup succeeds, then the process stops before saving `cleaned` | The record remains `cleaning` | Have `reconcile` report `cleaned`; without reconciliation, the runtime blocks rather than repeating cleanup. |
-| Cleanup changes part of the resource and then fails | `cleanup` may run again | Check the current external state and finish the desired cleanup. |
+| The worktree is created, then the process stops before saving `active` | The record remains `creating` | Publish its typed resource eagerly, then have `reconcile` check whether it exists. |
+| A typed cleanup step succeeds, then the process stops before saving `completed` | The step remains `running` | Mark it idempotent or reconcile that specific step before repeating it. |
+| Cleanup changes part of the resource and then fails | The cleanup hook and unfinished steps may run again | Put each outside effect in a step and use the right step retry policy. |
 | The process exits during either function | Local records may not match the provider | Look up the resource by the stable key before changing it. |
 
 Locks prevent two deliveries from creating or cleaning the same session sandbox at once only inside one runtime process. They don't coordinate separate processes.
@@ -142,7 +250,7 @@ Sandbox records include the client ID as well as the environment ID, so two clie
 
 ## Respond to timeouts and shutdown
 
-Sandbox `create` and `cleanup` receive the delivery attempt's `signal`. Pass it to external APIs and subprocesses. A handler timeout or runtime shutdown can abort it, but JavaScript can't forcibly stop code that ignores cancellation.
+Sandbox `create`, `reconcile`, `cleanup`, and cleanup steps receive the delivery attempt's `signal`. Pass it to external APIs and subprocesses. A handler timeout or runtime shutdown can abort it, but JavaScript can't forcibly stop code that ignores cancellation.
 
 The handler timeout includes sandbox creation and cleanup. If either operation times out, the attempt follows ordinary retry rules, so the operation still needs to be safe to repeat.
 

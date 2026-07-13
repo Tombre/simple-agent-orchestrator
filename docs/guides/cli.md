@@ -31,6 +31,8 @@ npx simple-agent-orchestrator state validate [--root <path>] [--config <path>]
 - `print-config` prints a resolved summary without dumping arbitrary config values.
 - `state validate` confirms that this package version can read the saved state. It doesn't rewrite the file.
 
+The current state format is version 8. Structurally valid versions 1 through 7 migrate in memory and are written as version 8 only after the next successful mutation. Version 8 adds typed sandbox resources and cleanup-step progress; validation remains read-only.
+
 ## Run your integration
 
 For normal development and production-like use, start the long-running process:
@@ -106,7 +108,7 @@ npx simple-agent-orchestrator sessions show <id-or-key> \
   [--root <path>] [--config <path>]
 ```
 
-The default list is a compact table. `--json` prints complete records, and `--limit` must be a positive integer. `sessions show` includes saved state and notes.
+The default list is a compact table. `--json` prints complete records, and `--limit` must be a positive integer. `sessions show` includes saved state, notes, and sandbox records, including typed resources and cleanup-step progress.
 
 Session keys are convenient until an ended session and a newer active session share the same key. In that case, lookup by key can select the older record, so use the session ID from `sessions list` when you need a specific one.
 
@@ -163,7 +165,7 @@ npx simple-agent-orchestrator events retry <delivery-or-exhaustion-id> \
 
 `sessions end` records the end reason, which defaults to `manual`, and releases the session's retained capacity. It does not call sandbox cleanup or stop external agents. If ending a session must remove an external worktree, container, or agent, arrange that through a handler or your own maintenance process.
 
-`sessions complete` requires the exact active session ID and rejects while pending or processing deliveries target that session or its key. It mounts the environments for recorded sandboxes, requires reconciliation for uncertain resources, and runs cleanup before ending the session or releasing capacity. A cleanup failure leaves the session active and can be retried after the integration can reconcile the resource. The default reason is `completed`.
+`sessions complete` requires the exact active session ID and rejects while pending or processing deliveries target that session or its key. It mounts the environments for recorded sandboxes and runs cleanup before ending the session or releasing capacity. Typed cleanup resumes from durable cleanup steps; missing or otherwise uncertain resources require sandbox-level reconciliation. A cleanup failure leaves the session active and can be retried after the integration can determine the resource or step outcome. The default reason is `completed`.
 
 `events retry` works for a delivery or exhaustion record whose status is `failed`. It grants that record one additional attempt, makes it runnable immediately, processes ready work, and prints `retried`. Pass the delivery or exhaustion record ID even though the command sits under `events`.
 
@@ -205,7 +207,7 @@ The default local store allows one process at a time to make changes. This is a 
 
 Read-only commands such as lists, shows, `capacity list`, validation, and prune previews can run while `start` is active. `dispatch`, `sessions end`, `sessions complete`, `capacity release`, `events retry`, and prune with `--apply` fail before writing until the running process stops.
 
-The state file and CLI JSON output can contain event bodies, session state, notes, sandbox checkpoints, cursor values, and errors as plaintext. Keep them out of logs and support bundles unless the contents are safe to share.
+The state file and CLI JSON output can contain event bodies, session state, notes, sandbox resources, checkpoints, cleanup-step errors, cursor values, and delivery errors as plaintext. Keep them out of logs and support bundles unless the contents are safe to share.
 
 The parser is intentionally strict. Unknown or repeated flags, missing values, extra arguments, invalid limits, missing records, and changes that don't apply all fail with an error instead of guessing what you meant.
 

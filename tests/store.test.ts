@@ -296,6 +296,42 @@ describe("stores", () => {
     });
   });
 
+  it("upgrades version 7 sandboxes with absent resources and empty cleanup steps", () => {
+    const timestamp = new Date(0).toISOString();
+    const current = emptyState();
+    current.sessions.push({
+      id: "session",
+      key: "work",
+      status: "active",
+      state: {},
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    current.sandboxes.push({
+      sessionId: "session",
+      clientId: "client",
+      environmentId: "workspace",
+      status: "active",
+      checkpoint: {},
+      cleanupSteps: {},
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    const historicalSandbox = { ...current.sandboxes[0] } as Record<string, unknown>;
+    delete historicalSandbox.cleanupSteps;
+    const versionSeven = {
+      ...current,
+      version: 7,
+      sandboxes: [historicalSandbox],
+    };
+
+    expect(validateAndMigrateState(versionSeven)).toEqual({
+      ...versionSeven,
+      version: CURRENT_STATE_VERSION,
+      sandboxes: [{ ...historicalSandbox, cleanupSteps: {} }],
+    });
+  });
+
   it("validates durable sandbox identities, statuses, references, and JSON-safe checkpoints", () => {
     const state = {
       ...emptyState(),
@@ -313,6 +349,7 @@ describe("stores", () => {
         environmentId: "workspace",
         status: "active" as const,
         checkpoint: { workspaceId: "ws-1" },
+        cleanupSteps: {},
         createdAt: new Date(0).toISOString(),
         updatedAt: new Date(0).toISOString(),
       }],
@@ -335,6 +372,114 @@ describe("stores", () => {
       ...state,
       sandboxes: [{ ...state.sandboxes[0]!, checkpoint: { invalid: undefined } }],
     })).toThrow("must be JSON-safe");
+  });
+
+  it("validates sandbox resources and cleanup step state relationships", () => {
+    const timestamp = new Date(0).toISOString();
+    const state = {
+      ...emptyState(),
+      sessions: [{
+        id: "session",
+        key: "work",
+        status: "active" as const,
+        state: {},
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }],
+      sandboxes: [{
+        sessionId: "session",
+        clientId: "agent",
+        environmentId: "workspace",
+        status: "cleaning" as const,
+        checkpoint: {},
+        resource: { workspace: { id: "ws-1" } },
+        cleanupSteps: {
+          remove: {
+            status: "completed" as const,
+            attempts: 1,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            startedAt: timestamp,
+            completedAt: timestamp,
+          },
+        },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }],
+    };
+
+    expect(validateAndMigrateState(state)).toEqual(state);
+    expect(() => validateAndMigrateState({
+      ...state,
+      sandboxes: [{ ...state.sandboxes[0]!, resource: { invalid: Number.NaN } }],
+    })).toThrow("resource.invalid must be JSON-safe");
+    expect(() => validateAndMigrateState({
+      ...state,
+      sandboxes: [{ ...state.sandboxes[0]!, cleanupSteps: { "": state.sandboxes[0]!.cleanupSteps.remove } }],
+    })).toThrow("empty step id");
+    expect(() => validateAndMigrateState({
+      ...state,
+      sandboxes: [{
+        ...state.sandboxes[0]!,
+        cleanupSteps: {
+          remove: {
+            ...state.sandboxes[0]!.cleanupSteps.remove,
+            status: "failed",
+            completedAt: undefined,
+            lastError: undefined,
+          },
+        },
+      }],
+    })).toThrow("lastError is required");
+    expect(() => validateAndMigrateState({
+      ...state,
+      sandboxes: [{
+        ...state.sandboxes[0]!,
+        cleanupSteps: { remove: { ...state.sandboxes[0]!.cleanupSteps.remove, completedAt: new Date(-1).toISOString() } },
+      }],
+    })).toThrow("completedAt cannot precede startedAt");
+  });
+
+  it("clones nested sandbox resources and cleanup steps on memory-store reads", async () => {
+    const timestamp = new Date(0).toISOString();
+    const state = emptyState();
+    state.sessions.push({
+      id: "session",
+      key: "work",
+      status: "active",
+      state: {},
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    state.sandboxes.push({
+      sessionId: "session",
+      clientId: "client",
+      environmentId: "workspace",
+      status: "active",
+      checkpoint: {},
+      resource: { nested: { value: "original" } },
+      cleanupSteps: {
+        remove: {
+          status: "running",
+          attempts: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          startedAt: timestamp,
+        },
+      },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    const store = memoryStore(state);
+
+    const inspected = await store.read();
+    (inspected.sandboxes[0]!.resource as { nested: { value: string } }).nested.value = "changed";
+    inspected.sandboxes[0]!.cleanupSteps.remove!.attempts = 99;
+
+    expect((await store.read()).sandboxes[0]).toMatchObject({
+      resource: { nested: { value: "original" } },
+      cleanupSteps: { remove: { attempts: 1 } },
+    });
   });
 
   it("validates durable capacity reservation identities and session references", () => {

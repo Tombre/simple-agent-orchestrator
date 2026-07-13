@@ -22,7 +22,7 @@ The package handles the plumbing around your handlers:
 - saving ordinary session updates and notes after successful work, while letting `session.ensure` save retry-safe setup earlier
 - remembering poll positions
 - starting and stopping client environments
-- tracking session sandboxes and running configured cleanup after a successful handler ends its session
+- tracking typed session sandbox resources and named cleanup-step progress, then running configured cleanup after a successful handler ends its session
 - checking stored data and upgrading supported older formats
 - providing small, read-only HTTP status summaries
 - inspecting, retrying, ending, and pruning work through explicit runtime or CLI actions
@@ -44,7 +44,7 @@ Your project decides:
 - when an external agent has actually stopped and its retained capacity can be released
 - how project-specific resources, such as repositories and worktrees, should behave
 
-This split keeps the package useful without turning it into an agent SDK, provider integration, authorization layer, or hosted queue.
+This split keeps the package useful without turning it into an agent SDK, provider integration, authorization layer, hosted queue, or general workflow engine.
 
 ## Use sessions for a real unit of work
 
@@ -79,6 +79,7 @@ The main building blocks are deliberately few:
 - `createChannel`
 - `createClient`
 - `createEnvironment`
+- `createSandbox`
 - `session.ensure`
 - typed state keys
 - key builders
@@ -86,6 +87,8 @@ The main building blocks are deliberately few:
 - runtime/CLI inspection
 
 Larger abstractions belong here only when several real integrations show that they're needed. Retry delays, for example, only determine when a failed delivery can try again. They aren't a scheduler, arbitrary timer system, or backoff strategy.
+
+Sandbox cleanup steps are similarly narrow. They record whether one named cleanup effect is running, completed, failed, or uncertain so cleanup can resume conservatively. They do not provide arbitrary workflow steps, branching, scheduling, compensation, or exactly-once outside effects.
 
 Channel, client, and environment builders set them up before startup. `init()` reads that setup once, so later changes require a new runtime.
 

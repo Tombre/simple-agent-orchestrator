@@ -4,9 +4,8 @@ Let's build a review workflow that keeps one coding-agent session and one worktr
 
 ```text
 GitHub poll -> review event -> coding client -> pull request session
-                                      |
-                                      +-> agent server environment
-                                      +-> worktree sandbox
+                                       |
+                                       +-> typed worktree + OpenCode process sandbox
 ```
 
 By the end, you can poll GitHub once with `start --drain`, watch the coding agent handle a review, and inspect the resulting event and session from the CLI.
@@ -19,10 +18,10 @@ The orchestrator connects the pieces, but it doesn't include GitHub, OpenCode, o
 | --- | --- | --- |
 | Channel and poll | This package | Fetch reviews, map them to events, and remember where the next poll should continue |
 | Client and handler | This package | Route each review to the coding-agent calls |
-| Session | This package | Keep the agent session ID and worktree ID together for one pull request |
-| Environment | This package | Start one agent server for the coding client while the process runs |
-| Sandbox | This package calls your hooks | Create or reuse one worktree for each pull request session |
-| GitHub, agent, and worktree functions | Your project | Talk to real APIs and manage real resources |
+| Session | This package | Keep the agent conversation ID for one pull request |
+| Environment and sandbox | This package calls your hooks | Save one typed worktree and OpenCode process resource per pull request |
+| Managed process helpers | This package | Spawn the detached process and safely adopt its saved POSIX group or Windows PID during cleanup |
+| GitHub, OpenCode, ownership, and worktree functions | Your project | Talk to real APIs and verify real resource identity |
 
 Every import from `../../src/` below is **project-provided code**. You'll need to implement those functions for your GitHub client, coding-agent SDK, and worktree manager. Imports from `simple-agent-orchestrator` are package APIs.
 
@@ -32,7 +31,7 @@ Use one orchestrator session per pull request. Typed keys make it harder to mix 
 
 ```ts
 // .simple-agent-orchestrator/keys.ts
-import { defineKey, envKey, sessionKey } from "simple-agent-orchestrator";
+import { defineKey, sessionKey } from "simple-agent-orchestrator";
 
 export const githubPullRequest = defineKey<{
   owner: string;
@@ -42,12 +41,10 @@ export const githubPullRequest = defineKey<{
   parts: ["owner", "repo", "number"],
 });
 
-export const agentServerUrl = envKey<string>("agent.serverUrl");
 export const agentSessionId = sessionKey<string>("agent.sessionId");
-export const worktreeId = sessionKey<string>("worktree.id");
 ```
 
-`githubPullRequest(...)` produces the same session key whenever a review refers to the same owner, repository, and pull request number. The server URL exists only while this process runs. The two session keys are saved and reused by later review events.
+`githubPullRequest(...)` produces the same session key whenever a review refers to the same owner, repository, and pull request number. The agent conversation ID is saved in session state. The worktree and process identity belong to the typed sandbox resource shown below.
 
 ## 2. Poll GitHub for review changes
 
@@ -108,62 +105,146 @@ This sample assumes `updatedAt` values are canonical timestamps whose string ord
 
 The poll maps items one at a time. A map may return one event or an array; the runtime records the flattened events sequentially before `commit` updates the cursor. `commit` confirms local event recording, not successful agent work. If a handler later fails, its delivery retries from the saved event.
 
-## 3. Start the agent server and prepare worktrees
+## 3. Create a typed worktree and OpenCode process
 
-The environment starts one agent server for this client. Its sandbox calls your worktree adapter once for each pull request session, then reuses the recorded worktree on later reviews.
+The environment owns one sandbox for each pull request session. Its saved resource contains everything later handlers and cleanup need: the worktree, the OpenCode endpoint, and an ownership token stronger than a PID.
 
 ```ts
 // .simple-agent-orchestrator/environments/coding.ts
-import { createEnvironment } from "simple-agent-orchestrator";
+import { createEnvironment, createSandbox } from "simple-agent-orchestrator";
+import { adoptManagedProcess } from "simple-agent-orchestrator/node";
 
-// Project-provided agent-server and worktree adapters.
-import { startAgentServer } from "../../src/agent-server.ts";
-import { closeWorktree, ensureWorktree } from "../../src/worktrees.ts";
+// Project-provided OpenCode, process-ownership, and worktree adapters.
+import {
+  findOpencodeProcess,
+  opencodeProcessStillMatches,
+  startOpencodeProcess,
+} from "../../src/opencode.ts";
+import {
+  closeWorktree,
+  ensureWorktree,
+  findWorktree,
+  worktreeExists,
+} from "../../src/worktrees.ts";
 
-import { agentServerUrl, worktreeId } from "../keys.ts";
+type CodingResource = {
+  worktreeId: string;
+  worktreePath: string;
+  opencode?: {
+    url: string;
+    pid: number;
+    ownershipToken: string;
+  };
+};
 
-export const codingEnvironment = createEnvironment("coding", (environment) => {
-  let shutdown: (() => Promise<void>) | undefined;
+export const codingSandbox = createSandbox<CodingResource>({
+  async create({ session, event, project, signal, publishResource }) {
+    const branch = event.meta?.branch;
+    if (typeof branch !== "string" || branch.trim() === "") {
+      throw new Error("Expected event.meta.branch");
+    }
 
-  environment.onMount(async ({ environment, project, signal }) => {
-    const server = await startAgentServer({ cwd: project.root, signal });
-    environment.set(agentServerUrl, server.url);
-    shutdown = server.shutdown;
-  });
+    const worktree = await ensureWorktree({
+      resourceKey: `worktree:${session.id}`,
+      repository: project.root,
+      branch,
+      signal,
+    });
+    await publishResource({
+      worktreeId: worktree.id,
+      worktreePath: worktree.path,
+    });
 
-  environment.onUnmount(async () => {
-    await shutdown?.();
-    shutdown = undefined;
-  });
+    const opencode = await startOpencodeProcess({
+      resourceKey: `opencode:${session.id}`,
+      cwd: worktree.path,
+      signal,
+    });
 
-  environment.useSandbox({
-    async create({ session, event, project, signal }) {
-      const branch = event.meta?.branch;
-      if (typeof branch !== "string" || branch.trim() === "") {
-        throw new Error("Expected event.meta.branch");
-      }
+    await publishResource({
+      worktreeId: worktree.id,
+      worktreePath: worktree.path,
+      opencode: {
+        url: opencode.url,
+        pid: opencode.pid,
+        ownershipToken: opencode.ownershipToken,
+      },
+    });
+  },
 
-      const id = await ensureWorktree({
-        resourceKey: `worktree:${session.id}`,
-        repository: project.root,
-        branch,
+  async reconcile({ resource, currentStatus, cause, session, project, signal, publishResource }) {
+    const savedWorktreeActive = resource
+      ? await worktreeExists(resource.worktreeId, { signal })
+      : false;
+    const worktree = savedWorktreeActive
+      ? { id: resource!.worktreeId, path: resource!.worktreePath }
+      : await findWorktree({
+          resourceKey: `worktree:${session.id}`,
+          repository: project.root,
+          signal,
+        });
+    let opencode = resource?.opencode &&
+        await opencodeProcessStillMatches(resource.opencode.pid, resource.opencode.ownershipToken)
+      ? resource.opencode
+      : await findOpencodeProcess({
+          resourceKey: `opencode:${session.id}`,
+          signal,
+    });
+    if (!worktree && !opencode) return "cleaned";
+    if (!worktree) return "unknown";
+
+    if (!opencode && cause.type === "delivery" && currentStatus === "creating") {
+      opencode = await startOpencodeProcess({
+        resourceKey: `opencode:${session.id}`,
+        cwd: worktree.path,
         signal,
       });
+    }
+    if (!opencode && cause.type === "completion") {
+      await publishResource({ worktreeId: worktree.id, worktreePath: worktree.path });
+      return "active";
+    }
+    if (!opencode) return "unknown";
 
-      session.set(worktreeId, id);
-    },
+    await publishResource({
+      worktreeId: worktree.id,
+      worktreePath: worktree.path,
+      opencode: {
+        url: opencode.url,
+        pid: opencode.pid,
+        ownershipToken: opencode.ownershipToken,
+      },
+    });
+    return "active";
+  },
 
-    async cleanup({ session, signal }) {
-      const id = session.getOptional(worktreeId);
-      if (id) await closeWorktree(id, { signal });
-    },
-  });
+  async cleanup({ cleanup }) {
+    await cleanup.step("stop-opencode", { retry: "idempotent" }, async ({ resource }) => {
+      if (!resource.opencode) return;
+      const processHandle = adoptManagedProcess(resource.opencode.pid, {
+        ownsProcess: (pid) => opencodeProcessStillMatches(pid, resource.opencode!.ownershipToken),
+      });
+      await processHandle.stop();
+    });
+
+    await cleanup.step("remove-worktree", { retry: "idempotent" }, async ({ resource, signal }) => {
+      await closeWorktree(resource.worktreeId, { signal });
+    });
+  },
+});
+
+export const codingEnvironment = createEnvironment("coding", (environment) => {
+  environment.useSandbox(codingSandbox);
 });
 ```
 
-Implement `ensureWorktree` as a get-or-create call keyed by `resourceKey`. A process can stop after the worktree is created but before its ID is recorded, so a retry may call it again. `closeWorktree` should likewise treat an already-removed worktree as success.
+Every function imported from `../../src/` is project code. The package does not provide GitHub, OpenCode, worktree, process discovery, or ownership-token APIs. Implement `ensureWorktree` and `startOpencodeProcess` as get-or-create operations keyed by `resourceKey`, make `closeWorktree` treat an already-removed worktree as success, and make the ownership check return true only for the process represented by the saved token. On POSIX, `startOpencodeProcess` must create a detached process group and return its leader PID so later adoption refers to the same group; `spawnManagedProcess` is the package helper for that launch pattern.
 
-The environment's server is stopped when the runtime stops. The per-session worktree is different: sandbox cleanup runs only after a successful handler calls `session.end()`. The handler below keeps sessions active, which is what makes the worktree persistent across reviews.
+The first `publishResource` saves the worktree identity before process startup. If startup fails, `reconcile` can discover or restart the missing process and publish the complete resource. During administrative completion, it can instead return the partial resource as active so cleanup removes the worktree without starting a process only to stop it. The second publication replaces the saved resource after startup succeeds.
+
+The adopted-process ownership check is mandatory. On POSIX, `adoptManagedProcess` signals only the saved process group and never falls back to a positive PID; on Windows it targets the PID. It rechecks ownership before KILL escalation. The `stop-opencode` step is marked idempotent because the project ownership check and adopted handle make an already-stopped target a successful no-op.
+
+Every outside cleanup effect is inside a step because typed cleanup is re-entered directly from `cleaning`. The worktree step waits for the OpenCode step because removing a working directory while the process uses it would be unsafe. This narrow step mechanism is not a general workflow engine and does not make other handling exactly once.
 
 ## 4. Send each review to the coding agent
 
@@ -178,8 +259,11 @@ import { createAgentSession, sendToAgent } from "../../src/agent.ts";
 import { markReviewSeen } from "../../src/github.ts";
 
 import { githubReviews } from "../channels/github.ts";
-import { codingEnvironment } from "../environments/coding.ts";
-import { agentServerUrl, agentSessionId } from "../keys.ts";
+import {
+  codingEnvironment,
+  codingSandbox,
+} from "../environments/coding.ts";
+import { agentSessionId } from "../keys.ts";
 
 export const codingClient = createClient("coding", (client) => {
   client.useEnvironment(codingEnvironment);
@@ -190,17 +274,19 @@ export const codingClient = createClient("coding", (client) => {
   client.handle(githubReviews, {
     id: "process-review",
 
-    async handle({ event, session, environment, signal }) {
-      const serverUrl = environment.get(agentServerUrl);
+    async handle({ event, session, sandbox, signal }) {
+      const resource = sandbox.get(codingSandbox);
+      if (!resource.opencode) throw new Error("Active coding sandbox has no OpenCode process");
       const externalSessionId = await session.ensure(agentSessionId, async () => {
-        const created = await createAgentSession(serverUrl, {
+        const created = await createAgentSession(resource.opencode.url, {
           idempotencyKey: `agent-session:${session.id}`,
           signal,
         });
         return created.id;
       });
 
-      await sendToAgent(serverUrl, externalSessionId, String(event.input), {
+      await sendToAgent(resource.opencode.url, externalSessionId, String(event.input), {
+        cwd: resource.worktreePath,
         idempotencyKey: `agent-message:${event.channelId}:${event.dedupeKey}`,
         signal,
       });
@@ -223,7 +309,7 @@ Here's how those settings affect what you'll see:
 - Each delivery gets up to three attempts, including the first, with a fixed ten-second delay after a failure.
 - The ten-minute timeout covers worktree setup, `handle`, `onSuccess`, and cleanup. Your adapters must observe `signal`; JavaScript can't be forcibly stopped.
 
-`session.ensure(...)` records one external agent session ID for the pull request. A failed `handle` call keeps a completed `ensure` value but discards ordinary changes that didn't reach the handling checkpoint. After `handle` succeeds, ordinary changes stay staged on the delivery until acknowledgement, cleanup, and saving finish.
+`sandbox.get(codingSandbox)` requires the exact typed definition configured on this client and returns its readonly `CodingResource`. `session.ensure(...)` records one external agent conversation ID for the pull request. A failed `handle` call keeps a completed `ensure` value but discards ordinary changes that didn't reach the handling checkpoint. After `handle` succeeds, ordinary changes stay staged on the delivery until acknowledgement, cleanup, and saving finish.
 
 An agent call can repeat if handling fails or is interrupted before its checkpoint. `markReviewSeen` can repeat if acknowledgement fails or is interrupted before its checkpoint. A later cleanup or local-save failure resumes that later phase without repeating either call. Keep stable idempotency keys anyway: the runtime can't atomically save a checkpoint with an outside API response. Don't include the attempt number in those keys.
 
@@ -245,7 +331,7 @@ export default defineConfig({
 });
 ```
 
-The channel produces normalized review events. The client subscribes to that channel. The client's environment supplies the process-wide agent server and its sandbox supplies the per-session worktree.
+The channel produces normalized review events. The client subscribes to that channel. Its environment supplies one typed worktree and OpenCode process resource for each pull request session.
 
 ## 6. Run one review cycle
 
@@ -258,7 +344,7 @@ npx simple-agent-orchestrator events list
 npx simple-agent-orchestrator sessions list
 ```
 
-After a review is found, expect `events list` to show a `processed` delivery and `sessions list` to show an active session keyed by the pull request. To inspect the agent session and worktree IDs saved in that session, use the ID from the list:
+After a review is found, expect `events list` to show a `processed` delivery and `sessions list` to show an active session keyed by the pull request. To inspect the saved agent conversation and typed sandbox resource, use the ID from the list:
 
 ```bash
 npx simple-agent-orchestrator sessions show <session-id>
@@ -280,14 +366,28 @@ The default JSON state file allows only one process to make changes at a time. D
 
 ## 7. Decide when a pull request is finished
 
-This review-only example intentionally never ends the session, so its worktree remains available for later reviews. In a complete integration, add a pull-request closed or merged event and have its successful handler call `session.end()` after any final agent work. That is what triggers sandbox cleanup.
+This review-only example intentionally never ends the session, so its OpenCode process and worktree remain available for later reviews. In a complete integration, route a pull-request closed or merged event to the existing session without creating a replacement:
+
+```ts
+client.handle(pullRequestsMerged, {
+  id: "finish-pull-request",
+  session: "existing-only",
+  handle({ session }) {
+    session.end();
+  },
+});
+```
+
+`pullRequestsMerged` is a project-defined channel whose events use the same pull-request `sessionKey`. Calling `session.end()` triggers the adopted-process and worktree cleanup steps. A late merge event with no active session is ignored instead of creating a new worktree and process.
 
 Running `sessions end` from the CLI marks the session ended but does not invoke `closeWorktree`. Use `sessions complete <session-id>` when operators need the configured sandbox cleanup to finish before the session ends.
 
 ## Check the design before shipping
 
 - Review revisions have distinct dedupe keys but share one pull request session.
-- One agent server is mounted for the coding client, while each pull request gets its own worktree.
+- Each pull request gets one typed worktree and OpenCode process resource.
+- Adopted cleanup verifies process ownership before signaling and again before KILL escalation.
+- Every outside cleanup effect is inside a durable sandbox cleanup step.
 - External agent creation, messaging, acknowledgement, and worktree calls are safe to repeat.
 - GitHub acknowledgement happens after the agent handles the review.
 - Poll cursor progress doesn't claim that agent work succeeded.

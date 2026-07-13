@@ -9,16 +9,35 @@ import { bodyLimit } from "hono/body-limit";
 import type { ChannelDefinition, PollDefinition } from "../core/channel.js";
 import { CursorImpl, pollCursorId } from "../core/channel.js";
 import { bindChannelRuntime, unbindChannelRuntime } from "../core/channel-bindings.js";
-import type { ClientDefinition, HandlerContext, RegisteredHandler } from "../core/client.js";
 import type {
+  ClientDefinition,
+  HandlerContext,
+  HandlerSandboxAccessor,
+  RegisteredHandler,
+} from "../core/client.js";
+import type {
+  AnySandboxDefinition,
   EnvironmentDefinition,
   EnvironmentInstance,
+  ResourceSandboxDefinition,
+  SandboxCleanupStepContext,
+  SandboxCleanupStepDisposition,
+  SandboxCleanupStepOptions,
   SandboxContext,
   SandboxCompletionContext,
+  SandboxDefinition,
   SandboxDeliveryContext,
   SandboxDisposition,
+  SandboxResourceCleanupContext,
+  SandboxResourceCreateContext,
+  SandboxResourcePrepareContext,
+  SandboxResourceReconcileContext,
 } from "../core/environment.js";
-import { createEmptyEnvironment, EnvironmentInstanceImpl } from "../core/environment.js";
+import {
+  createEmptyEnvironment,
+  EnvironmentInstanceImpl,
+  isResourceSandboxDefinition,
+} from "../core/environment.js";
 import type { OrchestratorConfig } from "../core/config.js";
 import { HandlerTimeoutError } from "../core/errors.js";
 import { createStoredSession, SessionImpl } from "../core/session.js";
@@ -39,6 +58,7 @@ import type {
   StoredExhaustion,
   StoredFailureDescriptor,
   StoredSandbox,
+  StoredSandboxCleanupStep,
   StoredSession,
 } from "../core/types.js";
 import { memoryStore, type Store } from "../stores/index.js";
@@ -87,8 +107,13 @@ interface RuntimeChannel {
   readonly polls: readonly PollDefinition[];
 }
 
-interface RuntimeClient extends ClientDefinition {
+interface RuntimeEnvironmentDefinition extends EnvironmentDefinition {
+  readonly sandboxHandle?: AnySandboxDefinition | undefined;
+}
+
+interface RuntimeClient extends Omit<ClientDefinition, "environment"> {
   readonly definition: ClientDefinition;
+  readonly environment?: RuntimeEnvironmentDefinition | undefined;
 }
 
 interface ClaimedDelivery {
@@ -158,7 +183,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function validateJsonValue(value: unknown, depth = 0): asserts value is JsonValue {
+function validateJsonValue(
+  value: unknown,
+  depth = 0,
+  ancestors = new Set<object>(),
+): asserts value is JsonValue {
   if (depth > MAX_JSON_NESTING_DEPTH) throw new WebhookValidationError("JSON nesting is too deep.");
   if (value === null || typeof value === "string" || typeof value === "boolean") return;
   if (typeof value === "number") {
@@ -166,11 +195,42 @@ function validateJsonValue(value: unknown, depth = 0): asserts value is JsonValu
     return;
   }
   if (Array.isArray(value)) {
-    for (const item of value) validateJsonValue(item, depth + 1);
+    if (
+      Object.getPrototypeOf(value) !== Array.prototype ||
+      Object.getOwnPropertySymbols(value).length > 0 ||
+      Object.getOwnPropertyNames(value).length !== value.length + 1
+    ) {
+      throw new WebhookValidationError("Values must be dense JSON arrays without extra properties.");
+    }
+    if (ancestors.has(value)) throw new WebhookValidationError("Values must not be circular.");
+    ancestors.add(value);
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor?.enumerable || !("value" in descriptor)) {
+        throw new WebhookValidationError("Values must be dense JSON arrays without accessors.");
+      }
+      validateJsonValue(descriptor.value, depth + 1, ancestors);
+    }
+    ancestors.delete(value);
     return;
   }
   if (!isRecord(value)) throw new WebhookValidationError("Values must be JSON-safe.");
-  for (const item of Object.values(value)) validateJsonValue(item, depth + 1);
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new WebhookValidationError("Values must be plain JSON objects.");
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new WebhookValidationError("Values must not contain symbol properties.");
+  }
+  if (ancestors.has(value)) throw new WebhookValidationError("Values must not be circular.");
+  ancestors.add(value);
+  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
+    if (!descriptor.enumerable || !("value" in descriptor)) {
+      throw new WebhookValidationError("Values must not contain non-enumerable or accessor properties.");
+    }
+    validateJsonValue(descriptor.value, depth + 1, ancestors);
+  }
+  ancestors.delete(value);
 }
 
 function validateOptionalString(
@@ -388,13 +448,16 @@ function sanitizeFailure(error: unknown): StoredFailureDescriptor {
   return { name, message: "Operation failed." };
 }
 
-function snapshotEnvironment(definition: EnvironmentDefinition | undefined): EnvironmentDefinition | undefined {
+function snapshotEnvironment(definition: EnvironmentDefinition | undefined): RuntimeEnvironmentDefinition | undefined {
   if (!definition) return undefined;
   return {
     id: definition.id,
     mountHooks: [...definition.mountHooks],
     unmountHooks: [...definition.unmountHooks],
-    ...(definition.sandbox ? { sandbox: { ...definition.sandbox } } : {}),
+    ...(definition.sandbox ? {
+      sandbox: { ...definition.sandbox },
+      sandboxHandle: definition.sandbox,
+    } : {}),
   };
 }
 
@@ -440,6 +503,7 @@ export class OrchestratorRuntime {
   private readonly completingSessions = new Set<string>();
   private readonly ensureLocks = new Map<string, Promise<unknown>>();
   private readonly sandboxLocks = new Map<string, Promise<void>>();
+  private readonly sandboxCleanupStepLocks = new Map<string, Promise<void>>();
   private ownership: RuntimeOwnership | undefined;
   private ownershipPromise: Promise<RuntimeOwnership> | undefined;
   private lifecycleState: RuntimeLifecycleState = "unused";
@@ -1237,7 +1301,7 @@ export class OrchestratorRuntime {
     const state = await this.store.read();
     return state.sandboxes
       .filter((sandbox) => sessionId === undefined || sandbox.sessionId === sessionId)
-      .map((sandbox) => ({ ...sandbox, checkpoint: structuredClone(sandbox.checkpoint) }))
+      .map((sandbox) => structuredClone(sandbox))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
@@ -1313,6 +1377,7 @@ export class OrchestratorRuntime {
                 environmentId,
                 status: "active",
                 checkpoint: {},
+                cleanupSteps: {},
                 createdAt: timestamp,
                 updatedAt: timestamp,
               });
@@ -1322,7 +1387,9 @@ export class OrchestratorRuntime {
           if (legacy.length > 0) await this.store.write(state);
           return {
             session: { ...session, state: { ...session.state } },
-            sandboxes: state.sandboxes.filter((sandbox) => sandbox.sessionId === sessionId),
+            sandboxes: state.sandboxes
+              .filter((sandbox) => sandbox.sessionId === sessionId)
+              .map((sandbox) => structuredClone(sandbox)),
           };
         });
 
@@ -1837,9 +1904,18 @@ export class OrchestratorRuntime {
         await this.ensureSandbox(client, environment, sessionImpl, event, attemptSignal);
         await this.checkpointDelivery(delivery.id, "handling");
       }
+      if (delivery.phase === "sandbox" || delivery.phase === "handling") {
+        stage = "sandbox";
+        await this.prepareSandbox(client, environment, sessionImpl, event, attemptSignal);
+      }
       attemptSignal.throwIfTimedOut();
 
       const orchestratorEvent = this.toRuntimeEvent(event);
+      const sandbox = await this.createHandlerSandboxAccessor(
+        client,
+        sessionImpl.id,
+        delivery.phase === "cleaning",
+      );
       handlerContext = {
         event: orchestratorEvent,
         session: sessionImpl,
@@ -1856,6 +1932,7 @@ export class OrchestratorRuntime {
             releaseCapacity = true;
           },
         },
+        sandbox,
       };
 
       if (delivery.phase === "sandbox" || delivery.phase === "handling") {
@@ -2136,7 +2213,7 @@ export class OrchestratorRuntime {
   }
 
   private async ensureSandbox(
-    client: ClientDefinition,
+    client: RuntimeClient,
     environment: EnvironmentInstance,
     session: SessionImpl,
     event: StoredEvent,
@@ -2144,19 +2221,44 @@ export class OrchestratorRuntime {
   ): Promise<void> {
     const definition = client.environment;
     if (!definition?.sandbox) return;
+    const resourceDefinition = this.resourceSandboxDefinition(client);
     await this.withSandboxLock(this.sandboxKey(session.id, client.id, definition.id), async () => {
       attemptSignal.throwIfTimedOut();
       const currentSession = await this.getSession(session.id);
       if (currentSession?.status !== "active") throw new Error(`Session ended before sandbox creation: ${session.id}`);
       let record = await this.getSandbox(session.id, client.id, definition.id);
       if (!record) record = await this.adoptLegacySandbox(session.id, client.id, definition.id);
-      if (record?.status === "active") return;
+      const activeResourceMissing = resourceDefinition !== undefined &&
+        record?.status === "active" && !Object.hasOwn(record, "resource");
+      if (record?.status === "active" && !activeResourceMissing) {
+        return;
+      }
       if (record && record.status !== "cleaned" && definition.sandbox!.reconcile) {
         let disposition: SandboxDisposition;
         try {
-          disposition = await definition.sandbox!.reconcile(
-            this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
-          );
+          disposition = resourceDefinition
+            ? await resourceDefinition.reconcile!(
+                this.resourceSandboxContext(
+                  client,
+                  environment,
+                  session,
+                  event,
+                  attemptSignal.signal,
+                  record,
+                  { type: "delivery" },
+                ),
+              )
+            : await (definition.sandbox as SandboxDefinition).reconcile!(
+                this.sandboxContext(
+                  client,
+                  environment,
+                  session,
+                  event,
+                  attemptSignal.signal,
+                  record,
+                  { type: "delivery" },
+                ),
+              );
           if (disposition !== "active" && disposition !== "cleaned" && disposition !== "unknown") {
             throw new Error(`Invalid sandbox reconciliation disposition: ${String(disposition)}`);
           }
@@ -2165,13 +2267,22 @@ export class OrchestratorRuntime {
           throw error;
         }
         attemptSignal.throwIfTimedOut();
+        record = (await this.getSandbox(session.id, client.id, definition.id)) ?? record;
+        if (disposition === "active" && resourceDefinition) this.assertPublishedSandboxResource(record);
         record = await this.persistSandboxDisposition(record, disposition);
-        if (disposition === "active") return;
+        if (disposition === "active") {
+          return;
+        }
         if (disposition === "unknown") throw new Error(`Sandbox reconciliation remained unknown for ${client.id}/${definition.id}`);
       }
       if (record?.status === "cleaning" || record?.status === "unknown") {
         throw new Error(
           `Sandbox ${client.id}/${definition.id} is ${record.status} and cannot be used without successful reconciliation`,
+        );
+      }
+      if (record?.status === "active" && resourceDefinition && !Object.hasOwn(record, "resource")) {
+        throw new Error(
+          `Active resource-aware sandbox ${client.id}/${definition.id} has no published resource and cannot be recovered without reconciliation`,
         );
       }
       record = await this.setSandboxStatus(
@@ -2182,9 +2293,36 @@ export class OrchestratorRuntime {
         record?.checkpoint ?? {},
       );
       try {
-        await definition.sandbox!.create(
-          this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
-        );
+        const resource = resourceDefinition
+          ? await resourceDefinition.create(
+              this.resourceSandboxContext(
+                client,
+                environment,
+                session,
+                event,
+                attemptSignal.signal,
+                record,
+                { type: "delivery" },
+              ),
+            )
+          : await (definition.sandbox as SandboxDefinition).create(
+              this.sandboxContext(
+                client,
+                environment,
+                session,
+                event,
+                attemptSignal.signal,
+                record,
+                { type: "delivery" },
+              ),
+            );
+        if (resourceDefinition && resource !== undefined) {
+          record = await this.publishSandboxResource(record, resource);
+        }
+        if (resourceDefinition) {
+          record = (await this.getSandbox(session.id, client.id, definition.id)) ?? record;
+          this.assertPublishedSandboxResource(record);
+        }
       } catch (error) {
         await this.setSandboxStatus(session.id, client.id, definition.id, "creating", undefined, error);
         throw error;
@@ -2196,7 +2334,7 @@ export class OrchestratorRuntime {
   }
 
   private async cleanupSandbox(
-    client: ClientDefinition,
+    client: RuntimeClient,
     environment: EnvironmentInstance,
     session: SessionImpl,
     event: StoredEvent,
@@ -2204,11 +2342,14 @@ export class OrchestratorRuntime {
   ): Promise<void> {
     const definition = client.environment;
     if (!definition?.sandbox?.cleanup) return;
+    const resourceDefinition = this.resourceSandboxDefinition(client);
     await this.withSandboxLock(this.sandboxKey(session.id, client.id, definition.id), async () => {
       attemptSignal.throwIfTimedOut();
       let record = await this.getSandbox(session.id, client.id, definition.id);
       if (!record || record.status === "cleaned") return;
-      if (record.status !== "active") {
+      const resourceMissing = resourceDefinition !== undefined && !Object.hasOwn(record, "resource");
+      const canReenterTypedCleanup = resourceDefinition !== undefined && record.status === "cleaning" && !resourceMissing;
+      if ((record.status !== "active" && !canReenterTypedCleanup) || resourceMissing) {
         if (!definition.sandbox!.reconcile) {
           throw new Error(
             `Sandbox ${client.id}/${definition.id} is ${record.status} and cleanup cannot continue without reconciliation`,
@@ -2216,9 +2357,29 @@ export class OrchestratorRuntime {
         }
         let disposition: SandboxDisposition;
         try {
-          disposition = await definition.sandbox!.reconcile(
-            this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
-          );
+          disposition = resourceDefinition
+            ? await resourceDefinition.reconcile!(
+                this.resourceSandboxContext(
+                  client,
+                  environment,
+                  session,
+                  event,
+                  attemptSignal.signal,
+                  record,
+                  { type: "delivery" },
+                ),
+              )
+            : await (definition.sandbox as SandboxDefinition).reconcile!(
+                this.sandboxContext(
+                  client,
+                  environment,
+                  session,
+                  event,
+                  attemptSignal.signal,
+                  record,
+                  { type: "delivery" },
+                ),
+              );
           if (disposition !== "active" && disposition !== "cleaned" && disposition !== "unknown") {
             throw new Error(`Invalid sandbox reconciliation disposition: ${String(disposition)}`);
           }
@@ -2227,23 +2388,82 @@ export class OrchestratorRuntime {
           throw error;
         }
         attemptSignal.throwIfTimedOut();
+        record = (await this.getSandbox(session.id, client.id, definition.id)) ?? record;
+        if (disposition === "active" && resourceDefinition) this.assertPublishedSandboxResource(record);
         record = await this.persistSandboxDisposition(record, disposition);
         if (disposition === "cleaned") return;
         if (disposition === "unknown") {
           throw new Error(`Sandbox reconciliation remained unknown for ${client.id}/${definition.id}`);
         }
       }
-      await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning");
+      if (resourceDefinition) this.assertPublishedSandboxResource(record);
+      record = await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning");
       try {
-        await definition.sandbox!.cleanup!(
-          this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
-        );
+        if (resourceDefinition) {
+          await resourceDefinition.cleanup!(
+            this.resourceSandboxCleanupContext(
+              client,
+              environment,
+              session,
+              event,
+              attemptSignal.signal,
+              record,
+              { type: "delivery" },
+            ),
+          );
+        } else {
+          await (definition.sandbox as SandboxDefinition).cleanup!(
+            this.sandboxContext(client, environment, session, event, attemptSignal.signal, record, { type: "delivery" }),
+          );
+        }
       } catch (error) {
         await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning", undefined, error);
         throw error;
       }
       attemptSignal.throwIfTimedOut();
       await this.setSandboxStatus(session.id, client.id, definition.id, "cleaned");
+    });
+  }
+
+  private async prepareSandbox(
+    client: RuntimeClient,
+    environment: EnvironmentInstance,
+    session: SessionImpl,
+    event: StoredEvent,
+    attemptSignal: AttemptSignal,
+  ): Promise<void> {
+    const definition = client.environment;
+    const resourceDefinition = this.resourceSandboxDefinition(client);
+    if (!definition || !resourceDefinition?.prepare) return;
+    await this.withSandboxLock(this.sandboxKey(session.id, client.id, definition.id), async () => {
+      attemptSignal.throwIfTimedOut();
+      const currentSession = await this.getSession(session.id);
+      if (currentSession?.status !== "active") throw new Error(`Session ended before sandbox preparation: ${session.id}`);
+      let record = await this.getSandbox(session.id, client.id, definition.id);
+      if (!record || record.status !== "active") return;
+      try {
+        const resource = await resourceDefinition.prepare!(
+          this.resourceSandboxContext(
+            client,
+            environment,
+            session,
+            event,
+            attemptSignal.signal,
+            record,
+            { type: "delivery" },
+          ),
+        );
+        if (resource !== undefined) record = await this.publishSandboxResource(record, resource);
+        record = (await this.getSandbox(session.id, client.id, definition.id)) ?? record;
+        this.assertPublishedSandboxResource(record);
+        if (record.lastError !== undefined) {
+          record = await this.setSandboxStatus(session.id, client.id, definition.id, "active");
+        }
+      } catch (error) {
+        await this.setSandboxStatus(session.id, client.id, definition.id, record.status, undefined, error);
+        throw error;
+      }
+      attemptSignal.throwIfTimedOut();
     });
   }
 
@@ -2255,9 +2475,12 @@ export class OrchestratorRuntime {
   ): Promise<void> {
     const definition = client.environment!;
     const sandbox = definition.sandbox!;
+    const resourceDefinition = this.resourceSandboxDefinition(client);
     let record = await this.getSandbox(session.id, client.id, definition.id);
     if (!record || record.status === "cleaned") return;
-    if (record.status !== "active") {
+    const resourceMissing = resourceDefinition !== undefined && !Object.hasOwn(record, "resource");
+    const canReenterTypedCleanup = resourceDefinition !== undefined && record.status === "cleaning" && !resourceMissing;
+    if ((record.status !== "active" && !canReenterTypedCleanup) || resourceMissing) {
       if (!sandbox.reconcile) {
         throw new Error(
           `Cannot complete session ${session.id}: sandbox ${client.id}/${definition.id} is ${record.status} and cleanup cannot continue without reconciliation`,
@@ -2265,12 +2488,24 @@ export class OrchestratorRuntime {
       }
       let disposition: SandboxDisposition;
       try {
-        disposition = await sandbox.reconcile(
-          this.sandboxContext(client, environment, session, undefined, this.abortController.signal, record, {
-            type: "completion",
-            reason,
-          }),
-        );
+        disposition = resourceDefinition
+          ? await resourceDefinition.reconcile!(
+              this.resourceSandboxContext(
+                client,
+                environment,
+                session,
+                undefined,
+                this.abortController.signal,
+                record,
+                { type: "completion", reason },
+              ),
+            )
+          : await (sandbox as SandboxDefinition).reconcile!(
+              this.sandboxContext(client, environment, session, undefined, this.abortController.signal, record, {
+                type: "completion",
+                reason,
+              }),
+            );
         if (disposition !== "active" && disposition !== "cleaned" && disposition !== "unknown") {
           throw new Error(`Invalid sandbox reconciliation disposition: ${String(disposition)}`);
         }
@@ -2278,24 +2513,41 @@ export class OrchestratorRuntime {
         await this.setSandboxStatus(session.id, client.id, definition.id, record.status, undefined, error);
         throw error;
       }
+      record = (await this.getSandbox(session.id, client.id, definition.id)) ?? record;
       if (disposition === "cleaned") {
         await this.persistAdministrativeSandboxSuccess(session, client.id, definition.id);
         return;
       }
+      if (disposition === "active" && resourceDefinition) this.assertPublishedSandboxResource(record);
       record = await this.persistSandboxDisposition(record, disposition);
       if (disposition === "unknown") throw new Error(`Sandbox reconciliation remained unknown for ${client.id}/${definition.id}`);
     }
     if (!sandbox.cleanup) {
       throw new Error(`Cannot complete session ${session.id}: sandbox ${client.id}/${definition.id} has no cleanup hook`);
     }
-    await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning");
+    if (resourceDefinition) this.assertPublishedSandboxResource(record);
+    record = await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning");
     try {
-      await sandbox.cleanup(
-        this.sandboxContext(client, environment, session, undefined, this.abortController.signal, record, {
-          type: "completion",
-          reason,
-        }),
-      );
+      if (resourceDefinition) {
+        await resourceDefinition.cleanup!(
+          this.resourceSandboxCleanupContext(
+            client,
+            environment,
+            session,
+            undefined,
+            this.abortController.signal,
+            record,
+            { type: "completion", reason },
+          ),
+        );
+      } else {
+        await (sandbox as SandboxDefinition).cleanup!(
+          this.sandboxContext(client, environment, session, undefined, this.abortController.signal, record, {
+            type: "completion",
+            reason,
+          }),
+        );
+      }
     } catch (error) {
       await this.setSandboxStatus(session.id, client.id, definition.id, "cleaning", undefined, error);
       throw error;
@@ -2377,6 +2629,7 @@ export class OrchestratorRuntime {
       logger: this.logger,
       signal,
       session,
+      currentStatus: sandbox.status,
       checkpoint: async (update: JsonRecord) => {
         if (!isRecord(update)) throw new Error("Sandbox checkpoint update must be a JSON object");
         validateJsonValue(update);
@@ -2392,6 +2645,107 @@ export class OrchestratorRuntime {
       get: () => structuredClone(currentCheckpoint),
     });
     return context;
+  }
+
+  private resourceSandboxContext(
+    client: ClientDefinition,
+    environment: EnvironmentInstance,
+    session: SessionImpl,
+    event: StoredEvent | undefined,
+    signal: AbortSignal,
+    sandbox: StoredSandbox,
+    cause: SandboxContext["cause"],
+  ): SandboxResourceCreateContext<JsonValue> & SandboxResourcePrepareContext<JsonValue> & SandboxResourceReconcileContext<JsonValue> {
+    const context = event === undefined
+      ? this.sandboxContext(
+          client,
+          environment,
+          session,
+          undefined,
+          signal,
+          sandbox,
+          cause.type === "completion" ? cause : { type: "completion" },
+        )
+      : this.sandboxContext(client, environment, session, event, signal, sandbox, { type: "delivery" });
+    const resourceContext = Object.assign(context, {
+      publishResource: async (resource: JsonValue) => {
+        await this.publishSandboxResource(sandbox, resource);
+      },
+    }) as SandboxResourceCreateContext<JsonValue> & SandboxResourcePrepareContext<JsonValue> & SandboxResourceReconcileContext<JsonValue>;
+    if (Object.hasOwn(sandbox, "resource")) {
+      Object.defineProperty(resourceContext, "resource", {
+        enumerable: true,
+        value: structuredClone(sandbox.resource),
+      });
+    }
+    return resourceContext;
+  }
+
+  private resourceSandboxCleanupContext(
+    client: ClientDefinition,
+    environment: EnvironmentInstance,
+    session: SessionImpl,
+    event: StoredEvent | undefined,
+    signal: AbortSignal,
+    sandbox: StoredSandbox,
+    cause: SandboxContext["cause"],
+  ): SandboxResourceCleanupContext<JsonValue> {
+    this.assertPublishedSandboxResource(sandbox);
+    const context = event === undefined
+      ? this.sandboxContext(
+          client,
+          environment,
+          session,
+          undefined,
+          signal,
+          sandbox,
+          cause.type === "completion" ? cause : { type: "completion" },
+        )
+      : this.sandboxContext(client, environment, session, event, signal, sandbox, { type: "delivery" });
+    const resource = structuredClone(sandbox.resource) as JsonValue;
+    const readonlySession = Object.freeze({
+      get id() {
+        return session.id;
+      },
+      get key() {
+        return session.key;
+      },
+      get status() {
+        return session.status;
+      },
+      get: session.get.bind(session),
+      getOptional: session.getOptional.bind(session),
+      has: session.has.bind(session),
+    });
+    const stepContext = {
+      environment: context.environment,
+      project: context.project,
+      logger: context.logger,
+      signal: context.signal,
+      currentStatus: context.currentStatus,
+      checkpoint: context.checkpoint,
+      cause: context.cause,
+      event: context.event,
+      session: readonlySession,
+      resource: structuredClone(resource),
+    } as SandboxCleanupStepContext<JsonValue>;
+    Object.defineProperty(stepContext, "currentCheckpoint", {
+      enumerable: true,
+      get: () => context.currentCheckpoint,
+    });
+    return Object.assign(context, {
+      resource,
+      cleanup: {
+        step: (
+          id: string,
+          options: SandboxCleanupStepOptions<JsonValue>,
+          operation: (ctx: SandboxCleanupStepContext<JsonValue>) => Promise<void> | void,
+        ) => this.withSandboxCleanupStepLock(
+          `${this.sandboxKey(sandbox.sessionId, sandbox.clientId, sandbox.environmentId)}:${id}`,
+          () => this.runSandboxCleanupStep(sandbox, id, options, operation, stepContext),
+        ),
+      },
+    }) as SandboxResourceCleanupContext<JsonValue>;
   }
 
   private validateConfiguration(): void {
@@ -2470,6 +2824,54 @@ export class OrchestratorRuntime {
     return JSON.stringify([sessionId, clientId, environmentId]);
   }
 
+  private resourceSandboxDefinition(
+    client: RuntimeClient | ClientDefinition,
+  ): ResourceSandboxDefinition<JsonValue> | undefined {
+    const environment = client.environment as RuntimeEnvironmentDefinition | undefined;
+    const handle = environment?.sandboxHandle;
+    if (!handle || !isResourceSandboxDefinition(handle)) return undefined;
+    return environment.sandbox as ResourceSandboxDefinition<JsonValue>;
+  }
+
+  private async createHandlerSandboxAccessor(
+    client: RuntimeClient,
+    sessionId: string,
+    includeCleaningResource = false,
+  ): Promise<HandlerSandboxAccessor> {
+    const environment = client.environment;
+    const handle = environment?.sandboxHandle;
+    const definition = this.resourceSandboxDefinition(client);
+    const record = definition && environment
+      ? await this.getSandbox(sessionId, client.id, environment.id)
+      : undefined;
+    const resourceAvailable = record !== undefined &&
+      (record.status === "active" || (includeCleaningResource && record.status === "cleaning")) &&
+      Object.hasOwn(record, "resource");
+    const resource = resourceAvailable
+      ? structuredClone(record.resource)
+      : undefined;
+    const assertConfigured = (requested: ResourceSandboxDefinition<JsonValue>) => {
+      if (!definition || requested !== handle) {
+        throw new Error(`Sandbox definition is not configured for client ${client.id}`);
+      }
+    };
+    return {
+      get<TResource extends JsonValue>(requested: ResourceSandboxDefinition<TResource>): Readonly<TResource> {
+        assertConfigured(requested as unknown as ResourceSandboxDefinition<JsonValue>);
+        if (!resourceAvailable) {
+          throw new Error(`Active sandbox resource not found for ${client.id}/${environment!.id}`);
+        }
+        return structuredClone(resource) as Readonly<TResource>;
+      },
+      getOptional<TResource extends JsonValue>(
+        requested: ResourceSandboxDefinition<TResource>,
+      ): Readonly<TResource> | undefined {
+        assertConfigured(requested as unknown as ResourceSandboxDefinition<JsonValue>);
+        return structuredClone(resource) as Readonly<TResource> | undefined;
+      },
+    };
+  }
+
   private async getSandbox(
     sessionId: string,
     clientId: string,
@@ -2482,7 +2884,7 @@ export class OrchestratorRuntime {
         candidate.clientId === clientId &&
         candidate.environmentId === environmentId
       );
-      return sandbox ? { ...sandbox, checkpoint: structuredClone(sandbox.checkpoint) } : undefined;
+      return sandbox ? structuredClone(sandbox) : undefined;
     });
   }
 
@@ -2511,6 +2913,7 @@ export class OrchestratorRuntime {
         environmentId,
         status: "active",
         checkpoint: {},
+        cleanupSteps: {},
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -2518,7 +2921,7 @@ export class OrchestratorRuntime {
       delete session.state[flag];
       session.updatedAt = timestamp;
       await this.store.write(state);
-      return { ...sandbox, checkpoint: {} };
+      return structuredClone(sandbox);
     });
   }
 
@@ -2545,6 +2948,7 @@ export class OrchestratorRuntime {
           environmentId,
           status,
           checkpoint: structuredClone(checkpoint ?? {}),
+          cleanupSteps: {},
           createdAt: updatedAt,
           updatedAt,
         };
@@ -2552,11 +2956,12 @@ export class OrchestratorRuntime {
       } else {
         sandbox.status = status;
         if (checkpoint !== undefined) sandbox.checkpoint = structuredClone(checkpoint);
+        sandbox.cleanupSteps ??= {};
         sandbox.updatedAt = updatedAt;
       }
       sandbox.lastError = error === undefined ? undefined : formatError(error);
       await this.store.write(state);
-      return { ...sandbox, checkpoint: structuredClone(sandbox.checkpoint) };
+      return structuredClone(sandbox);
     });
   }
 
@@ -2577,6 +2982,168 @@ export class OrchestratorRuntime {
       sandbox.checkpoint = { ...sandbox.checkpoint, ...structuredClone(update) };
       sandbox.updatedAt = nowIso();
       await this.store.write(state);
+    });
+  }
+
+  private assertPublishedSandboxResource(
+    sandbox: StoredSandbox,
+  ): asserts sandbox is StoredSandbox & { resource: JsonValue } {
+    if (!Object.hasOwn(sandbox, "resource")) {
+      throw new Error(`Active resource-aware sandbox ${sandbox.clientId}/${sandbox.environmentId} has no published resource`);
+    }
+  }
+
+  private async publishSandboxResource(
+    sandbox: StoredSandbox,
+    resource: JsonValue,
+  ): Promise<StoredSandbox> {
+    try {
+      validateJsonValue(resource);
+    } catch (error) {
+      throw new Error("Sandbox resource must be JSON-safe", { cause: error });
+    }
+    return this.mutex.run(async () => {
+      const state = await this.store.read();
+      const stored = state.sandboxes.find((candidate) =>
+        candidate.sessionId === sandbox.sessionId &&
+        candidate.clientId === sandbox.clientId &&
+        candidate.environmentId === sandbox.environmentId
+      );
+      if (!stored) {
+        throw new Error(`Sandbox record not found for ${sandbox.clientId}/${sandbox.environmentId}`);
+      }
+      stored.resource = structuredClone(resource);
+      stored.updatedAt = nowIso();
+      await this.store.write(state);
+      return structuredClone(stored);
+    });
+  }
+
+  private async runSandboxCleanupStep(
+    sandbox: StoredSandbox,
+    id: string,
+    options: SandboxCleanupStepOptions<JsonValue>,
+    operation: (ctx: SandboxCleanupStepContext<JsonValue>) => Promise<void> | void,
+    context: SandboxCleanupStepContext<JsonValue>,
+  ): Promise<void> {
+    if (id.trim().length === 0) throw new Error("Sandbox cleanup step id must be a non-empty string");
+    const idempotent = options.retry === "idempotent";
+    const reconcile = options.reconcile;
+    if (idempotent === (typeof reconcile === "function")) {
+      throw new Error(`Sandbox cleanup step ${id} must specify either idempotent retry or reconciliation`);
+    }
+    context.signal.throwIfAborted();
+
+    let storedStep = await this.getSandboxCleanupStep(sandbox, id);
+    if (storedStep?.status === "completed") return;
+    if (storedStep && !idempotent) {
+      let disposition: SandboxCleanupStepDisposition;
+      try {
+        disposition = await reconcile!(context);
+      } catch (error) {
+        await this.setSandboxCleanupStep(sandbox, id, {
+          ...storedStep,
+          status: "unknown",
+          updatedAt: nowIso(),
+          lastError: formatError(error),
+        });
+        throw error;
+      }
+      context.signal.throwIfAborted();
+      if (disposition === "completed") {
+        const completedAt = nowIso();
+        await this.setSandboxCleanupStep(sandbox, id, {
+          ...storedStep,
+          status: "completed",
+          updatedAt: completedAt,
+          completedAt,
+          lastError: undefined,
+        });
+        return;
+      }
+      if (disposition !== "incomplete") {
+        const error = new Error(
+          disposition === "unknown"
+            ? `Sandbox cleanup step ${id} reconciliation remained unknown`
+            : `Invalid sandbox cleanup step reconciliation disposition: ${String(disposition)}`,
+        );
+        await this.setSandboxCleanupStep(sandbox, id, {
+          ...storedStep,
+          status: "unknown",
+          updatedAt: nowIso(),
+          lastError: formatError(error),
+        });
+        throw error;
+      }
+    }
+
+    context.signal.throwIfAborted();
+    const startedAt = nowIso();
+    storedStep = await this.setSandboxCleanupStep(sandbox, id, {
+      status: "running",
+      attempts: (storedStep?.attempts ?? 0) + 1,
+      createdAt: storedStep?.createdAt ?? startedAt,
+      updatedAt: startedAt,
+      startedAt,
+    });
+    context.signal.throwIfAborted();
+    try {
+      await operation(context);
+    } catch (error) {
+      await this.setSandboxCleanupStep(sandbox, id, {
+        ...storedStep,
+        status: "failed",
+        updatedAt: nowIso(),
+        lastError: formatError(error),
+      });
+      throw error;
+    }
+    const completedAt = nowIso();
+    await this.setSandboxCleanupStep(sandbox, id, {
+      ...storedStep,
+      status: "completed",
+      updatedAt: completedAt,
+      completedAt,
+      lastError: undefined,
+    });
+  }
+
+  private async getSandboxCleanupStep(
+    sandbox: StoredSandbox,
+    id: string,
+  ): Promise<StoredSandboxCleanupStep | undefined> {
+    return this.mutex.run(async () => {
+      const state = await this.store.read();
+      const stored = state.sandboxes.find((candidate) =>
+        candidate.sessionId === sandbox.sessionId &&
+        candidate.clientId === sandbox.clientId &&
+        candidate.environmentId === sandbox.environmentId
+      );
+      const step = stored?.cleanupSteps && Object.hasOwn(stored.cleanupSteps, id)
+        ? stored.cleanupSteps[id]
+        : undefined;
+      return step ? structuredClone(step) : undefined;
+    });
+  }
+
+  private async setSandboxCleanupStep(
+    sandbox: StoredSandbox,
+    id: string,
+    step: StoredSandboxCleanupStep,
+  ): Promise<StoredSandboxCleanupStep> {
+    return this.mutex.run(async () => {
+      const state = await this.store.read();
+      const stored = state.sandboxes.find((candidate) =>
+        candidate.sessionId === sandbox.sessionId &&
+        candidate.clientId === sandbox.clientId &&
+        candidate.environmentId === sandbox.environmentId
+      );
+      if (!stored) throw new Error(`Sandbox record not found for ${sandbox.clientId}/${sandbox.environmentId}`);
+      stored.cleanupSteps ??= {};
+      stored.cleanupSteps = { ...stored.cleanupSteps, [id]: structuredClone(step) };
+      stored.updatedAt = step.updatedAt;
+      await this.store.write(state);
+      return structuredClone(step);
     });
   }
 
@@ -2616,6 +3183,23 @@ export class OrchestratorRuntime {
       return key === undefined ? fn() : this.withSandboxLock(key, () => acquire(index + 1));
     };
     return acquire(0);
+  }
+
+  private async withSandboxCleanupStepLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.sandboxCleanupStepLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      release = resolveGate;
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.sandboxCleanupStepLocks.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.sandboxCleanupStepLocks.get(key) === tail) this.sandboxCleanupStepLocks.delete(key);
+    }
   }
 }
 

@@ -29,21 +29,31 @@ export type {
   ExhaustionOptions,
   HandlerCapacity,
   HandlerContext,
+  HandlerSandboxAccessor,
   HandleOptions,
 } from "./core/client.js";
 export { HandlerTimeoutError } from "./core/errors.js";
 
-export { createEnvironment } from "./core/environment.js";
+export { createEnvironment, createSandbox } from "./core/environment.js";
 export type {
   EnvironmentBuilder,
   EnvironmentDefinition,
   EnvironmentHookContext,
   EnvironmentInstance,
   SandboxContext,
+  SandboxCleanup,
+  SandboxCleanupStepContext,
+  SandboxCleanupStepDisposition,
+  SandboxCleanupStepOptions,
   SandboxCompletionContext,
   SandboxDefinition,
   SandboxDeliveryContext,
   SandboxDisposition,
+  SandboxResourceCleanupContext,
+  SandboxResourceCreateContext,
+  SandboxResourcePrepareContext,
+  SandboxResourceReconcileContext,
+  ResourceSandboxDefinition,
 } from "./core/environment.js";
 
 export { defineKey, cursorKey, envKey, sessionKey } from "./core/types.js";
@@ -66,6 +76,7 @@ export type {
   ProjectContext,
   RetryOptions,
   SessionNote,
+  SandboxCleanupStepStatus,
   SandboxStatus,
   StateKey,
   StoredDelivery,
@@ -76,6 +87,7 @@ export type {
   StoredFailureDescriptor,
   StoredSession,
   StoredSandbox,
+  StoredSandboxCleanupStep,
   WorkStatus,
 } from "./core/types.js";
 

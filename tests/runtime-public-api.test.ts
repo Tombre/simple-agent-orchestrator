@@ -193,6 +193,59 @@ describe("runtime public API", () => {
     await runtime.stop();
   });
 
+  it("does not expose nested sandbox records from custom stores by reference", async () => {
+    const timestamp = new Date(0).toISOString();
+    const state = emptyState();
+    state.sessions.push({
+      id: "session",
+      key: "work",
+      status: "active",
+      state: {},
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    state.sandboxes.push({
+      sessionId: "session",
+      clientId: "agent",
+      environmentId: "workspace",
+      status: "active",
+      checkpoint: { nested: { value: "checkpoint" } },
+      resource: { nested: { value: "resource" } },
+      cleanupSteps: {
+        remove: {
+          status: "running",
+          attempts: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          startedAt: timestamp,
+        },
+      },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    const store: Store = {
+      name: "sandbox-aliasing",
+      async init() {},
+      async read() {
+        return state;
+      },
+      async write(next) {
+        Object.assign(state, next);
+      },
+    };
+    const runtime = await createRuntime({ store });
+
+    const [sandbox] = await runtime.listSandboxes();
+    (sandbox!.resource as { nested: { value: string } }).nested.value = "changed";
+    sandbox!.cleanupSteps.remove!.attempts = 99;
+
+    expect(state.sandboxes[0]).toMatchObject({
+      resource: { nested: { value: "resource" } },
+      cleanupSteps: { remove: { attempts: 1 } },
+    });
+    await runtime.stop();
+  });
+
 
   it("creates runtimes from object, synchronous, and asynchronous project config", async () => {
     const root = await mkdtemp(join(tmpdir(), "sao-create-runtime-"));

@@ -182,12 +182,26 @@ export interface StoredCapacityReservation {
 
 export type SandboxStatus = "creating" | "active" | "cleaning" | "cleaned" | "unknown";
 
+export type SandboxCleanupStepStatus = "running" | "completed" | "failed" | "unknown";
+
+export interface StoredSandboxCleanupStep {
+  status: SandboxCleanupStepStatus;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string | undefined;
+  completedAt?: string | undefined;
+  lastError?: string | undefined;
+}
+
 export interface StoredSandbox {
   sessionId: string;
   clientId: string;
   environmentId: string;
   status: SandboxStatus;
   checkpoint: JsonRecord;
+  resource?: JsonValue;
+  cleanupSteps: Record<string, StoredSandboxCleanupStep>;
   createdAt: string;
   updatedAt: string;
   lastError?: string | undefined;
@@ -202,7 +216,7 @@ export interface SessionNote {
 }
 
 export interface OrchestratorState {
-  version: 7;
+  version: 8;
   sessions: StoredSession[];
   events: StoredEvent[];
   deliveries: StoredDelivery[];

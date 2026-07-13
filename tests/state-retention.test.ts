@@ -64,7 +64,7 @@ function delivery(
 
 function fixtureState(): OrchestratorState {
   return {
-    version: 7,
+    version: 8,
     sessions: [
       session("event-processed", "ended"),
       session("event-pending", "ended"),
@@ -117,6 +117,7 @@ function fixtureState(): OrchestratorState {
       environmentId: "local",
       status: "unknown",
       checkpoint: {},
+      cleanupSteps: {},
       createdAt: old,
       updatedAt: old,
     }],

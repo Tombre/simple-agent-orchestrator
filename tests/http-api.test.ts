@@ -212,7 +212,7 @@ describe("HTTP webhook and operational API", () => {
     const occupied = await occupy(requestedPort);
     const now = "2026-07-10T10:00:00.000Z";
     const state: OrchestratorState = {
-      version: 7,
+      version: 8,
       events: ["a", "b", "c"].map((id) => ({
         id: `evt_${id}`,
         channelId: "summary",

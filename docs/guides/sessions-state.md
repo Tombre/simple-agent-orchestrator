@@ -78,7 +78,8 @@ Use ordinary `set` when a failed attempt should roll back the value. Use `ensure
 | `note` | Staged until the delivery finishes | Discarded |
 | `end` | Staged until the delivery finishes | Discarded |
 | Completed `ensure` | Already saved | Kept |
-| Completed sandbox creation changes | Already saved | Kept |
+| Published or returned sandbox resource and creation changes | Already saved | Kept |
+| Completed typed sandbox cleanup step | Already saved | Skipped when cleanup resumes |
 
 After `handle` succeeds, its ordinary changes stay on the delivery while acknowledgement, cleanup, or saving retries. Other deliveries don't see them until the delivery finishes.
 
@@ -132,7 +133,7 @@ npx simple-agent-orchestrator sessions complete <session-id> \
   --reason "closed by operator"
 ```
 
-Completion mounts the relevant client environments and can be retried after a cleanup failure. A retry requires the sandbox's `reconcile` hook to decide whether cleanup completed, should repeat, or remains unknown. Completion does not accept a session key, because historical and active sessions can share one.
+Completion mounts the relevant client environments and can be retried after a cleanup failure. Typed cleanup resumes from its saved cleanup steps; a legacy sandbox or a typed sandbox with a missing or otherwise uncertain resource needs sandbox-level `reconcile`. Completion does not accept a session key, because historical and active sessions can share one.
 
 When the same key has both old ended records and a newer active record, lookup by key can return an older one. Use the session ID for `sessions show`, `sessions end`, and runtime lookup when you need one specific record.
 
@@ -141,6 +142,8 @@ Session records can contain `paused` and `failed` status values, but the package
 ## Store values safely
 
 With `jsonFileStore`, session values and note data must be valid JSON and no more than 100 levels deep: strings, finite numbers, booleans, `null`, arrays, and plain objects containing those values. Don't store `undefined`, class instances, functions, `BigInt`, circular objects, or non-finite numbers. Invalid values fail the save instead of being silently changed.
+
+Typed sandbox resources and checkpoints follow the same JSON rules. State version 8 stores each sandbox's optional `resource` and `cleanupSteps` beside its lifecycle status and checkpoint. Valid version 1 through 7 files migrate in memory; the next successful write saves version 8. Older sandbox records start with no typed resource and empty cleanup steps, so a typed definition must reconcile and publish the resource before an active legacy record can be used or cleaned.
 
 The JSON file is plaintext. Don't put credentials, tokens, or other secrets in session values or notes unless you've made an explicit decision to protect that file appropriately.
 
