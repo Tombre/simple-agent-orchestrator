@@ -205,7 +205,9 @@ describe("typed sandbox resources", () => {
     await restarted.dispatch(resumeChannel, { id: "second", sessionKey: "work" });
 
     expect(seen).toEqual(["replacement"]);
-    expect(await restarted.sandboxes.list()).toMatchObject([{ resource: { id: "replacement" } }]);
+    const sandboxes = await restarted.sandboxes.list();
+    expect(sandboxes).toMatchObject([{ resource: { id: "replacement" } }]);
+    expect(sandboxes[0]?.lastError).toBeUndefined();
     await restarted.stop();
   });
 

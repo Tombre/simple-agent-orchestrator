@@ -2456,6 +2456,9 @@ export class OrchestratorRuntime {
         if (resource !== undefined) record = await this.publishSandboxResource(record, resource);
         record = (await this.getSandbox(session.id, client.id, definition.id)) ?? record;
         this.assertPublishedSandboxResource(record);
+        if (record.lastError !== undefined) {
+          record = await this.setSandboxStatus(session.id, client.id, definition.id, "active");
+        }
       } catch (error) {
         await this.setSandboxStatus(session.id, client.id, definition.id, record.status, undefined, error);
         throw error;
